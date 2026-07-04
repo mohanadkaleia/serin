@@ -449,3 +449,144 @@ No plan rulings overturned — Rulings 1–10 stand; F1 tightens Ruling 6's best
 cover every malformed-manifest shape `Workspace.open` can actually raise, F4 formalizes what
 Ruling 4's exit-2 class already implied. Re-run local gates (`ruff check`, `ruff format --check`,
 `mypy`, `pytest`) before pushing; reply on the five review threads with these dispositions.
+
+---
+
+## Security Round 1 — Triage & Fix Plan
+
+Security review verdict: REQUEST_CHANGES on PR #7 (head 01ad720) — two medium findings, both on
+the tool's core promise ("can input make verify lie or crash before reporting?"). I verified both
+against the branch: **both are real, both ADDRESSED**. The reviewer's "verified safe" list
+(non-string/missing `event_hash` → `hash_mismatch` not a crash; `JCSError` containment; deep-JSON;
+`--json` integrity; seq/id extraction guards) matches my own reading — no action there.
+Implementer: `python-engineer`. Scope: `cli/msgctl/verify.py` + `cli/tests/test_verify*.py` only.
+
+**Summary of dispositions**
+
+| # | Finding | Severity | Decision |
+|---|---|---|---|
+| S1 | `payload_redacted` silently waives the hash check (verifier bypass) | medium | **ADDRESS — REVISE plan Ruling 2's exemption: at M0 the flag has NO authority. Run the hash check unconditionally + new FAILURE class `redacted_line`** |
+| S2 | Human report embeds attacker-controlled strings unescaped (ANSI/CR terminal spoofing) | medium | **ADDRESS — `_sanitize_for_terminal` (C0/C1/DEL → `\xNN`) at the `format_human` boundary, applied to ALL untrusted fields (wider than the two flagged)** |
+
+### S1 — `payload_redacted` verifier bypass — ADDRESS; ruled FAILURE at M0, exemption deferred to M1
+
+**The attack is real and cheap:** edit `body.payload.text`, set `server.payload_redacted: true`,
+leave `event_hash` stale → current code skips the hash check entirely, emits nothing, exit 0. One
+attacker-writable in-band bit defeats the exact tamper class the tool exists to catch — and
+silently, which is the worst failure mode a verifier can have.
+
+**Ruling — enforce M0 reality (FAILURE), not protocol semantics (warning):**
+
+- **TDD §2.1's redaction exemption is not being relitigated** — it is *protocol semantics for
+  authenticated server redaction*, an operation that **does not exist at M0**. No legitimate M0
+  writer (msgctl `send` is the only one) ever sets `payload_redacted=true`; ENG-57 hardcodes
+  `False`. A redacted line in an M0 workspace is therefore *definitionally anomalous* — there is
+  no legitimate case to protect with a warning, and "clean workspace verifies green" (the
+  acceptance criterion) is not violated by failing on a line no clean workspace can contain.
+- **Why not warning:** warning → exit 0 → CI green on a tamperable bypass. The operator must
+  *read* the report to catch it; CI never would. A verifier whose hash authority can be waived by
+  unauthenticated input while still exiting 0 is broken against its own threat model. Warning is
+  the M1+ posture, once redaction has an authority to check against.
+- **Semantics (two changes in `_walk_stream` Pass A):**
+  1. **Delete the exemption branch** — run the hash check **unconditionally** at M0 (`if not
+     redacted:` goes away; the `redacted` detection stays). The flag has no authority, so the line
+     is hashed like any other. Tampered body + stale hash → `hash_mismatch` fires as normal.
+  2. **New taxonomy class `redacted_line`, severity FAILURE** (plan Ruling 4 table amended),
+     emitted once per line where the flag is truthy, detail:
+     `"payload_redacted set, but M0 has no redaction authority — hash check NOT waived"`.
+     So: flag + tampered body → `redacted_line` **and** `hash_mismatch` (two true statements);
+     flag + untouched body → `redacted_line` only. Either way exit 1 — the bypass is closed and
+     visible.
+- **Plan bookkeeping:** this REVISES the plan's Ruling 2 bullet ("redaction exemption … skip the
+  hash check") — that bullet is withdrawn for M0. The revision is security-forced, local to
+  verify, and touches no TDD decision (D1 is *strengthened*: the hash check now has no waiver
+  path at all in M0).
+- **M1 server-ticket note (RECORD in the M1 redaction/upload ticket):** redaction must be an
+  **authenticated, audited server operation** (who redacted, when, under what authority — its own
+  event or signed server record), and M1 `verify` must validate a redacted line **against that
+  record** before honoring the §2.1 hash exemption. `redacted_line` then becomes: FAILURE when
+  unauthenticated/unmatched, silent-or-verbose when the audit record checks out. Never trust the
+  self-asserted in-band flag alone.
+
+**Tests (`test_verify_corruption.py`):**
+- `test_verify_redacted_flag_tampered_body`: real send; edit `body.payload.text`, set
+  `server.payload_redacted=true`, keep the stale `event_hash` (the reviewer's PoC) → exit **1**,
+  findings include BOTH `redacted_line` and `hash_mismatch` (correct stream/seq/event_id).
+- `test_verify_redacted_flag_alone_is_failure`: set the flag on an otherwise untouched line and
+  **re-fix nothing** (body unmodified ⇒ hash still faithful) → exit **1**, exactly one
+  `redacted_line`, **no** `hash_mismatch` (proving the two signals are independent).
+
+### S2 — ANSI/CR injection in the human report — ADDRESS (sanitize at the `format_human` boundary)
+
+**Verified, and the surface is WIDER than the review's two fields.** Raw attacker-controlled
+strings reaching the terminal via `format_human`:
+- `finding.detail` — `hash_mismatch` detail embeds `stored_hash = obj.get("event_hash")`
+  **unclipped and unescaped**; `_clip` (used for Pydantic dumps) collapses whitespace via
+  `" ".join(text.split())` but **passes ESC (0x1b) and other C0 through** (`str.split()` splits
+  on whitespace only);
+- `finding.file` and `finding.stream_id` — on-disk dir/file names an attacker can craft;
+- `summary.name` — the stream name from `workspace.json` (attacker-editable manifest);
+- `report.notes` (verbose) — embed raw `env.body.type` / `type_version` repr / `entry.name`.
+
+A crafted `event_hash` of `"\x1b[2K\rclean: 0 failures …"` overwrites the real finding line on a
+TTY — the human report is the operator's decision surface, so this makes verify visually lie even
+while the exit code is truthful.
+
+**Fix — exact mechanism:**
+- Add to `verify.py`:
+
+  ```python
+  _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # C0, DEL, C1
+
+  def _sanitize_for_terminal(text: str) -> str:
+      """Escape C0/C1 control chars for TTY-safe display (\\xNN form).
+
+      Untrusted log/manifest content must never reach a terminal raw: ESC enables
+      ANSI rewriting, CR enables line overwrite. Applied ONLY in format_human —
+      Finding values stay raw so --json keeps byte-fidelity (json.dumps escapes
+      control chars itself, so the JSON path is already safe).
+      """
+      return _CTRL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+  ```
+
+- **Apply in `format_human` only**, to **every** untrusted interpolation: `finding.detail`,
+  `finding.file`, `finding.stream_id` (via the `sid` variable), `summary.stream_id`,
+  `summary.name`, and each `note` in the verbose loop. Trusted fields (`severity.value`, `cls`,
+  numeric counts, `seq`) need no treatment. **Escape-visibly (`\xNN`), don't strip** — stripping
+  would hide that an injection was attempted; the escaped bytes are themselves evidence.
+- **Do NOT sanitize at `Finding` construction** — `format_json` must keep raw values
+  (machine consumers want fidelity; `json.dumps` already escapes control chars safely). The
+  formatter boundary is the correct trust boundary. `!r` (the reviewer's alternative) is rejected
+  only on cosmetics: it quotes every field and double-escapes the JSON-ish details; `\xNN`
+  substitution neutralizes exactly the dangerous class with no other visual change. The existing
+  `{body_wsid!r}` in the workspace_id detail stays (harmless, already safe).
+- While in there: run `stored_hash` through `_clip(str(stored_hash))` in the `hash_mismatch`
+  detail (currently unclipped — a 10 MB fake hash string should not produce a 10 MB report line).
+  Defense-in-depth; the sanitizer is the actual security fix.
+
+**Test (`test_verify_json.py` or new `test_verify_report_safety.py`) —
+`test_verify_human_output_has_no_control_chars`:** build a hostile fixture: real send, then (a)
+rewrite the line's `event_hash` to `"sha256:\x1b[2K\rclean: 0 failures\x1b[0m"` and (b) add a
+manifest stream entry whose name contains `\x1b[31m`. Run `verify` (human) via subprocess:
+- exit 1; stdout contains **no** raw `\x1b` and **no** raw `\r` (`"\x1b" not in out and "\r" not
+  in out`), while the literal escaped text `\x1b` (backslash-x form) IS present — proving
+  escape-not-strip;
+- the genuine `hash_mismatch` line is present and last-line totals report ≥1 failure (spoof did
+  not displace real findings);
+- same fixture with `--json`: output parses, the raw `event_hash` value round-trips through
+  `json.loads` byte-identically (fidelity preserved), exit code identical.
+
+### Net change scope (one fixup commit, combinable with Review Round 1's)
+
+- `cli/msgctl/verify.py` — S1: drop the redaction hash-waiver, add `redacted_line` FAILURE class
+  (taxonomy + docstring + Ruling-2-revision comment); S2: `_CTRL_RE` + `_sanitize_for_terminal`,
+  applied to all untrusted fields in `format_human`; `_clip` the `stored_hash` detail. **No other
+  files; `workspace.py`/`append.py`/`core/` untouched.**
+- `cli/tests/` — `test_verify_redacted_flag_tampered_body`,
+  `test_verify_redacted_flag_alone_is_failure`,
+  `test_verify_human_output_has_no_control_chars` (+ its `--json` fidelity counterpart).
+- Plan deltas recorded here: Ruling 2's redaction-exemption bullet **withdrawn for M0** (S1);
+  Ruling 4 taxonomy gains `redacted_line` (failure); M1 redaction ticket note recorded (S1).
+
+Re-run local gates (`ruff check`, `ruff format --check`, `mypy`, `pytest`) before pushing; reply
+on both security threads with these dispositions.
