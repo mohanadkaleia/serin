@@ -51,12 +51,17 @@ __all__ = [
     "check_event_size",
 ]
 
-#: Hard limit on the serialized size of a single event (TDD §2.1 / §4.3).
+#: Hard limit on the serialized size of a single event (TDD §2.1 / §4.3),
+#: measured over the §3.2 upload wire form ``{body, event_hash}``.
 MAX_EVENT_SIZE_BYTES: Final = 64 * 1024
 
 # RFC 3339 / ISO-8601 timestamp with a mandatory ``Z`` or numeric offset.
 # We validate the *shape* but preserve the original text verbatim (see the
 # module docstring, locked call 3).
+# Shape-only by design: structure is validated, not value ranges
+# (``2026-13-45T99:99:99Z`` passes). Range checks add no value here —
+# ``client_created_at`` is untrusted metadata (D14) and preserved verbatim,
+# ``server_received_at`` is server-minted, and server time is authoritative.
 _RFC3339_RE: Final = re.compile(
     r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$"
 )
@@ -167,17 +172,23 @@ class Envelope(BaseModel):
 
 
 def serialized_size_bytes(envelope: Envelope) -> int:
-    """Return the UTF-8 byte length of the compact JSON serialization."""
-    compact = json.dumps(
-        envelope.model_dump(mode="json"),
-        separators=(",", ":"),
-        ensure_ascii=False,
-    )
+    """UTF-8 byte length of the §3.2 upload wire form ``{body, event_hash}``.
+
+    The cap is defined over the bytes the client uploads (§2.1 "hard reject at
+    upload", §3.2 wire form), NOT the full stored envelope — ``signature`` and
+    ``server`` are excluded so the measured size is stable for a given ``body``
+    regardless of whether server metadata has been attached.
+    """
+    wire = {
+        "body": envelope.body.model_dump(mode="json"),
+        "event_hash": envelope.event_hash,
+    }
+    compact = json.dumps(wire, separators=(",", ":"), ensure_ascii=False)
     return len(compact.encode("utf-8"))
 
 
 def check_event_size(envelope: Envelope) -> None:
-    """Raise :class:`EventTooLargeError` if ``envelope`` exceeds the size cap."""
+    """Raise :class:`EventTooLargeError` if the upload wire form exceeds the cap."""
     size = serialized_size_bytes(envelope)
     if size > MAX_EVENT_SIZE_BYTES:
         raise EventTooLargeError(size)

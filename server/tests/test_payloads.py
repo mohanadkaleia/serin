@@ -14,6 +14,9 @@ from pydantic import ValidationError
 
 def test_required_fields_and_defaults() -> None:
     msg = MessageCreatedV1(message_id=ids.new_message_id(), text="hi")
+    # Locked at M0 (review round 1 ruling): omitting `format` yields "markdown".
+    # The model is a validation-only view — defaulting never mutates the stored
+    # payload dict, so it cannot cause a hash mismatch.
     assert msg.format == "markdown"
     assert msg.thread_root_id is None
     assert msg.file_ids == []
@@ -70,7 +73,11 @@ def test_format_literal_domain() -> None:
         MessageCreatedV1(message_id=ids.new_message_id(), text="x", format="html")  # type: ignore[arg-type]
 
 
-def test_extra_field_allowed_on_payload() -> None:
+def test_message_created_v1_unknown_field_survives() -> None:
+    # The real extra="allow" guard for the payload *model* (§2.3.2 additive-only
+    # evolution): this test fails if extra="allow" is dropped from
+    # MessageCreatedV1. (The envelope-level test_unknown_payload_field_survives
+    # only covers dict passthrough on Body.payload.)
     msg = MessageCreatedV1.model_validate(
         {"message_id": ids.new_message_id(), "text": "x", "future_field": 7}
     )

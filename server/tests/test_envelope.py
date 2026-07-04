@@ -56,6 +56,10 @@ def _valid_envelope_dict() -> dict[str, Any]:
 
 
 def test_2_1_example_round_trips_losslessly() -> None:
+    # Asserts structural (dict deep-)equality, not byte-verbatim reserialization:
+    # event_hash is SHA-256 over JCS(body) and JCS re-sorts keys canonically, so
+    # hash reproducibility depends only on structural fidelity (no field dropped
+    # or mutated) — key order is irrelevant and extra="allow" does not preserve it.
     original = _load_example()
     env = Envelope.model_validate(original)
     assert env.model_dump(mode="json") == original
@@ -72,6 +76,10 @@ def test_unknown_body_field_survives() -> None:
 
 
 def test_unknown_payload_field_survives() -> None:
+    # NOTE: this exercises dict passthrough, not extra="allow" — payload is typed
+    # dict[str, Any] on Body, so unknown keys inside it survive as plain dict
+    # data regardless of model config. The payload-model config guard lives in
+    # test_payloads.py::test_message_created_v1_unknown_field_survives.
     data = _load_example()
     data["body"]["payload"]["future_payload_field"] = "kept"
     dumped = Envelope.model_validate(data).model_dump(mode="json")
@@ -150,6 +158,9 @@ def test_round_trip_per_registered_type_version(type_version: tuple[str, int]) -
 
 
 # --- size cap ----------------------------------------------------------------
+# The cap is measured over the §3.2 upload wire form {body, event_hash} only
+# ("hard reject at upload", §2.1) — never the full stored envelope, so the
+# measured size of a given body is independent of attached server metadata.
 
 
 def test_size_cap_accepts_normal_event() -> None:
@@ -170,7 +181,8 @@ def test_size_cap_boundary() -> None:
     data = _valid_envelope_dict()
     env = Envelope.model_validate(data)
     base = serialized_size_bytes(env)
-    # Pad the text so the serialized size is exactly the limit.
+    # Pad the text so the {body, event_hash} wire form is exactly the limit
+    # (the envelope's server block is present but excluded from measurement).
     pad = MAX_EVENT_SIZE_BYTES - base
     assert pad > 0
     data["body"]["payload"]["text"] += "y" * pad
@@ -183,6 +195,17 @@ def test_size_cap_boundary() -> None:
     assert serialized_size_bytes(env_over) == MAX_EVENT_SIZE_BYTES + 1
     with pytest.raises(EventTooLargeError):
         check_event_size(env_over)
+
+
+def test_size_cap_is_form_stable() -> None:
+    # The key guarantee of the wire-form measurement: an identical body +
+    # event_hash measures the same with and without server metadata attached.
+    data = _valid_envelope_dict()
+    upload_form = Envelope.model_validate({"body": data["body"], "event_hash": data["event_hash"]})
+    stored_form = Envelope.model_validate(data)
+    assert upload_form.server is None
+    assert stored_form.server is not None
+    assert serialized_size_bytes(upload_form) == serialized_size_bytes(stored_form)
 
 
 # --- direct model construction -----------------------------------------------
