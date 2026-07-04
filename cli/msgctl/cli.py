@@ -25,6 +25,7 @@ from msgd.core.payloads import build_message_created_body
 from msgctl import __version__
 from msgctl.append import append_event
 from msgctl.errors import MsgctlError
+from msgctl.projection import PROJECTION_DB_NAME, open_db, project
 from msgctl.workspace import Workspace, init_workspace, now_rfc3339, resolve_or_create_stream
 
 
@@ -72,6 +73,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="override the workspace local author device_id (for tests)",
     )
     send_parser.set_defaults(handler=cmd_send)
+
+    # ENG-58: append-only per the §6 cli.py collision protocol — a self-contained
+    # subparser block at the end of build_parser, dispatched via set_defaults.
+    project_parser = subparsers.add_parser(
+        "project",
+        help="incrementally materialize the SQLite message projection",
+    )
+    project_parser.add_argument("dir", help="workspace directory")
+    project_parser.set_defaults(handler=cmd_project)
 
     return parser
 
@@ -126,6 +136,26 @@ def cmd_send(args: argparse.Namespace) -> int:
     if not result.appended:
         event_id = json.loads(result.line)["body"]["event_id"]
         print(f"idempotent: event_id {event_id} already present", file=sys.stderr)
+    return 0
+
+
+def cmd_project(args: argparse.Namespace) -> int:
+    ws = Workspace.open(args.dir)
+    conn = open_db(ws.root / PROJECTION_DB_NAME)
+    try:
+        result = project(ws, conn)
+    finally:
+        conn.close()
+    print(
+        json.dumps(
+            {
+                "applied": result.applied,
+                "skipped": result.skipped,
+                "streams": result.stream_heads,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 
