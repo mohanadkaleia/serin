@@ -34,7 +34,17 @@ Discipline this module is built to keep
   ``hash_event(raw["body"])`` on the pre-model parsed dict and compares to the raw
   stored ``event_hash`` string. ``verify_hash(envelope)`` is FORBIDDEN here — see the
   comment on Pass A. Schema validation is a SEPARATE, additive pass whose result never
-  feeds the hash check.
+  feeds the hash check. **No redaction waiver at M0 (security round 1):** the plan's
+  ``payload_redacted`` exemption is withdrawn — redaction does not exist at M0, so the
+  self-asserted flag has no authority; the hash check runs unconditionally and a truthy
+  flag is itself a FAILURE (``redacted_line``). The §2.1 exemption returns at M1 only
+  for authenticated, audited server redactions validated against their audit record.
+* **TTY-safe human output.** Untrusted strings (stored hashes, dir/file names, manifest
+  stream names, event types) are escaped (C0/C1/DEL → visible ``\\xNN``) at the
+  ``format_human`` boundary only — ESC enables ANSI rewriting and CR enables line
+  overwrite, and the human report is the operator's decision surface. ``Finding``
+  values stay raw so ``--json`` keeps byte-fidelity (``json.dumps`` escapes control
+  characters itself).
 * **Collect everything (Ruling 8).** verify never stops at the first finding; it walks
   every stream, month, and line, then prints and exits. Human output is capped at
   :data:`MAX_HUMAN_FINDINGS` detail lines (summary counts stay complete); ``--json`` is
@@ -53,6 +63,7 @@ the stream walk.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -160,6 +171,22 @@ def _clip(text: str) -> str:
     """Truncate an over-long detail string (e.g. a Pydantic error dump)."""
     text = " ".join(text.split())
     return text if len(text) <= _MAX_DETAIL else text[: _MAX_DETAIL - 1] + "…"
+
+
+#: C0 controls, DEL, and C1 controls — the classes that can rewrite a terminal.
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _sanitize_for_terminal(text: str) -> str:
+    """Escape C0/C1 control chars for TTY-safe display (``\\xNN`` form).
+
+    Untrusted log/manifest content must never reach a terminal raw: ESC enables ANSI
+    rewriting, CR enables line overwrite. Applied ONLY in :func:`format_human` —
+    ``Finding`` values stay raw so ``--json`` keeps byte-fidelity (``json.dumps``
+    escapes control chars itself, so the JSON path is already safe). Escape-visibly,
+    never strip: the escaped bytes are themselves evidence an injection was attempted.
+    """
+    return _CTRL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
 
 
 def _walk_stream(
@@ -275,13 +302,46 @@ def _walk_stream(
             # silently repair a nonconforming body ("type_version": "1" -> 1), masking the
             # exact byte divergence this check exists to catch. Always hash the raw dict and
             # compare to the raw stored event_hash string (never launder either through a model).
+            #
+            # SECURITY (S1, revises plan Ruling 2): the hash check runs UNCONDITIONALLY at
+            # M0 — there is no payload_redacted exemption. Redaction does not exist at M0
+            # (send hardcodes False), so the self-asserted in-band flag has NO authority;
+            # honoring it would let one attacker-writable bit waive the exact tamper class
+            # verify exists to catch. A truthy flag is itself a FAILURE (redacted_line).
+            # M1 note: the §2.1 exemption returns only for authenticated, audited server
+            # redactions, validated against their audit record — never the bare flag.
             server_meta = obj.get("server")
             redacted = isinstance(server_meta, dict) and bool(server_meta.get("payload_redacted"))
-            if not redacted:
-                stored_hash = obj.get("event_hash")
-                try:
-                    computed = hash_event(obj["body"])
-                except JCSError as exc:
+            if redacted:
+                findings.append(
+                    Finding(
+                        Severity.FAILURE,
+                        "redacted_line",
+                        stream_id,
+                        seq,
+                        eid,
+                        rel,
+                        "payload_redacted set, but M0 has no redaction authority — "
+                        "hash check NOT waived",
+                    )
+                )
+            stored_hash = obj.get("event_hash")
+            try:
+                computed = hash_event(obj["body"])
+            except JCSError as exc:
+                findings.append(
+                    Finding(
+                        Severity.FAILURE,
+                        "hash_mismatch",
+                        stream_id,
+                        seq,
+                        eid,
+                        rel,
+                        f"body not canonicalizable: {_clip(str(exc))}",
+                    )
+                )
+            else:
+                if computed != stored_hash:
                     findings.append(
                         Finding(
                             Severity.FAILURE,
@@ -290,22 +350,9 @@ def _walk_stream(
                             seq,
                             eid,
                             rel,
-                            f"body not canonicalizable: {_clip(str(exc))}",
+                            f"recomputed {computed} != stored {_clip(str(stored_hash))}",
                         )
                     )
-                else:
-                    if computed != stored_hash:
-                        findings.append(
-                            Finding(
-                                Severity.FAILURE,
-                                "hash_mismatch",
-                                stream_id,
-                                seq,
-                                eid,
-                                rel,
-                                f"recomputed {computed} != stored {stored_hash}",
-                            )
-                        )
 
             # workspace_id cross-check (suppressed in best-effort mode where wsid is unknown).
             if manifest_wsid is not None:
@@ -592,12 +639,18 @@ def _finding_sort_key(f: Finding) -> tuple[int, str, int]:
 def format_human(
     report: VerifyReport, *, cap: int = MAX_HUMAN_FINDINGS, verbose: bool = False
 ) -> str:
-    """Render the human-readable report: per-stream summary, capped findings, totals."""
+    """Render the human-readable report: per-stream summary, capped findings, totals.
+
+    Every untrusted interpolation (stream ids, manifest names, file paths, details,
+    verbose notes) passes through :func:`_sanitize_for_terminal` — this formatter is
+    the trust boundary between attacker-influenceable disk content and the operator's
+    terminal. Trusted fields (severity, class, numeric counts) are emitted as-is.
+    """
     lines: list[str] = []
     for summary in sorted(report.streams, key=lambda s: s.stream_id):
-        label = f"stream {summary.stream_id}"
+        label = f"stream {_sanitize_for_terminal(summary.stream_id)}"
         if summary.name:
-            label += f" ({summary.name})"
+            label += f" ({_sanitize_for_terminal(summary.name)})"
         span = (
             f"seq {summary.first_seq}..{summary.last_seq}"
             if summary.first_seq is not None
@@ -614,16 +667,16 @@ def format_human(
     ordered = sorted(report.findings, key=_finding_sort_key)
     for finding in ordered[:cap]:
         seq = "?" if finding.sequence is None else finding.sequence
-        sid = finding.stream_id or "-"
+        sid = _sanitize_for_terminal(finding.stream_id or "-")
         lines.append(
             f"  [{finding.severity.value}] {finding.cls} {sid} seq={seq} "
-            f"{finding.file}: {finding.detail}"
+            f"{_sanitize_for_terminal(finding.file)}: {_sanitize_for_terminal(finding.detail)}"
         )
     if len(ordered) > cap:
         lines.append(f"  … +{len(ordered) - cap} more findings (use --json for the full list)")
 
     if verbose:
-        lines.extend(f"note: {note}" for note in report.notes)
+        lines.extend(f"note: {_sanitize_for_terminal(note)}" for note in report.notes)
 
     lines.append(
         f"{report.total_events} events across {len(report.streams)} streams: "

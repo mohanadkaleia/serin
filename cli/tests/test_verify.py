@@ -138,6 +138,48 @@ def test_verify_coercion_tamper_is_caught(tmp_path: Path) -> None:
     assert main(["verify", str(root)]) == 1
 
 
+def test_verify_redacted_flag_tampered_body(tmp_path: Path) -> None:
+    """Security round 1 (S1): payload_redacted must NOT waive the hash check at M0.
+
+    The PoC bypass: edit the payload, set the self-asserted flag, keep the stale hash.
+    Both signals must fire — the flag itself (redacted_line) and the tamper it tried to
+    hide (hash_mismatch)."""
+    root = tmp_path / "ws"
+    init_ws(root)
+    env = send(root, "general", "original")
+    path = month_file(stream_dirs(root)[0])
+    obj = json.loads(read_raw_lines(path)[0])
+    obj["body"]["payload"]["text"] = "tampered"  # stale event_hash kept
+    obj["server"]["payload_redacted"] = True
+    write_lines(path, [json.dumps(obj, separators=(",", ":"))])
+
+    report = verify.verify_workspace(root)
+    classes = _classes(report)
+    assert "redacted_line" in classes
+    assert "hash_mismatch" in classes
+    for finding in report.findings:
+        assert finding.sequence == 1
+        assert finding.event_id == env["body"]["event_id"]
+        assert finding.severity is verify.Severity.FAILURE
+    assert report.exit_code == 1
+
+
+def test_verify_redacted_flag_alone_is_failure(tmp_path: Path) -> None:
+    """S1 signal independence: the flag on an untouched body (hash still faithful) is
+    exactly one redacted_line failure and NO hash_mismatch — exit 1 either way."""
+    root = tmp_path / "ws"
+    init_ws(root)
+    send(root, "general", "untouched")
+    path = month_file(stream_dirs(root)[0])
+    obj = json.loads(read_raw_lines(path)[0])
+    obj["server"]["payload_redacted"] = True  # body unmodified => hash still valid
+    write_lines(path, [json.dumps(obj, separators=(",", ":"))])
+
+    report = verify.verify_workspace(root)
+    assert _classes(report) == ["redacted_line"]
+    assert report.exit_code == 1
+
+
 # ----------------------------------------------------------------------- sequence class
 
 
@@ -578,6 +620,61 @@ def test_verify_exit_codes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -
     # missing dir -> 2
     assert main(["verify", str(tmp_path / "does-not-exist")]) == 2
     capsys.readouterr()
+
+
+# -------------------------------------------------------------------- report safety (S2)
+
+_HOSTILE_HASH = "sha256:\x1b[2K\rclean: 0 failures\x1b[0m"
+
+
+def _hostile_workspace(root: Path) -> None:
+    """Real send, then a spoofing event_hash + an ANSI-laced manifest stream name."""
+    init_ws(root)
+    send(root, "general", "hello")
+    path = month_file(stream_dirs(root)[0])
+    obj = json.loads(read_raw_lines(path)[0])
+    obj["event_hash"] = _HOSTILE_HASH  # terminal-rewrite payload in an untrusted field
+    write_lines(path, [json.dumps(obj, separators=(",", ":"))])
+    manifest_path = root / "workspace.json"
+    manifest = json.loads(manifest_path.read_text())
+    for entry in manifest["streams"].values():
+        entry["name"] = "gen\x1b[31meral"  # ANSI in the manifest stream name
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+
+def test_verify_human_output_has_no_control_chars(tmp_path: Path) -> None:
+    """S2: the human report is TTY-safe — control chars are escaped visibly, never raw
+    and never silently stripped; the spoof does not displace the genuine finding."""
+    root = tmp_path / "ws"
+    _hostile_workspace(root)
+
+    proc = run_cli("verify", str(root))
+    assert proc.returncode == 1
+    out = proc.stdout
+    # No raw ESC / CR anywhere on the operator's terminal...
+    assert "\x1b" not in out
+    assert "\r" not in out
+    # ...but the escaped form IS present: escape-not-strip (the bytes are evidence).
+    assert "\\x1b" in out
+    # The genuine hash_mismatch finding is intact and the totals report the failure.
+    assert "hash_mismatch" in out
+    assert "1 failure(s)" in out
+
+
+def test_verify_json_keeps_raw_bytes(tmp_path: Path) -> None:
+    """S2 counterpart: --json is NOT sanitized — machine consumers get byte-fidelity
+    (json.dumps escapes control chars safely on the wire; json.loads round-trips them)."""
+    root = tmp_path / "ws"
+    _hostile_workspace(root)
+
+    proc = run_cli("verify", str(root), "--json")
+    assert proc.returncode == 1  # same exit code as the human run
+    payload = json.loads(proc.stdout)  # parses cleanly despite hostile content
+    assert payload["ok"] is False
+    detail = next(f for f in payload["findings"] if f["class"] == "hash_mismatch")["detail"]
+    # The raw ESC bytes round-trip through the JSON path un-sanitized (no \\xNN text).
+    assert "\x1b[2K" in detail
+    assert "\\x1b" not in detail
 
 
 # ----------------------------------------------------------------- collect all / capping
