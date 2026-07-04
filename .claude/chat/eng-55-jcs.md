@@ -221,3 +221,82 @@ Exactly these, nothing else:
 | Property: `canonicalize(parse(canonicalize(x))) == canonicalize(x)` | §6.D |
 | Edge cases (ordering/nesting/unicode/numbers/escapes/null/bool) | §6.C |
 | Single swappable `canonicalize(obj) -> bytes` | §2, §5 Step 2 |
+
+---
+
+## Review Round 1 — Triage & Fix Plan
+
+Reviewer verdict: REQUEST_CHANGES — one real correctness gap (#1), two nits (#2, #3). Core
+verified correct byte-for-byte. I independently reproduced library behavior against
+`rfc8785==0.1.4` before ruling (results inline below). All three are ADDRESSED; fix scope is
+minimal and lands in **one commit** touching only `server/msgd/core/jcs.py` and
+`server/tests/test_jcs.py`. Owner: `python-engineer`.
+
+### Decisions (one line each)
+- **#1 (blocking) — ADDRESS.** Widen the `except` to also catch `UnicodeEncodeError`; catch-and-wrap, the minimal reviewer fix. Do **not** catch bare `ValueError`.
+- **#2 (nit) — ADDRESS as doc-only.** Soften the docstring to admit tuple→list coercion; do **not** add a runtime tuple guard (mypy already forbids tuples at every call site).
+- **#3 (nit) — ADDRESS.** Add `{True: "a"}` and `{"\ud800": 1}` to the rejection tests; both assert `JCSError`.
+
+### Behavior rulings (verified against `rfc8785==0.1.4`)
+- **Bool-as-key is rejected, not coerced.** `rfc8785.dumps({True: "a"})` raises
+  `CanonicalizationError("object keys must be strings")` — the library rejects any non-`str` key
+  type outright. It does **not** serialize `True`→`"true"`, so the feared canonicalization
+  ambiguity (`{True: 1}` vs `{"true": 1}` colliding) **cannot occur**. This is the correct
+  behavior and must stay pinned by a regression test (the `issubclass(bool, int)` trap).
+- **Lone-surrogate key leaks a `UnicodeEncodeError`.** Confirmed `rfc8785.dumps({"\ud800": 1})`
+  raises `UnicodeEncodeError` (from the `utf-16be` key sort), which is **not** a
+  `CanonicalizationError` and escapes the current wrapper. Client-reachable via
+  `json.loads('{"\ud800": 1}')` → recomputed during §3.2 upload validation → unhandled 500.
+  Surrogates in string *values* are already normalized to `CanonicalizationError` by the library;
+  only the key path leaks.
+- **`ValueError` must NOT be caught.** `CanonicalizationError` and `UnicodeEncodeError` are *both*
+  already `ValueError` subclasses, so `except ValueError` would "work" — but it is over-broad: it
+  would silently swallow any unrelated `ValueError` raised by our own wrapper logic or a future
+  edit, masking a real bug as a clean reject. The contract is "translate the library's known
+  out-of-domain failures," and `{CanonicalizationError, UnicodeEncodeError}` is the exhaustive set
+  the library raises for bad input. Name them explicitly.
+- **Tuple coercion is accepted (loose), not test-locked.** The library coerces `tuple → list`
+  (`dumps((1,2)) == b'[1,2]'`), hash-identical to the equivalent list, so it is harmless. A
+  runtime `isinstance(tuple)` guard would only re-reject something `JSONValue` (which excludes
+  `tuple`) already makes a mypy error at every real call site — dead defensive code, out of scope.
+  On the swappability caveat: we deliberately do **not** add a test asserting tuple acceptance, so
+  no implicit contract forms; a future vendored impl remains free to reject tuples. We only correct
+  the docstring's overstatement.
+
+### Fix plan (`python-engineer`)
+
+**A. `server/msgd/core/jcs.py` — widen the exception wrapper (#1).**
+Change the `except` clause in `canonicalize`:
+```python
+    except (rfc8785.CanonicalizationError, UnicodeEncodeError) as exc:
+        raise JCSError(str(exc)) from exc
+```
+Rationale is the `ValueError` ruling above. No other logic changes.
+
+**B. `server/msgd/core/jcs.py` — correct the domain docstring (#2).**
+The module-docstring "Input domain" bullet and the `canonicalize` docstring both say non-domain
+types "raise `JCSError`" without exception. Add a one-clause caveat that `tuple` is the deliberate
+exception — it is coerced to a JSON array rather than rejected (mypy forbids it at call sites; it is
+hash-safe). Keep the "only" domain statement but note tuples are accepted-as-arrays. Do not touch
+the integer-cap / NaN / non-string-key wording.
+
+**C. `server/tests/test_jcs.py` — extend rejection coverage (#3).**
+Augment `test_non_string_object_key_rejected` (line 294) so it also pins:
+- `canonicalize({True: "a"})  # type: ignore[dict-item]` → expects `JCSError` (bool-as-key /
+  `issubclass(bool, int)` regression guard). **Verified today: rejected.**
+- `canonicalize({"\ud800": 1})` → expects `JCSError` (lone-surrogate key; a *valid* `str` key so
+  **no** `type: ignore` needed). This test **fails until fix A lands** — that coupling is
+  intentional and is the regression pin for #1.
+
+Recommended shape: parametrize the rejected keys (`{1: "a"}`, `{True: "a"}`, `{"\ud800": 1}`) so
+each is an independently reported case. Optionally add a positive-form note that the surrogate case
+is the §3.2 upload-validation hardening.
+
+### Out of scope / not doing
+- No runtime tuple rejection (ruling above).
+- No key pre-validation pass in `canonicalize` (duplicates the library's own key-type check; the
+  library is the source of truth for the domain).
+- No new files; no `core/__init__.py` edits; public surface (`canonicalize` / `JCSError` /
+  `JSONValue`) unchanged.
+
+Post-fix this clears the reviewer's stated approval condition ("Fix #1 and I'm happy to approve").
