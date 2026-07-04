@@ -15,7 +15,7 @@ msgd = { workspace = true }
 msgctl = { workspace = true }
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "hypothesis>=6.100"]
 
 [tool.ruff]
 target-version = "py312"
