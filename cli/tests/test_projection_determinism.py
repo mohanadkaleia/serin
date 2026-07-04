@@ -14,6 +14,7 @@ Two invariants, exercised locally:
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -104,3 +105,54 @@ def test_rebuild_equals_incremental(tmp_path: Path) -> None:
     assert incremental != ""
     assert incremental == rebuilt
     assert int(version) == PROJECTION_VERSION
+
+
+def test_dump_matches_reimplementation(tmp_path: Path) -> None:
+    """Pins the exact ``dump_messages`` serialization (the ENG-61 contract).
+
+    ``dump_messages``'s docstring licenses ENG-61 to *reimplement* the identical
+    query + serialization instead of importing the function. This test IS that
+    faithful reimplementation — the contract's SELECT, each row serialized with
+    compact separators, fixed key order, ``ensure_ascii=False``, ``\\n``-joined —
+    asserted byte-equal, so any serialization drift (separators, key order,
+    ordering) breaks here before it breaks the equivalence gate.
+    """
+    root = tmp_path / "ws"
+    assert run_cli("init", str(root)).returncode == 0
+    _send(root, "general", "plain ascii")
+    _send(root, "general", "unicode — héllo ✓")  # exercises ensure_ascii=False
+    _send(root, "random", 'commas, and "quotes", inside text')
+
+    dump = _dump(root)
+
+    columns = (
+        "message_id",
+        "stream_id",
+        "server_sequence",
+        "author_user_id",
+        "text",
+        "format",
+        "thread_root_id",
+        "client_created_at",
+        "server_received_at",
+    )
+    conn = sqlite3.connect(root / PROJECTION_DB_NAME)
+    try:
+        rows = conn.execute(
+            "SELECT message_id, stream_id, server_sequence, author_user_id, text, "
+            "format, thread_root_id, client_created_at, server_received_at "
+            "FROM messages ORDER BY stream_id, server_sequence"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    expected = "\n".join(
+        json.dumps(
+            dict(zip(columns, row, strict=True)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for row in rows
+    )
+    assert dump != ""
+    assert dump == expected

@@ -286,8 +286,21 @@ def _apply_message_created(conn: sqlite3.Connection, env: Envelope) -> None:
     ``message.edited`` event), so an existing row and a re-projected one are
     byte-identical; ``IGNORE`` (keep existing) avoids needless churn and keeps the
     dump stable regardless of the cursor (Ruling 4).
+
+    A payload that fails :class:`MessageCreatedV1` is **not** a D9 skip case (D9
+    covers *unknown* types/versions): the only M0 writer validates the payload
+    before writing, so an invalid known payload in the log is corruption a
+    well-behaved writer never emits → :class:`CorruptLogError` (Ruling 7). The
+    raise unwinds out of the per-stream ``with conn`` transaction, rolling back
+    that stream's partial batch including the cursor bump.
     """
-    payload = MessageCreatedV1(**env.body.payload)
+    try:
+        payload = MessageCreatedV1(**env.body.payload)
+    except ValidationError as exc:
+        raise CorruptLogError(
+            f"invalid message.created v1 payload in stream {env.body.stream_id} "
+            f"seq {_server_sequence(env)} (event {env.body.event_id}): {exc}"
+        ) from exc
     conn.execute(
         "INSERT OR IGNORE INTO messages "
         "(message_id, stream_id, server_sequence, author_user_id, text, format, "
@@ -381,6 +394,10 @@ def dump_messages(conn: sqlite3.Connection) -> str:
     **this** text, not the raw DB. Two workspaces with identical logs → a
     byte-identical dump; a rebuilt projection and an incrementally-built one →
     a byte-identical dump (rebuild ≡ incremental).
+
+    ENG-61 may import this function or reimplement the identical query + this
+    exact serialization (compact separators, fixed ``_DUMP_COLUMNS`` key order,
+    ``ensure_ascii=False``).
     """
     rows = conn.execute(
         "SELECT message_id, stream_id, server_sequence, author_user_id, text, "
@@ -388,5 +405,10 @@ def dump_messages(conn: sqlite3.Connection) -> str:
         "FROM messages ORDER BY stream_id, server_sequence"
     ).fetchall()
     return "\n".join(
-        json.dumps(dict(zip(_DUMP_COLUMNS, row, strict=True)), ensure_ascii=False) for row in rows
+        json.dumps(
+            dict(zip(_DUMP_COLUMNS, row, strict=True)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for row in rows
     )

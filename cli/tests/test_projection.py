@@ -466,3 +466,101 @@ def test_corrupt_terminated_line_hard_errors(tmp_path: Path) -> None:
     assert "Traceback" not in proc.stderr
     # Read-only even on the error path: the log is byte-identical.
     assert month_file.read_bytes() == before
+
+
+def test_malformed_known_payload_is_hard_error(tmp_path: Path) -> None:
+    """A known-(type,version) payload failing MessageCreatedV1 is corruption.
+
+    Not a D9 skip case (D9 covers *unknown* types/versions): the only M0 writer
+    validates the payload before writing, so an invalid known payload in the log
+    is corruption → clean exit 1 via CorruptLogError, and the whole per-stream
+    transaction (including the good seq-1 row and the cursor bump) rolls back.
+    The exact sibling of ``test_corrupt_terminated_line_hard_errors`` one layer
+    up the stack.
+    """
+    root = tmp_path / "ws"
+    _init(root)
+    first = _send(root, "general", "good one")  # seq 1
+    base = first["body"]
+
+    # Terminated, structurally-valid envelope of the KNOWN ("message.created", 1)
+    # but with a payload missing message_id — fails MessageCreatedV1.
+    bad_line = _craft_unprojectable_line(
+        base,
+        seq=2,
+        server_received_at=first["server"]["server_received_at"],
+        type_="message.created",
+        type_version=1,
+        payload={"text": "orphan"},
+    )
+    month_file = next(only_stream_dir(root).glob("*.ndjson"))
+    with open(month_file, "ab") as fh:
+        fh.write((bad_line + "\n").encode("utf-8"))
+    before = month_file.read_bytes()
+
+    proc = run_cli("project", str(root))
+    assert proc.returncode == 1
+    assert proc.stderr.startswith("msgctl:")
+    assert "Traceback" not in proc.stderr
+    # Read-only holds on the error path: the log is byte-identical.
+    assert month_file.read_bytes() == before
+
+    # The per-stream transaction rolled back whole: no rows (not even the good
+    # seq-1 message) and no cursor committed for that stream.
+    assert _count(root) == 0
+    assert _cursor(root, base["stream_id"]) is None
+
+
+def test_reinsert_existing_message_id_keeps_first_row(tmp_path: Path) -> None:
+    """Pins Ruling 4's deliberate ``INSERT OR IGNORE`` (first-write-wins).
+
+    The same-``message_id``/different-body input is **synthetic** — no M0 writer
+    produces it (``message.created`` is immutable and idempotency is by
+    ``event_id``) — which is fine: this test pins the SQL *conflict clause*, not
+    a log scenario. Do not "fix" it by validating the input away. ``OR REPLACE``
+    fails the first-text assertion; a dropped ``OR IGNORE`` fails on
+    ``IntegrityError``. It becomes load-bearing the moment a real re-apply path
+    exists (ENG-59 rebuild over a non-empty table, a concurrent projector).
+    """
+    workspace_id = ids.new_workspace_id()
+    stream_id = ids.new_stream_id()
+    user_id = ids.new_user_id()
+    device_id = ids.new_device_id()
+    message_id = ids.new_message_id()
+
+    def craft(seq: int, text: str) -> Envelope:
+        body = build_message_created_body(
+            workspace_id=workspace_id,
+            stream_id=stream_id,
+            author_user_id=user_id,
+            author_device_id=device_id,
+            client_created_at="2026-07-04T12:00:00.000Z",
+            text=text,
+            message_id=message_id,  # deliberately identical across both
+        )
+        return Envelope(
+            body=body,
+            event_hash=hash_event(body.model_dump(mode="json")),
+            signature=None,
+            server=ServerMetadata(
+                server_sequence=seq,
+                server_received_at="2026-07-04T12:00:01.000Z",
+                payload_redacted=False,
+            ),
+        )
+
+    conn = open_db(tmp_path / "reinsert.sqlite3")
+    try:
+        with conn:
+            projection._apply_message_created(conn, craft(1, "first write"))
+        dump_after_first = dump_messages(conn)
+
+        # Same message_id, different text AND sequence → must be a no-op.
+        with conn:
+            projection._apply_message_created(conn, craft(2, "second write"))
+
+        rows = conn.execute("SELECT message_id, text, server_sequence FROM messages").fetchall()
+        assert rows == [(message_id, "first write", 1)]  # first-write-wins, 1 row
+        assert dump_messages(conn) == dump_after_first  # dump unchanged
+    finally:
+        conn.close()
