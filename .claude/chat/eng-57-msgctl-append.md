@@ -374,3 +374,149 @@ helper. Torn-write & concurrency exceed the ACs but are required by the ticket's
   reuse, checking within the target stream's scan is sufficient; the id set is per-stream. (If a future
   M0 command could resend an event to a *different* stream, idempotency would need a workspace-wide id
   index — out of scope now; noted.)
+
+---
+
+## Review Round 1 — Triage & Fix Plan
+
+Reviewer verdict: REQUEST_CHANGES (comment form, own-PR) on PR #6. Reviewer confirms the crash/race
+core is correct (critical section, torn repair, contiguity, model-is-source hashing, atomic
+manifest); findings 1–2 are gaps, 3–5 are minor/nit. I verified each against the branch
+(`append.py` `_scan_file`/`append_event`, `workspace.py` `write_manifest`, `cli.py` `cmd_send`,
+`test_concurrency.py`). **All five ADDRESSED** — none warrants a push-back once examined; every fix
+is small and lands in one fixup commit. Implementer: `python-engineer`.
+
+**Summary of dispositions**
+
+| # | Finding | Severity | Decision |
+|---|---|---|---|
+| 1 | No parent-dir fsync after new-month-file creation / manifest `os.replace` | substantive | **ADDRESS — fix (plain `os.fsync(dirfd)`), no F_FULLFSYNC** |
+| 2 | No tests for corrupt-terminated-line and unknown-type-preserved paths | substantive | **ADDRESS — two tests** |
+| 3 | Valid-JSON/invalid-`Envelope` line escapes as raw `ValidationError` traceback | minor | **ADDRESS — wrap as `CorruptLogError`** |
+| 4 | `send` doesn't enforce `MAX_EVENT_SIZE_BYTES` | minor / M1 handoff | **ADDRESS — enforce now via `check_event_size`** |
+| 5 | Concurrency test is probabilistic-only | nit | **ADDRESS — minimal start-file gate (not `multiprocessing.Barrier`)** |
+
+### Finding 1 — Directory fsync — ADDRESS (fix, not waive)
+
+**Ruling: fix.** The reviewer is right on the failure mode: `fsync(fd)` makes the line's *data*
+durable, but a newly created month file's **dirent** is not durable until the parent directory is
+fsync'd — power loss can vanish the whole file including an **acknowledged** `server_sequence`,
+which is a lost *acked* event, not a torn one. That breaks the exact guarantee (gapless, durable
+before acknowledged) this component exists to sell — waiving it would hollow out the ticket's
+integrity story for the cost of ~5 lines. So we fix, with a documented macOS scope line:
+
+- **`append.py`:** add `_fsync_dir(path: Path) -> None` — `fd = os.open(path, os.O_RDONLY)` →
+  `os.fsync(fd)` → `os.close(fd)` (in `finally`). In `append_event`, capture `is_new_file =
+  not month_path.exists()` before the `open(..., "ab")`; after the existing write+flush+fsync,
+  if `is_new_file`: `_fsync_dir(stream_dir)`. Once per file creation only — appends to an existing
+  file need no dir fsync (the dirent already exists and the data fsync covers the bytes). Also:
+  when `append_event`'s `stream_dir.mkdir(parents=True, exist_ok=True)` actually *created* the
+  stream dir (guard with a did-create check), fsync the `streams/` parent once too, so a brand-new
+  stream's directory survives the same crash — same helper, one extra call on the first-ever append.
+- **`workspace.py`:** in `write_manifest`, after `os.replace(tmp_path, self.manifest_path)`, call
+  the same helper on `self.root` (the rename is atomic w.r.t. readers but not durable until the
+  containing dir is fsync'd — reviewer's manifest nit). In `init_workspace`, add one
+  `_fsync_dir(root)` after creating `streams/`. Single definition of the helper: put `_fsync_dir`
+  in `workspace.py` and import it in `append.py` (avoids a circular import, since `append.py`
+  already imports from `workspace.py`).
+- **macOS `F_FULLFSYNC`: ruled out for M0, documented.** On macOS `fsync` (file or dir) does not
+  force a media flush — only `F_FULLFSYNC` does, at large latency cost — while Linux, the
+  deployment target (§11), has honest `fsync`. Plain `os.fsync(dirfd)` is the correct baseline; add
+  one docstring line on `_fsync_dir`: "macOS fsync does not force media flush (`F_FULLFSYNC`
+  would); accepted for M0 — macOS is dev-only, Linux is the deployment target." This joins the
+  flock/Windows note as the second explicitly-waived platform nuance.
+- **Test:** no honest power-loss test exists at M0; pin the *call sites* instead — monkeypatch
+  `_fsync_dir` and assert it is called on the first append to a new month file (and on stream-dir
+  creation) but **not** on a second append to the same file.
+
+### Finding 2 — Missing integrity tests — ADDRESS
+
+Correct: plan Ruling 3 mandates both behaviors, `_scan_file` implements both, and no test exercises
+either — a regression to silent-skip (masking data loss) or scan-choke-on-unknown-type (D9) would
+pass the suite. Add to `cli/tests/test_torn_write.py` (or split into `test_scan_integrity.py` if it
+reads better — implementer's pick):
+
+- **`test_corrupt_terminated_line_is_hard_error`:** init; one good send; append
+  `b"this is not json\n"` (trailing `\n` — *terminated*, so it must NOT be treated as torn) to the
+  month file; next `send` via subprocess → exit code **1**, stderr starts `msgctl:` (no traceback),
+  and the month file is byte-identical to before the attempt (nothing appended, nothing truncated).
+- **`test_unknown_event_type_is_preserved_and_counted`:** init; one good send (seq 1); hand-craft a
+  terminated line with `type="widget.exploded"`, `type_version=7`, arbitrary dict payload, valid
+  ids, `event_hash = hash_event(raw_body_dict)`, `server_sequence=2`; write it directly; next
+  `send` → exit 0, new event gets **seq 3** (unknown line *counted*), the unknown line is still
+  present **byte-identical** (*preserved*, D9), 3 lines total, and `assert_every_line_verifies`
+  passes over all three (`verify_hash` is type-agnostic).
+
+### Finding 3 — Raw `ValidationError` escapes — ADDRESS
+
+Verified on the branch: `_scan_file` wraps `json.loads` in `CorruptLogError` but calls
+`Envelope.model_validate(parsed)` bare, so a terminated valid-JSON/non-envelope line raises a raw
+`pydantic.ValidationError` that bypasses `main`'s `except MsgctlError` → traceback instead of the
+clean `msgctl: …` + exit 1 that Ruling 3 promises for terminated corruption.
+
+**Fix (`append.py` `_scan_file`):**
+
+```python
+try:
+    envelope = Envelope.model_validate(parsed)
+except ValidationError as exc:
+    raise CorruptLogError(f"corrupt terminated line in {path}: {exc}") from exc
+```
+
+(`from pydantic import ValidationError` — already a transitive dep via `msgd`, no dep change. The
+`server is None` check on the next line already raises `CorruptLogError`, so the reviewer's
+parenthetical is satisfied as-is.) **Test:** parametrize Finding 2's corrupt-line test with a
+second case, `b'{"not": "an envelope"}\n'` → same clean exit-1 contract — this is the case that
+fails until this fix lands (the intentional regression pin).
+
+### Finding 4 — `MAX_EVENT_SIZE_BYTES` not enforced — ADDRESS (enforce now, not TODO)
+
+**Ruling: enforce now.** The whole premise of ENG-57 is "same envelope contract, local sequencer" —
+a stand-in that acks events the real server hard-rejects (§2.1) would bake >64 KiB lines into logs
+that ENG-58/59/60 replay and that rebuild≡incremental is tested against, making the M0 logs
+unfaithful to the very contract they exist to prove. `check_event_size` already exists and (per the
+ENG-54 review ruling) measures the §3.2 wire form `{body, event_hash}` — form-stable, exactly what
+the server will measure — so the CLI attaching `server` metadata does not change the measured size.
+Enforcement is genuinely one line.
+
+**Fix (`cli.py` `cmd_send`):** inside `build_envelope`, call `check_event_size(envelope)` on the
+constructed envelope before returning it; catch `EventTooLargeError` around the `append_event` call
+and re-raise as `MsgctlError` (exit 1) carrying the size — do **not** widen `main`'s `except` (keep
+the error contract single-typed). The exception unwinds out of the locked section before any write,
+so a rejection consumes no sequence and appends nothing. **Test (`test_send.py`):** send with
+`--text` of ~66 000 chars → exit 1, stderr `msgctl: …` mentioning the cap, zero lines appended, and
+a following normal send gets the next contiguous sequence (no gap burned by the rejection).
+
+### Finding 5 — Probabilistic concurrency test — ADDRESS (start-file gate, not Barrier)
+
+**Ruling: address, using the reviewer's cheaper alternative — a shared start file, not
+`multiprocessing.Barrier`.** A `Barrier` cannot be handed to `sys.executable -c` subprocesses
+without a `multiprocessing.Manager` (real machinery, new failure modes for a nit); the start-file
+gate is ~5 lines and forces both workers to hit their *first* `send` — the maximal-contention
+scan→write window — simultaneously on every run, turning the lock guard from likely into reliable.
+It can never false-fail: the gate only synchronizes the start.
+
+**Fix (`test_concurrency.py`):** worker prelude gains a spin-wait on `sys.argv[4]`
+(`while not Path(go).exists(): time.sleep(0.001)`, with a ~10 s timeout → `sys.exit(3)` so a bug
+cannot hang CI); the test `Popen`s both workers first, **then** touches the go-file, then waits.
+Assertions unchanged (`1..2K` exact, `2K` distinct ids, every line verifies) — they were already
+the right ones; only the collision is now deterministic. `K=15` stays.
+
+### Net change scope
+
+- `cli/msgctl/workspace.py` — `_fsync_dir` helper + calls after manifest `os.replace` and in
+  `init_workspace` (F1).
+- `cli/msgctl/append.py` — dir-fsync on new month file / new stream dir (F1); wrap
+  `model_validate` → `CorruptLogError` (F3).
+- `cli/msgctl/cli.py` — `check_event_size` in `build_envelope` + `EventTooLargeError` →
+  `MsgctlError` mapping (F4).
+- `cli/tests/test_torn_write.py` (or new `test_scan_integrity.py`) — corrupt-terminated-line
+  (parametrized: bad JSON, valid-JSON-bad-envelope) + unknown-type-preserved tests (F2, F3).
+- `cli/tests/test_send.py` — oversized-reject + no-gap-after-reject test (F4).
+- `cli/tests/test_torn_write.py` or a small new unit — `_fsync_dir` call-site guard (F1).
+- `cli/tests/test_concurrency.py` — start-file gate (F5).
+
+No `core/` edits, no new deps, no plan rulings overturned — Rulings 1–6 stand; F1 tightens Ruling
+3's durability story (dirent durability now included), F4 adds one exit-1 case to Ruling 5's UX.
+One fixup commit; re-run local gates (`ruff check`, `ruff format --check`, `mypy`, `pytest`) before
+pushing, then reply on the five review threads with these dispositions.
