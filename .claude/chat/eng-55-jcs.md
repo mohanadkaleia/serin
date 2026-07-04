@@ -300,3 +300,87 @@ is the §3.2 upload-validation hardening.
   `JSONValue`) unchanged.
 
 Post-fix this clears the reviewer's stated approval condition ("Fix #1 and I'm happy to approve").
+
+---
+
+## Security Round 1 — Triage & Fix Plan
+
+One blocking medium from the security review (post round-1). **ADDRESS — option (b): explicit
+depth cap as a protocol constant, plus `RecursionError` in the except tuple as backstop.**
+Owner: `python-engineer`; scope stays `server/msgd/core/jcs.py` + `server/tests/test_jcs.py`,
+one commit.
+
+### Finding (independently re-verified)
+`RecursionError` escapes `canonicalize()`. Reproduced against `rfc8785==0.1.4`:
+- `json.loads('['*2000 + '1' + ']'*2000)` parses fine (C scanner; ~4 KB input, far under the
+  64 KB cap — depth 1000 needs only ~2 KB).
+- `rfc8785.dumps` on that value raises `RecursionError`; measured failure threshold **depth 997**
+  at default interpreter limits.
+- `issubclass(RecursionError, ValueError)` is `False` → it bypasses the
+  `(CanonicalizationError, UnicodeEncodeError)` tuple and violates the module's "only `JCSError`
+  leaks" invariant → unhandled 500 at §3.2 upload validation.
+
+### Ruling: (b) + backstop, not (a) alone
+Option (a) (just add `RecursionError` to the tuple) converts the 500 into a clean reject but
+leaves the **accept/reject boundary nondeterministic**: it sits wherever the interpreter's
+remaining stack happens to be, so the same event could canonicalize on one worker and be rejected
+on another — and the M2 TypeScript client has an entirely different (engine-dependent) stack
+limit. A validity boundary that varies by process is unacceptable for a function whose whole
+contract is determinism (D1). Option (b) makes the boundary an explicit, documented, cheap,
+cross-language-portable constant. We take (b) **and** keep `RecursionError` in the tuple as
+belt-and-braces (it becomes unreachable-by-design; if the invariant is ever broken it degrades to
+a clean reject, never a 500).
+
+**Depth number: 128.** Rationale: the §2.1 example body is depth 3 (body → payload →
+`file_ids`/`mentions`); 128 is ~40x headroom over any plausible real body, comfortably below
+Python's measured ~997 failure point (so the backstop is never load-bearing), trivially within
+every JS engine's stack for the TS mirror, and matches serde_json's well-known default (128) for
+cross-ecosystem familiarity. **Protocol-lock implication:** this cap becomes part of the locked
+JCS input-domain semantics under D1 — ENG-56 must freeze it alongside the hash vectors (include
+one at-cap and one over-cap vector in `core/testdata/vectors.json`), and the M2 TS client must
+enforce the same constant. This does not conflict with RFC 8785 (the RFC imposes no depth limit;
+a stricter input domain is ours to pin, same as the existing 2^53 integer cap).
+
+### Fix spec (`python-engineer`)
+
+**A. `jcs.py` — protocol constant.**
+```python
+#: Maximum container nesting depth accepted by :func:`canonicalize`. Protocol constant:
+#: part of the locked JCS input domain (D1) — the web client must enforce the same value.
+MAX_DEPTH: int = 128
+```
+Add `"MAX_DEPTH"` to `__all__`. Depth definition (document it): a scalar is depth 0; each
+`dict`/`list` level adds 1 (`{}` is 1; the §2.1 body is 3). Count `tuple` as a container too,
+since the library coerces tuple→array.
+
+**B. `jcs.py` — iterative pre-pass.** Private helper `_check_depth(obj: object) -> None`, called
+first in `canonicalize`, raising `JCSError(f"nesting depth exceeds {MAX_DEPTH}")` when container
+depth > `MAX_DEPTH`. Must be **iterative** (explicit worklist of `(value, depth)` pairs), never
+recursive — the guard itself must be immune to the failure it guards against. Only descend into
+`dict` values / `list`/`tuple` items; skip scalars (and do not iterate `str`).
+
+**C. `jcs.py` — backstop.** Except tuple becomes
+`(rfc8785.CanonicalizationError, UnicodeEncodeError, RecursionError)`, with a comment that
+`RecursionError` is defense-in-depth: unreachable given the pre-pass (997 ≫ 128), and safe to
+catch here because `canonicalize` is pure and the stack is fully unwound at the handler. Update
+both docstrings: add "nesting deeper than ``MAX_DEPTH``" to the Raises list and to the module's
+input-domain bullet.
+
+**D. `test_jcs.py` — four pins.**
+1. **At-cap accepted:** list nested exactly `MAX_DEPTH` deep (built iteratively:
+   `o: Any = 1; for _ in range(MAX_DEPTH): o = [o]`) → succeeds with exact bytes
+   `b"[" * 128 + b"1" + b"]" * 128`.
+2. **Cap+1 rejected:** depth `MAX_DEPTH + 1` (list variant, and a dict variant
+   `o = {"k": o}`) → `pytest.raises(JCSError)`.
+3. **Reviewer repro rejected cleanly:** `json.loads("[" * 2000 + "1" + "]" * 2000)` →
+   `pytest.raises(JCSError)` — this inherently asserts no `RecursionError` escapes, and pins the
+   client-reachable §3.2 path (parse-then-canonicalize).
+4. **Depth counting sanity:** the §2.1 `EXAMPLE_BODY` snapshot still passes untouched (depth 3,
+   nowhere near the cap), proving the pre-pass changes nothing for real bodies.
+Import `MAX_DEPTH` from `msgd.core.jcs` in the tests — never hard-code 128 except in the
+expected-bytes literal of test 1.
+
+### Out of scope
+- `parse_constant` hardening on `json.loads` at the upload layer — real but belongs to the §3.2
+  upload-validation ticket, not core JCS. Noted for that ticket's plan.
+- No `sys.setrecursionlimit` tampering; no library patching.
