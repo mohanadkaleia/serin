@@ -289,9 +289,24 @@ def test_non_json_types_rejected_as_jcs_error() -> None:
             canonicalize(bad)  # type: ignore[arg-type]
 
 
-def test_non_string_object_key_rejected() -> None:
+@pytest.mark.parametrize(
+    ("bad_mapping", "reason"),
+    [
+        pytest.param({1: "a"}, "int key", id="int-key"),
+        # bool-as-key regression guard (the issubclass(bool, int) trap): the library
+        # rejects non-str keys outright — it does NOT coerce True -> "true", so no
+        # {True: 1} vs {"true": 1} canonicalization collision is possible.
+        pytest.param({True: "a"}, "bool key", id="bool-key"),
+        # Lone-surrogate key: a *valid* Python str, so it passes JSONValue typing, but
+        # the library leaks UnicodeEncodeError (from its UTF-16BE key sort) instead of
+        # CanonicalizationError. Client-reachable via json.loads on upload (§3.2
+        # validation hardening); the wrapper must surface it as JCSError, not a 500.
+        pytest.param({"\ud800": 1}, "lone-surrogate key", id="surrogate-key"),
+    ],
+)
+def test_bad_object_key_rejected(bad_mapping: Any, reason: str) -> None:
     with pytest.raises(JCSError):
-        canonicalize({1: "a"})  # type: ignore[dict-item]
+        canonicalize(bad_mapping)
 
 
 def test_rejections_do_not_leak_library_exception() -> None:

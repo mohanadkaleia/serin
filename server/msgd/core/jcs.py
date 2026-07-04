@@ -32,7 +32,11 @@ Pinned semantics (locked by tests in ``server/tests/test_jcs.py``)
 ------------------------------------------------------------------
 * **Input domain:** ``dict`` / ``list`` / ``str`` / ``int`` / ``float`` / ``bool`` /
   ``None`` only, with **string** object keys. Anything else (``bytes``, ``Decimal``,
-  ``datetime``, ``set``, custom objects, non-string keys) raises :class:`JCSError`.
+  ``datetime``, ``set``, custom objects, non-string keys) raises :class:`JCSError` —
+  with one deliberate exception: the current library coerces ``tuple`` to a JSON
+  array rather than rejecting it (hash-safe; ``JSONValue`` still excludes ``tuple``,
+  so mypy forbids it at every call site, and no test locks the coercion in — a future
+  vendored implementation remains free to reject tuples).
 * **Floats** serialize per RFC 8785 = ECMAScript ``Number::toString``.
 * **NaN / Infinity** are rejected → :class:`JCSError`.
 * **Integer range:** we adopt the RFC 8785 interop cap ``[-(2**53)+1, 2**53-1]``;
@@ -76,14 +80,23 @@ def canonicalize(obj: JSONValue) -> bytes:
 
     ``obj`` must be a JSON value: ``dict`` (string keys) / ``list`` / ``str`` /
     ``int`` / ``float`` / ``bool`` / ``None``. The production caller passes the event
-    ``body`` dict. Output is deterministic and suitable for hashing.
+    ``body`` dict. Output is deterministic and suitable for hashing. (Caveat: the
+    current library coerces ``tuple`` to a JSON array instead of rejecting it; see
+    the module docstring — do not rely on either behavior.)
 
     Raises:
         JCSError: if ``obj`` (or a nested value) is out of the JSON domain — a
             non-finite float, an integer outside ``[-(2**53)+1, 2**53-1]``, an
-            unsupported type, or a non-string object key.
+            unsupported type, a non-string object key, or a string key containing
+            a lone surrogate.
     """
     try:
         return rfc8785.dumps(obj)
-    except rfc8785.CanonicalizationError as exc:
+    except (rfc8785.CanonicalizationError, UnicodeEncodeError) as exc:
+        # UnicodeEncodeError: a lone-surrogate *object key* escapes the library's own
+        # error type (it leaks from the UTF-16BE key sort), while surrogates in string
+        # values are already CanonicalizationError. Client-reachable via json.loads on
+        # upload, so it must surface as JCSError, not a 500. Deliberately NOT bare
+        # ValueError: both caught types already subclass it, and a blanket catch would
+        # swallow unrelated bugs in our own logic as a clean reject.
         raise JCSError(str(exc)) from exc
