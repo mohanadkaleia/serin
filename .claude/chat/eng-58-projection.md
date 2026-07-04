@@ -472,3 +472,122 @@ scope here, and would touch a file this ticket must not own.
   `build_parser`) + `cmd_*` (dispatch via `set_defaults(handler=…)`, no separate dispatch line);
   second-to-merge mechanically reorders its block below the other's — a pure rebase, no parser
   refactor. `append.py`/`workspace.py`/`errors.py` stay read-only.
+
+---
+
+## Review Round 1 — Triage & Fix Plan
+
+Reviewer verdict: REQUEST_CHANGES (comment form, own-PR) on PR #8 — 1 blocking, 2 non-blocking.
+Reviewer confirms the load-bearing invariants are correct (per-stream transaction wraps rows+cursor,
+cursor advances over skipped events, read-only reader, version stamp written *last* in
+`_rebuild_schema` so a crashed rebuild re-converges — the classic gate bug is absent). I verified all
+three findings against the branch (`projection.py`: `_apply_message_created`'s unwrapped
+`MessageCreatedV1(**env.body.payload)`; `dump_messages`'s default `json.dumps` separators; no test
+path that re-inserts an existing `message_id`). **All three ADDRESSED** — each fix is small and lands
+in one fixup commit. Implementer: `python-engineer`.
+
+| # | Finding | Severity | Decision |
+|---|---|---|---|
+| 1 | Malformed known payload escapes as raw `ValidationError` traceback | blocking | **ADDRESS — wrap → `CorruptLogError` + test** |
+| 2 | `dump_messages` not compact despite the pinned ENG-61 contract | non-blocking | **ADDRESS — add `separators=(",", ":")` now + reimplementation test** |
+| 3 | `OR IGNORE` immutability pin unguarded (`OR REPLACE` would pass) | non-blocking | **ADDRESS — first-write-wins unit test** |
+
+### Finding 1 — Malformed `message.created` v1 payload → wrap as `CorruptLogError` — ADDRESS (blocking)
+
+**Ruling: hard error, not skip — and the reviewer is right that it must be a *clean* one.** A
+terminated line that is a structurally-valid `Envelope` of a *known* `(type, version)` but whose
+payload fails `MessageCreatedV1` is not a D9 case (D9 covers *unknown* types/versions, which
+skip-with-cursor-advance). The only M0 writer is `msgctl send`, which validates the payload through
+`MessageCreatedV1` *before* writing — so an invalid known payload in the log is corruption a
+well-behaved writer never emits, exactly the class Ruling 7 sends to `CorruptLogError`. Plan Step 4
+already said "a clean error on a malformed known payload"; the implementation raised the right alarm
+through the wrong channel (`ValidationError` is not a `MsgctlError`, so `main` lets it traceback).
+
+**Fix (`projection.py`, `_apply_message_created`) — wrap at the construction site, narrowest scope:**
+
+```python
+try:
+    payload = MessageCreatedV1(**env.body.payload)
+except ValidationError as exc:
+    raise CorruptLogError(
+        f"invalid message.created v1 payload in stream {env.body.stream_id} "
+        f"seq {_server_sequence(env)} (event {env.body.event_id}): {exc}"
+    ) from exc
+```
+
+`ValidationError` and `CorruptLogError` are already imported (used by `_read_stream_events`) — no
+import change. Do **not** widen the except beyond `ValidationError`, and do not wrap the
+`conn.execute` (a SQL failure there would be a projection bug, not log corruption — let it surface).
+The raise unwinds out of the per-stream `with conn:` block, which **rolls back** that stream's
+partial batch including the cursor bump — correct, and already the crash-mid-apply contract: nothing
+half-applied, earlier streams' commits stand, re-run after the log is fixed converges.
+
+**Test (`cli/tests/test_projection.py`) — `test_malformed_known_payload_is_hard_error`:** init + one
+good send (seq 1); hand-craft a *terminated* envelope at seq 2 with `type="message.created"`,
+`type_version=1`, valid ids and `event_hash = hash_event(raw_body)` (the scan-integrity crafting
+pattern) but `payload` missing `message_id` (e.g. `{"text": "orphan"}`); append it;
+`run_cli("project", …)` → exit **1**, stderr starts `msgctl:`, `"Traceback" not in stderr`; log file
+byte-identical (read-only holds on the error path too); and the DB shows **no** rows and no cursor
+for that stream (the whole per-stream transaction rolled back — seq 1's row must not have committed
+with the cursor un-bumped or vice versa). This is the exact sibling of
+`test_corrupt_terminated_line_hard_errors` one layer up the stack.
+
+### Finding 2 — `dump_messages` compactness — ADDRESS (fix now, code → contract)
+
+**Ruling: add `separators=(",", ":")` now — do not defer to ENG-61, and do not retreat to
+"import-only".** The dump is THE pinned ENG-61 comparison surface, and plan Ruling 5 deliberately
+permits ENG-61 to "reimplement the identical query"; leaving the code non-compact while the written
+contract (Ruling 5 *and* the function's own docstring) says "compact" guarantees a byte-level
+mismatch the moment anyone reimplements faithfully from the contract text. Reconciling toward the
+contract (compact) rather than the accident (default separators) is strictly cheaper now than an
+equivalence-gate churn after ENG-61 freezes. The reviewer's alternative — tighten the note to "must
+import, never reimplement" — is rejected: it would make the documented contract unimplementable from
+its own text, which is a worse contract than a two-token code fix.
+
+**Fix (`projection.py`, `dump_messages`):** add `separators=(",", ":")` to the `json.dumps` call.
+The docstring already says compact — now true; append one line: "ENG-61 may import this function or
+reimplement the identical query + this exact serialization (compact separators, fixed
+`_DUMP_COLUMNS` key order, `ensure_ascii=False`)."
+
+**Test (`cli/tests/test_projection_determinism.py`) — `test_dump_matches_reimplementation`:** after a
+`project`, rebuild the expected dump *independently* from the same DB — run the contract's SELECT,
+serialize each row dict with `json.dumps(..., ensure_ascii=False, separators=(",", ":"))`,
+`\n`-join — and assert byte-equality with `dump_messages(conn)`. This is precisely the faithful
+ENG-61 reimplementation the contract licenses, so it pins the separators (and any future
+serialization drift) — rather than a fragile "no `', '` substring" assertion, which message text
+could legitimately contain.
+
+### Finding 3 — `OR IGNORE` first-write-wins guard — ADDRESS (add the cheap pin)
+
+**Ruling: add it.** The reviewer is correct that it is not a live M0 bug (rows are immutable and the
+dump never touches rowid, so `OR REPLACE` is observationally identical today) — but Ruling 4 chose
+`IGNORE` over `REPLACE` *deliberately*, and an unguarded deliberate ruling is exactly what a future
+"harmless" edit flips. The pin is one small unit test with no new machinery, and it becomes
+load-bearing the moment any real re-apply path exists (ENG-59 rebuild over a non-empty table, a
+future concurrent projector).
+
+**Test (`cli/tests/test_projection.py`) — `test_reinsert_existing_message_id_keeps_first_row`:**
+in-process: `open_db` on a tmp path; apply a crafted envelope via `_apply_message_created` inside a
+`with conn:`; then apply a *second* crafted envelope with the **same `message_id`** but different
+`text` (and a different `server_sequence`); assert the stored row still carries the **first** text
+and sequence (first-write-wins), row count is 1, and `dump_messages` is byte-identical between the
+two applies. `OR REPLACE` fails the first-text assertion; a dropped `OR IGNORE` fails on
+`IntegrityError`. (The same-id/different-body input is synthetic — no M0 writer produces it — which
+is fine: the test pins the SQL conflict clause, not a log scenario; say so in its docstring so
+nobody "fixes" the test by validating the input away.)
+
+### Net change scope
+
+- `cli/msgctl/projection.py` — try/except around `MessageCreatedV1(**…)` → `CorruptLogError` (F1);
+  `separators=(",", ":")` in `dump_messages` + one docstring line (F2).
+- `cli/tests/test_projection.py` — `test_malformed_known_payload_is_hard_error` (F1),
+  `test_reinsert_existing_message_id_keeps_first_row` (F3).
+- `cli/tests/test_projection_determinism.py` — `test_dump_matches_reimplementation` (F2).
+
+No plan rulings overturned — F1 enforces Ruling 7's clean-error contract at the payload layer, F2
+makes the code match Ruling 5's already-written contract, F3 pins Ruling 4's `IGNORE`-over-`REPLACE`
+choice. **Note for ENG-61 (record now):** the dump contract is finalized as **compact** separators —
+the equivalence gate compares against `dump_messages` output or a byte-faithful reimplementation per
+the F2 docstring line. No `core/`/`append.py`/`workspace.py`/`errors.py` edits, no new deps. One
+fixup commit; re-run local gates (`ruff check`, `ruff format --check`, `mypy`, `pytest`) before
+pushing, then reply on the three review threads with these dispositions.

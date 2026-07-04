@@ -295,3 +295,298 @@ Pinned so the two tickets **cannot** touch the same code:
 | CI-suitable exit codes (0/1/2) | Ruling 4, `test_verify_exit_codes` |
 | `--json` machine output | Ruling 7, `test_verify_json_shape` |
 | Raw-hash discipline (never `verify_hash`) | Ruling 2 + `test_verify_coercion_tamper_is_caught` |
+
+---
+
+## Review Round 1 — Triage & Fix Plan
+
+Reviewer verdict: REQUEST_CHANGES (comment form, own-PR) on PR #7 — 2 blocking + 3 nits. The
+reviewer confirms the core is right (raw-hash discipline verified end-to-end, read-only guarantee,
+ENG-58 boundary, contiguity taxonomy). I verified both blocking findings against the branch and
+`workspace.py`: both are real. **All five ADDRESSED** (finding 4 is addressed as *documentation
+only* — the current behavior is ruled correct). Every fix is small and lands in one fixup commit.
+Implementer: `python-engineer`. Scope discipline: fixes are confined to `verify.py` +
+`cli/tests/test_verify*.py` — `workspace.py` stays untouched (ENG-58 partition, plan §8).
+
+**Summary of dispositions**
+
+| # | Finding | Severity | Decision |
+|---|---|---|---|
+| 1 | Uncaught `KeyError` on valid-JSON manifest missing `workspace_id` | blocking | **ADDRESS — broaden the best-effort except tuple in `verify.py`; two-case test** |
+| 2 | `out_of_order` detector branch untested | blocking | **ADDRESS — seq `1,3,2` test** |
+| 3 | Hash pass on tampered unknown-type line untested | nit | **ADDRESS — one cheap test** |
+| 4 | Mid-walk `OSError` → exit-2 abort vs finding+continue | nit | **ADDRESS as documentation — exit 2 is RULED correct for M0, no behavior change** |
+| 5 | Gap-at-start untested | nit | **ADDRESS — parametrize the existing gap test** |
+
+### Finding 1 — Uncaught `KeyError` on malformed manifest — ADDRESS (blocking, fix in `verify.py` only)
+
+**Verified real.** `verify_workspace` catches only `WorkspaceError` (→ `UsageError`, exit 2) and
+`CorruptLogError` (→ `manifest_invalid` + best-effort). But `Workspace.open` performs three
+untrusted reads *outside* its own internal try, so a valid-JSON manifest can raise bare exceptions
+that sail past `main`'s `except MsgctlError` into a traceback — exactly the corrupt-manifest class
+verify exists to survive (plan Rulings 1/6/8). The full leak surface (confirmed by reading
+`workspace.py:155–196`):
+
+- `raw["workspace_id"]` → **KeyError** (the reviewer's empirical repro);
+- `info["name"]` per stream entry → **KeyError** (entry missing `name`) or **TypeError** (entry is
+  a string/list, not a dict);
+- `streams_raw.items()` → **AttributeError** when `"streams"` is a list/string (the internal try
+  annotates `dict[str, Any]` but never runtime-checks it).
+
+**Fix (`cli/msgctl/verify.py` `verify_workspace`, the `Workspace.open` try only — `workspace.py`
+is off-limits per the ENG-58 partition and the plan's file list):** broaden the best-effort branch
+to the exact tuple
+
+```python
+except WorkspaceError as exc:
+    raise UsageError(str(exc)) from exc
+except (CorruptLogError, KeyError, TypeError, ValueError, AttributeError) as exc:
+    findings.append(
+        Finding(Severity.FAILURE, "manifest_invalid", None, None, None,
+                "workspace.json", f"malformed manifest: {exc!r}")
+    )
+    ws = None
+```
+
+Rulings inside the fix:
+- **`WorkspaceError` stays FIRST and separate** — "no `workspace.json` at all" remains exit 2
+  (not-a-workspace is a usage error, not a finding). Order matters; do not fold it into the tuple.
+- **Exact tuple `(CorruptLogError, KeyError, TypeError, ValueError, AttributeError)`**, scoped to
+  this one `try` around `Workspace.open` and nothing else. KeyError/TypeError/AttributeError cover
+  the three verified leak paths; ValueError is included (reviewer's suggestion) as the standard
+  malformed-scalar parse error so a future `workspace.py` tweak doesn't reopen the hole.
+  **Bare `except Exception` is REJECTED**: it would relabel genuine verify bugs
+  (NameError, RecursionError, etc.) as `manifest_invalid` findings and hide crashes CI must see.
+  The tuple is the honest middle.
+- **Use `{exc!r}` in the detail, not `{exc}`** — `str(KeyError('workspace_id'))` is just
+  `'workspace_id'`, which is useless in a report; the repr names the exception class.
+- Downstream best-effort behavior is already correct (`ws = None` → registry/`workspace_id`
+  cross-checks suppressed, per-line hash/sequence/schema checks still run); no other change.
+
+**Test (`test_verify_registry.py` or wherever `test_verify_manifest_invalid_best_effort` lives):**
+parametrize a new `test_verify_manifest_malformed_shapes_best_effort` with two cases, each built on
+a real workspace (init + one send, then edit `workspace.json`):
+1. **delete the `workspace_id` key** (the KeyError repro) — keep everything else intact;
+2. **set `"streams": []`** (the AttributeError path — same fix covers it, one param proves the
+   tuple isn't KeyError-only).
+
+For each: `verify` → exit **1** (no traceback — assert `"Traceback" not in stderr`), exactly one
+`manifest_invalid` finding, **the stream walk still ran** (summary shows the 1 event; its hash
+check executed — assert no `hash_mismatch`, i.e. events were visited and clean), no
+`unregistered_stream_dir`/`workspace_id_mismatch` noise (suppressed in best-effort mode), and
+`--json` emits a well-formed object with `ok: false`. The existing JSONDecodeError-path test stays
+as-is.
+
+### Finding 2 — `out_of_order` untested — ADDRESS (blocking)
+
+Correct: the branch exists (verified at `verify.py` Pass B: `else: # seq < expected and not
+previously seen`), it's a first-class failure class in Ruling 4, and no test reaches it. For an
+integrity tool, an untested detector is an unproven detector.
+
+**Test (`test_verify_corruption.py`) — `test_verify_out_of_order`:** init + 3 real sends (seqs
+1,2,3); rewrite the month file with the same three **unmodified** lines in file order **1, 3, 2**
+(lines untouched ⇒ hashes stay faithful, so the only findings are sequence findings). Expected
+walk: seq 1 ok (expected→2); seq 3 > 2 → **`gap`** ("missing 2..2", resync expected→4); seq 2 < 4
+and not in `seen_seqs` → **`out_of_order`**. Assert: exit 1; finding classes are exactly
+`{gap, out_of_order}` (one each — the gap/resync interplay is intended and now pinned);
+the `out_of_order` finding carries `sequence == 2` and the correct `event_id`; **no**
+`duplicate` and **no** `hash_mismatch`. This also documents the accepted semantics: a
+late-arriving sequence is reported as *both* the hole it left and the out-of-place line — two
+true statements about the disk, not double-counting.
+
+### Finding 3 — Hash pass on tampered unknown-type line untested — ADDRESS (nit, cheap)
+
+The code is correct (Pass A hashes every line before the D9 skip in Pass C), but the false-negative
+audit deserves the pin: unknown types must never become a hashing blind spot.
+
+**Test (`test_verify_schema.py`, next to `test_verify_unknown_type_not_a_finding`) —
+`test_verify_unknown_type_tampered_hash_is_caught`:** reuse the existing unknown-type line crafting
+(`type="widget.exploded"`, correct next seq) but set `event_hash` to a syntactically valid, wrong
+digest (e.g. `"sha256:" + "0"*64`). Assert: exit 1, exactly one `hash_mismatch` finding (correct
+stream/seq/event_id), and **no** `schema_invalid`/`unparseable` (the D9 skip still applies —
+payload validation stayed off; only the hash fired).
+
+### Finding 4 — Mid-walk `OSError` → exit 2 — ADDRESS as documentation; behavior RULED correct
+
+**Ruling: keep exit-2 abort for M0.** A mid-walk `OSError` (permission denied, disk error,
+vanished file) is **environmental, not log corruption** — it says nothing about the integrity of
+the bytes verify exists to judge. Converting it to a finding + continue would be worse on both
+axes: exit 1 would misreport an ops problem as data corruption, and any "partial verify" that
+skips an unreadable month file **cannot honestly claim the stream is gapless** — a green-ish
+report over an incompletely-read log is precisely the false assurance a verifier must never emit.
+Exit 2 already means "the run itself could not complete" in our convention (plan Ruling 4:
+usage/IO), and CI treats it as infra-red, not corruption-red. This also matches the plan's
+existing `UsageError` mapping for an unreadable `streams/` dir — the mid-walk case is the same
+class.
+
+**Change (doc only):** one sentence in `verify_workspace`'s docstring and a line in the plan's
+Risks: "A mid-walk `OSError` on a month file aborts the run with exit 2 (environmental, not a
+finding): a partially-read stream cannot honestly be reported gapless. Revisit at M4 scale if
+long-running verifies want per-stream isolation." No test (simulating a mid-walk `OSError`
+portably means chmod tricks that are flaky as root/CI; the abort path is a two-line re-raise
+already exercised by the unreadable-dir case).
+
+### Finding 5 — Gap-at-start untested — ADDRESS (nit, ~4 lines)
+
+Same code branch as the middle gap (`seq > expected` with `expected == 1`), but boundary pins are
+cheap and the first-line case is the one a chopped-head file produces in the wild.
+
+**Fix:** parametrize the existing `test_verify_deleted_line_is_gap` (delete middle → `missing
+2..2` vs delete **first** → `missing 1..1`), asserting one `gap` finding with the right detail and
+exit 1 in both cases. No new file.
+
+### Net change scope (one fixup commit)
+
+- `cli/msgctl/verify.py` — broaden the `Workspace.open` except tuple + `{exc!r}` detail (F1);
+  one docstring sentence on mid-walk `OSError` (F4). **No other code change; `workspace.py`
+  untouched (ENG-58 partition holds).**
+- `cli/tests/` — `test_verify_manifest_malformed_shapes_best_effort` (2 params, F1);
+  `test_verify_out_of_order` (F2); `test_verify_unknown_type_tampered_hash_is_caught` (F3);
+  parametrize gap test for first-line deletion (F5).
+- This session file — Risks note for the F4 ruling (done above).
+
+No plan rulings overturned — Rulings 1–10 stand; F1 tightens Ruling 6's best-effort promise to
+cover every malformed-manifest shape `Workspace.open` can actually raise, F4 formalizes what
+Ruling 4's exit-2 class already implied. Re-run local gates (`ruff check`, `ruff format --check`,
+`mypy`, `pytest`) before pushing; reply on the five review threads with these dispositions.
+
+---
+
+## Security Round 1 — Triage & Fix Plan
+
+Security review verdict: REQUEST_CHANGES on PR #7 (head 01ad720) — two medium findings, both on
+the tool's core promise ("can input make verify lie or crash before reporting?"). I verified both
+against the branch: **both are real, both ADDRESSED**. The reviewer's "verified safe" list
+(non-string/missing `event_hash` → `hash_mismatch` not a crash; `JCSError` containment; deep-JSON;
+`--json` integrity; seq/id extraction guards) matches my own reading — no action there.
+Implementer: `python-engineer`. Scope: `cli/msgctl/verify.py` + `cli/tests/test_verify*.py` only.
+
+**Summary of dispositions**
+
+| # | Finding | Severity | Decision |
+|---|---|---|---|
+| S1 | `payload_redacted` silently waives the hash check (verifier bypass) | medium | **ADDRESS — REVISE plan Ruling 2's exemption: at M0 the flag has NO authority. Run the hash check unconditionally + new FAILURE class `redacted_line`** |
+| S2 | Human report embeds attacker-controlled strings unescaped (ANSI/CR terminal spoofing) | medium | **ADDRESS — `_sanitize_for_terminal` (C0/C1/DEL → `\xNN`) at the `format_human` boundary, applied to ALL untrusted fields (wider than the two flagged)** |
+
+### S1 — `payload_redacted` verifier bypass — ADDRESS; ruled FAILURE at M0, exemption deferred to M1
+
+**The attack is real and cheap:** edit `body.payload.text`, set `server.payload_redacted: true`,
+leave `event_hash` stale → current code skips the hash check entirely, emits nothing, exit 0. One
+attacker-writable in-band bit defeats the exact tamper class the tool exists to catch — and
+silently, which is the worst failure mode a verifier can have.
+
+**Ruling — enforce M0 reality (FAILURE), not protocol semantics (warning):**
+
+- **TDD §2.1's redaction exemption is not being relitigated** — it is *protocol semantics for
+  authenticated server redaction*, an operation that **does not exist at M0**. No legitimate M0
+  writer (msgctl `send` is the only one) ever sets `payload_redacted=true`; ENG-57 hardcodes
+  `False`. A redacted line in an M0 workspace is therefore *definitionally anomalous* — there is
+  no legitimate case to protect with a warning, and "clean workspace verifies green" (the
+  acceptance criterion) is not violated by failing on a line no clean workspace can contain.
+- **Why not warning:** warning → exit 0 → CI green on a tamperable bypass. The operator must
+  *read* the report to catch it; CI never would. A verifier whose hash authority can be waived by
+  unauthenticated input while still exiting 0 is broken against its own threat model. Warning is
+  the M1+ posture, once redaction has an authority to check against.
+- **Semantics (two changes in `_walk_stream` Pass A):**
+  1. **Delete the exemption branch** — run the hash check **unconditionally** at M0 (`if not
+     redacted:` goes away; the `redacted` detection stays). The flag has no authority, so the line
+     is hashed like any other. Tampered body + stale hash → `hash_mismatch` fires as normal.
+  2. **New taxonomy class `redacted_line`, severity FAILURE** (plan Ruling 4 table amended),
+     emitted once per line where the flag is truthy, detail:
+     `"payload_redacted set, but M0 has no redaction authority — hash check NOT waived"`.
+     So: flag + tampered body → `redacted_line` **and** `hash_mismatch` (two true statements);
+     flag + untouched body → `redacted_line` only. Either way exit 1 — the bypass is closed and
+     visible.
+- **Plan bookkeeping:** this REVISES the plan's Ruling 2 bullet ("redaction exemption … skip the
+  hash check") — that bullet is withdrawn for M0. The revision is security-forced, local to
+  verify, and touches no TDD decision (D1 is *strengthened*: the hash check now has no waiver
+  path at all in M0).
+- **M1 server-ticket note (RECORD in the M1 redaction/upload ticket):** redaction must be an
+  **authenticated, audited server operation** (who redacted, when, under what authority — its own
+  event or signed server record), and M1 `verify` must validate a redacted line **against that
+  record** before honoring the §2.1 hash exemption. `redacted_line` then becomes: FAILURE when
+  unauthenticated/unmatched, silent-or-verbose when the audit record checks out. Never trust the
+  self-asserted in-band flag alone.
+
+**Tests (`test_verify_corruption.py`):**
+- `test_verify_redacted_flag_tampered_body`: real send; edit `body.payload.text`, set
+  `server.payload_redacted=true`, keep the stale `event_hash` (the reviewer's PoC) → exit **1**,
+  findings include BOTH `redacted_line` and `hash_mismatch` (correct stream/seq/event_id).
+- `test_verify_redacted_flag_alone_is_failure`: set the flag on an otherwise untouched line and
+  **re-fix nothing** (body unmodified ⇒ hash still faithful) → exit **1**, exactly one
+  `redacted_line`, **no** `hash_mismatch` (proving the two signals are independent).
+
+### S2 — ANSI/CR injection in the human report — ADDRESS (sanitize at the `format_human` boundary)
+
+**Verified, and the surface is WIDER than the review's two fields.** Raw attacker-controlled
+strings reaching the terminal via `format_human`:
+- `finding.detail` — `hash_mismatch` detail embeds `stored_hash = obj.get("event_hash")`
+  **unclipped and unescaped**; `_clip` (used for Pydantic dumps) collapses whitespace via
+  `" ".join(text.split())` but **passes ESC (0x1b) and other C0 through** (`str.split()` splits
+  on whitespace only);
+- `finding.file` and `finding.stream_id` — on-disk dir/file names an attacker can craft;
+- `summary.name` — the stream name from `workspace.json` (attacker-editable manifest);
+- `report.notes` (verbose) — embed raw `env.body.type` / `type_version` repr / `entry.name`.
+
+A crafted `event_hash` of `"\x1b[2K\rclean: 0 failures …"` overwrites the real finding line on a
+TTY — the human report is the operator's decision surface, so this makes verify visually lie even
+while the exit code is truthful.
+
+**Fix — exact mechanism:**
+- Add to `verify.py`:
+
+  ```python
+  _CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")  # C0, DEL, C1
+
+  def _sanitize_for_terminal(text: str) -> str:
+      """Escape C0/C1 control chars for TTY-safe display (\\xNN form).
+
+      Untrusted log/manifest content must never reach a terminal raw: ESC enables
+      ANSI rewriting, CR enables line overwrite. Applied ONLY in format_human —
+      Finding values stay raw so --json keeps byte-fidelity (json.dumps escapes
+      control chars itself, so the JSON path is already safe).
+      """
+      return _CTRL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+  ```
+
+- **Apply in `format_human` only**, to **every** untrusted interpolation: `finding.detail`,
+  `finding.file`, `finding.stream_id` (via the `sid` variable), `summary.stream_id`,
+  `summary.name`, and each `note` in the verbose loop. Trusted fields (`severity.value`, `cls`,
+  numeric counts, `seq`) need no treatment. **Escape-visibly (`\xNN`), don't strip** — stripping
+  would hide that an injection was attempted; the escaped bytes are themselves evidence.
+- **Do NOT sanitize at `Finding` construction** — `format_json` must keep raw values
+  (machine consumers want fidelity; `json.dumps` already escapes control chars safely). The
+  formatter boundary is the correct trust boundary. `!r` (the reviewer's alternative) is rejected
+  only on cosmetics: it quotes every field and double-escapes the JSON-ish details; `\xNN`
+  substitution neutralizes exactly the dangerous class with no other visual change. The existing
+  `{body_wsid!r}` in the workspace_id detail stays (harmless, already safe).
+- While in there: run `stored_hash` through `_clip(str(stored_hash))` in the `hash_mismatch`
+  detail (currently unclipped — a 10 MB fake hash string should not produce a 10 MB report line).
+  Defense-in-depth; the sanitizer is the actual security fix.
+
+**Test (`test_verify_json.py` or new `test_verify_report_safety.py`) —
+`test_verify_human_output_has_no_control_chars`:** build a hostile fixture: real send, then (a)
+rewrite the line's `event_hash` to `"sha256:\x1b[2K\rclean: 0 failures\x1b[0m"` and (b) add a
+manifest stream entry whose name contains `\x1b[31m`. Run `verify` (human) via subprocess:
+- exit 1; stdout contains **no** raw `\x1b` and **no** raw `\r` (`"\x1b" not in out and "\r" not
+  in out`), while the literal escaped text `\x1b` (backslash-x form) IS present — proving
+  escape-not-strip;
+- the genuine `hash_mismatch` line is present and last-line totals report ≥1 failure (spoof did
+  not displace real findings);
+- same fixture with `--json`: output parses, the raw `event_hash` value round-trips through
+  `json.loads` byte-identically (fidelity preserved), exit code identical.
+
+### Net change scope (one fixup commit, combinable with Review Round 1's)
+
+- `cli/msgctl/verify.py` — S1: drop the redaction hash-waiver, add `redacted_line` FAILURE class
+  (taxonomy + docstring + Ruling-2-revision comment); S2: `_CTRL_RE` + `_sanitize_for_terminal`,
+  applied to all untrusted fields in `format_human`; `_clip` the `stored_hash` detail. **No other
+  files; `workspace.py`/`append.py`/`core/` untouched.**
+- `cli/tests/` — `test_verify_redacted_flag_tampered_body`,
+  `test_verify_redacted_flag_alone_is_failure`,
+  `test_verify_human_output_has_no_control_chars` (+ its `--json` fidelity counterpart).
+- Plan deltas recorded here: Ruling 2's redaction-exemption bullet **withdrawn for M0** (S1);
+  Ruling 4 taxonomy gains `redacted_line` (failure); M1 redaction ticket note recorded (S1).
+
+Re-run local gates (`ruff check`, `ruff format --check`, `mypy`, `pytest`) before pushing; reply
+on both security threads with these dispositions.
