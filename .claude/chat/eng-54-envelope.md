@@ -168,3 +168,96 @@ All ENG-54 test files are namespaced to avoid any overlap with ENG-55/56 test fi
 - **Merge coordination with ENG-55 (parallel).** Shared additive edits: `server/pyproject.toml` deps (ENG-55 adds `rfc8785` or vendors JCS), root `pyproject.toml` dev group (both add `hypothesis`), and `uv.lock`. Plan: land ENG-54 first if possible; whoever merges second re-runs `uv sync` to regenerate `uv.lock` (do not hand-merge the lock) and dedupes `hypothesis`. `core/__init__.py`: ENG-54 makes **zero** edits, so no conflict there by design. `core/testdata/` and `jcs.py`/`hashing.py` are untouched by ENG-54, so no file-level collision with ENG-55/56.
 - **ULID library API surface.** Confirm `python-ulid`'s `ULID` exposes construction from timestamp+randomness and a validity/parse path; the monotonic factory is implemented in `ids.py` regardless, using the library only for encode/decode. If `python-ulid`'s API is awkward for the monotonic increment, the fallback is to keep the 48-bit time + 80-bit randomness handling in `ids.py` directly (still no new dependency).
 - **Envelope assembly vs. hashing boundary.** ENG-54 stops at `Body` builders + an `Envelope` model with an opaque `event_hash`. Full seal (compute hash, attach server metadata) is ENG-56/M1. Tests use placeholder hashes. This keeps ENG-54 mergeable without ENG-55/56 present.
+
+---
+
+## Review Round 1 — Triage & Fix Plan
+
+Reviewer verdict: REQUEST_CHANGES (comment form, own-PR). Five findings on PR #3. One substantive (size-cap form), four nits. This is a **locked-schema correctness round, not a refactor** — scope is deliberately minimal. Implementer: `python-engineer`. Decisions below are final for the M0 lock.
+
+**Summary of dispositions**
+
+| # | Finding | Severity | Decision |
+|---|---|---|---|
+| 1 | Size cap measured over full `Envelope`, not §3.2 `{body, event_hash}` wire form | substantive | **ADDRESS** |
+| 2 | `format` has default `"markdown"` but §2.2 lists it required | nit | **DECIDE → keep default** (record rationale) |
+| 3 | RFC 3339 regex accepts out-of-range instants | nit | **DECIDE → keep shape-only** + add scope comment |
+| 4 | `test_unknown_payload_field_survives` doesn't exercise `extra="allow"` | nit | **ADDRESS** (comment + real payload-config guard) |
+| 5 | Headline round-trip is structural, not byte-verbatim | nit/info | **PUSH BACK** (document rationale; add clarifying comment) |
+
+---
+
+### Finding 1 — Size cap must measure the §3.2 upload wire form — ADDRESS
+
+**Why it's right.** §2.1 defines the cap as "hard reject **at upload**" and §3.2 fixes the upload wire form as exactly `{ "body": {...}, "event_hash": "sha256:..." }` — no `signature`, no `server`. Measuring the full `Envelope` makes the size of an identical client `body` depend on whether server metadata has been attached (not form-stable), and over-counts even at the upload point by the two null keys (`,"signature":null,"server":null`). Since this definition is inherited downstream (TS client M2, exports M4), it must be pinned to the uploaded bytes **before the schema locks**. This also corrects the plan's own Step-5 "compact-JSON of the envelope" wording, which was imprecise.
+
+**Fix — `server/msgd/core/envelope.py`.** Change `serialized_size_bytes` to measure **only** the wire form, independent of `signature`/`server`:
+
+```python
+def serialized_size_bytes(envelope: Envelope) -> int:
+    """UTF-8 byte length of the §3.2 upload wire form ``{body, event_hash}``.
+
+    The cap is defined over the bytes the client uploads (§2.1 "hard reject at
+    upload", §3.2 wire form), NOT the full stored envelope — ``signature`` and
+    ``server`` are excluded so the measured size is stable for a given ``body``
+    regardless of whether server metadata has been attached.
+    """
+    wire = {"body": envelope.body.model_dump(mode="json"), "event_hash": envelope.event_hash}
+    compact = json.dumps(wire, separators=(",", ":"), ensure_ascii=False)
+    return len(compact.encode("utf-8"))
+```
+
+`check_event_size` is unchanged (it delegates to `serialized_size_bytes`). Update the docstring reference in the module header if it implies whole-envelope measurement.
+
+**Tests — `server/tests/test_envelope.py`.**
+- `test_size_cap_boundary` and `test_size_cap_accepts_normal_event` currently build from `_valid_envelope_dict()` (which carries a `server` block). They still pass under the wire-form measurement because padding is computed via the same function — but the intent is now different, so update the comments to say the boundary is over `{body, event_hash}`.
+- **Add `test_size_cap_is_form_stable`** — the key new guarantee: build one `body`+`event_hash`, measure it once with `server=None` and once with a `ServerMetadata` attached, assert `serialized_size_bytes` is **identical** across both. This is the regression that locks the fix.
+
+Not blocking on M1: the binding reject still lives at upload (§3.2/§4.3) and must reuse `check_event_size` — already noted in Risks.
+
+### Finding 2 — `format` default `"markdown"` vs. §2.2 "required" — DECIDE: keep the default
+
+**Ruling: keep `format: Literal["markdown", "plain"] = "markdown"`.** This confirms plan Q1 as the M0 lock. Rationale, recorded now because field-requiredness locks here:
+
+- `MessageCreatedV1` is a **validation-only** view (§3.2 "schema (type + version)" check). It never round-trips back into the stored `body` — the body's `payload` is the opaque dict preserved verbatim (locked call 2). So defaulting does **not** mutate stored bytes and cannot cause a hash mismatch: a client that omits `format` stores a payload with no `format` key, and the hash is over exactly those bytes.
+- "Required" in the §2.2 table is the **payload contract** (`format` is always meaningful for a message), not a wire-level "reject if absent." Defaulting satisfies the contract: every validated `MessageCreatedV1` has a well-defined `format`, and markdown is the safe, useful default.
+- Additive-friendly per §2.3/D9: new format values arrive via a `type_version` bump, so the `Literal` is not an evolution hazard.
+
+No code change. `python-engineer`: keep the existing `format` field and its test; ensure a `test_payloads.py` case asserts that omitting `format` yields `"markdown"` (documents the locked behavior).
+
+### Finding 3 — RFC 3339 regex is shape-only — DECIDE: keep shape-only, add a scope comment
+
+**Ruling: do not tighten the regex; document the scope.** Range validation (rejecting month 13, hour 99) has **no correctness value here** and is not worth the fiddly regex/parse:
+
+- `client_created_at` is untrusted metadata (D14) — nothing orders or displays on it as authority; server sequence/time are authoritative.
+- `server_received_at` is server-minted, so it is never out-of-range in practice.
+- The lock we care about is **verbatim preservation** (str, not `datetime`), which shape-only validation already guarantees. A stricter validator would add surface area with zero downstream benefit.
+
+**Fix — `server/msgd/core/envelope.py`.** One-line scope comment at `_RFC3339_RE` / `_validate_rfc3339` making the deliberate choice explicit, e.g.: `# Shape-only: we validate structure, not value ranges (2026-13-45T99:99:99Z passes). Range checks add no value — timestamps are untrusted (D14) and preserved verbatim; server time is authoritative.` No behavior change.
+
+### Finding 4 — `test_unknown_payload_field_survives` doesn't exercise `extra="allow"` — ADDRESS
+
+**Why it's right.** `payload` is typed `dict[str, Any]` on `Body`, so an unknown key inside it round-trips because it's dict data, not because of any model config — the test would pass even if `extra="allow"` were removed. The `body`/`server`/top-level variants do pin the config; this one is mislabeled.
+
+**Fix (minimal).**
+- `server/tests/test_envelope.py`: add a comment on `test_unknown_payload_field_survives` clarifying it exercises **dict passthrough**, not the `extra="allow"` config, so a future reader doesn't treat it as the payload-config guard.
+- `server/tests/test_payloads.py`: add the **real** payload-config guard — `MessageCreatedV1` also sets `extra="allow"` (for additive-only v1 evolution, §2.3.2). Add `test_message_created_v1_unknown_field_survives`: validate a `MessageCreatedV1` with an unknown key and assert it re-emits under `model_dump` (this is the test that would fail if `extra="allow"` were dropped from the payload model).
+
+### Finding 5 — Headline round-trip is structural, not byte-verbatim — PUSH BACK (document)
+
+**Ruling: structural (dict deep-equal) is the correct invariant; no assertion change.** Reply to post on the thread:
+
+> Deliberate — structural deep-equality is the invariant we want here, not byte/key-order. `event_hash` is SHA-256 over **JCS(body)**, and JCS re-sorts keys canonically, so hash reproducibility depends only on structural fidelity (same keys, same values), which this test asserts. Byte/key-order preservation is explicitly *not* a requirement: `extra="allow"` re-emits unknown fields after declared fields, so declared+extra key order isn't preserved in general — and that's fine because nothing hashes the raw envelope bytes. The "byte-lossless" phrasing in the acceptance criterion means *no field is dropped or mutated* (which `extra="allow"` + str timestamps guarantee), not *byte-verbatim reserialization*.
+
+**Fix (doc only):** add a one-line comment on `test_2_1_example_round_trips_losslessly` noting the assertion is structural-equality-for-JCS-fidelity, not byte-verbatim, so the distinction is captured in the code. No behavior change.
+
+---
+
+### Net change scope
+
+- `server/msgd/core/envelope.py` — rewrite `serialized_size_bytes` to the wire form (Finding 1); add RFC-3339 scope comment (Finding 3).
+- `server/tests/test_envelope.py` — add `test_size_cap_is_form_stable`; comment updates on size-cap and round-trip tests (Findings 1, 4, 5).
+- `server/tests/test_payloads.py` — add `test_message_created_v1_unknown_field_survives`; assert `format` defaults to markdown (Findings 4, 2).
+- No change to `format` field, RFC-3339 regex behavior, or the round-trip assertion.
+
+Only Finding 1 is behavior-changing; the rest are tests/comments/rulings. Re-run local gates (`ruff`, `mypy`, `pytest`) before pushing the fixup. After push, reply on Finding 5's thread with the text above and resolve threads 2/3 with the recorded rulings.
