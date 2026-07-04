@@ -22,7 +22,7 @@ from msgd.core.envelope import Envelope, EventTooLargeError, ServerMetadata, che
 from msgd.core.hashing import hash_event
 from msgd.core.payloads import build_message_created_body
 
-from msgctl import __version__
+from msgctl import __version__, verify
 from msgctl.append import append_event
 from msgctl.errors import MsgctlError
 from msgctl.projection import PROJECTION_DB_NAME, open_db, project
@@ -82,6 +82,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     project_parser.add_argument("dir", help="workspace directory")
     project_parser.set_defaults(handler=cmd_project)
+
+    # ENG-60: `verify` — append-only block (ENG-58 adds `project` in parallel; keep both
+    # additions surgical so the two tickets conflict on at most this one file, trivially).
+    verify_parser = subparsers.add_parser(
+        "verify", help="re-hash every event and check per-stream sequence contiguity"
+    )
+    verify_parser.add_argument("dir", help="workspace directory")
+    verify_parser.add_argument(
+        "--json", action="store_true", help="emit one machine-readable JSON object"
+    )
+    verify_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show per-stream OK lines and unknown-type notes",
+    )
+    verify_parser.set_defaults(handler=cmd_verify)
 
     return parser
 
@@ -157,6 +173,19 @@ def cmd_project(args: argparse.Namespace) -> int:
         )
     )
     return 0
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    # Thin adapter (Ruling 10): verify_workspace does the whole read-only walk and returns
+    # a report. A workspace with findings is a *successful run that found problems*, so the
+    # findings-based exit code (0/1) is returned directly — only usage/IO raises (UsageError
+    # -> exit 2 via main's `except MsgctlError`).
+    report = verify.verify_workspace(args.dir, verbose=args.verbose)
+    if args.json:
+        print(verify.format_json(report))
+    else:
+        print(verify.format_human(report, verbose=args.verbose))
+    return report.exit_code
 
 
 def main(argv: list[str] | None = None) -> int:
