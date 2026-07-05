@@ -273,3 +273,100 @@ async def test_private_channel_bootstrap_ordering(db_session: AsyncSession) -> N
     meta_events = await fetch_stream_events(db_session, meta)
     assert meta_events[-1].type == "channel.created"
     assert meta_events[-1].stream_id == meta  # homed in workspace-meta
+
+
+async def test_colliding_channel_created_is_total_noop(db_session: AsyncSession) -> None:
+    """SECURITY (round 1): a ``channel.created`` whose ``channel_stream_id``
+    collides with an EXISTING stream mutates nothing — in particular it must NOT
+    insert the colliding author's ``stream_members`` row (silent cross-stream
+    read grant). Covers both public and private colliding variants, and a
+    collision against a non-channel (dm) victim stream."""
+    ws, meta, users = await _seed(db_session, n_users=2)
+    victim_owner, attacker = users
+
+    # Victim's private channel, owned/joined by victim_owner only.
+    victim = ids.new_stream_id()
+    await apply_reducer(
+        db_session,
+        _meta_body(
+            workspace_id=ws,
+            stream_id=meta,
+            author=victim_owner,
+            type="channel.created",
+            payload={"channel_stream_id": victim, "name": "secret", "visibility": "private"},
+        ),
+    )
+    # A victim dm stream too (collisions are gated regardless of victim kind).
+    victim_dm = ids.new_stream_id()
+    await apply_reducer(
+        db_session,
+        _meta_body(
+            workspace_id=ws,
+            stream_id=victim_dm,
+            author=victim_owner,
+            type="dm.created",
+            payload={"dm_stream_id": victim_dm, "member_user_ids": [victim_owner]},
+        ),
+    )
+    await db_session.flush()
+    before = await _snapshot(db_session)
+
+    for visibility in ("public", "private"):
+        for target in (victim, victim_dm):
+            await apply_reducer(
+                db_session,
+                _meta_body(
+                    workspace_id=ws,
+                    stream_id=meta,
+                    author=attacker,
+                    type="channel.created",
+                    payload={
+                        "channel_stream_id": target,
+                        "name": "innocuous",
+                        "visibility": visibility,
+                    },
+                ),
+            )
+    await db_session.flush()
+
+    # Total no-op: no membership grafted, no name/visibility/kind churn.
+    assert await _snapshot(db_session) == before
+    assert await db_session.get(StreamMember, (victim, attacker)) is None
+    assert await db_session.get(StreamMember, (victim_dm, attacker)) is None
+
+
+async def test_colliding_dm_created_is_total_noop(db_session: AsyncSession) -> None:
+    """SECURITY (round 1): a ``dm.created`` whose ``dm_stream_id`` collides with
+    an existing stream mutates nothing — the attacker-chosen ``member_user_ids``
+    are never grafted onto the victim stream."""
+    ws, meta, users = await _seed(db_session, n_users=2)
+    victim_owner, attacker = users
+
+    victim = ids.new_stream_id()
+    await apply_reducer(
+        db_session,
+        _meta_body(
+            workspace_id=ws,
+            stream_id=meta,
+            author=victim_owner,
+            type="channel.created",
+            payload={"channel_stream_id": victim, "name": "secret", "visibility": "private"},
+        ),
+    )
+    await db_session.flush()
+    before = await _snapshot(db_session)
+
+    await apply_reducer(
+        db_session,
+        _meta_body(
+            workspace_id=ws,
+            stream_id=victim,
+            author=attacker,
+            type="dm.created",
+            payload={"dm_stream_id": victim, "member_user_ids": [attacker]},
+        ),
+    )
+    await db_session.flush()
+
+    assert await _snapshot(db_session) == before
+    assert await db_session.get(StreamMember, (victim, attacker)) is None

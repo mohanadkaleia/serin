@@ -42,9 +42,15 @@ async def _insert_stream_if_absent(
     kind: str,
     name: str | None,
     visibility: str | None,
-) -> None:
-    """``INSERT … ON CONFLICT DO NOTHING`` a ``streams`` row (head_seq defaults 0)."""
-    await db.execute(
+) -> bool:
+    """``INSERT … ON CONFLICT DO NOTHING RETURNING`` a ``streams`` row.
+
+    Returns ``True`` iff this call actually created the row (``head_seq``
+    defaults 0); ``False`` means the stream id already existed. Genesis reducers
+    MUST gate their per-genesis side effects (member-adds) on this flag —
+    see the SECURITY guard in ``_reduce_channel_created`` / ``_reduce_dm_created``.
+    """
+    result = await db.execute(
         pg_insert(Stream)
         .values(
             stream_id=stream_id,
@@ -54,7 +60,9 @@ async def _insert_stream_if_absent(
             visibility=visibility,
         )
         .on_conflict_do_nothing(index_elements=[Stream.stream_id])
+        .returning(Stream.stream_id)
     )
+    return result.first() is not None
 
 
 async def _add_member_if_absent(db: AsyncSession, *, stream_id: str, user_id: str) -> None:
@@ -99,9 +107,19 @@ async def _reduce_channel_created(db: AsyncSession, body: dict[str, Any]) -> Non
     defaults 0) is created here regardless of where the genesis event is homed —
     §2.2 privacy placement (public → workspace-meta; private → the channel's own
     stream seq 1) is decided by the caller/uploader, not the reducer.
+
+    SECURITY (round 1): the creator member-add is gated on the stream insert
+    actually creating the row. A genesis event whose ``channel_stream_id``
+    collides with an EXISTING stream must be a total no-op — otherwise the
+    colliding author would silently gain a ``stream_members`` row on someone
+    else's stream (a cross-stream read grant). This reducer no-op is
+    defense-in-depth, not the primary gate: **ENG-66's upload validator must
+    additionally REJECT genesis events whose stream id already exists.**
+    A genuine full-log replay is unaffected (the rebuilt row is created fresh,
+    so the gate passes; an in-place re-apply already has the membership row).
     """
     payload = body["payload"]
-    await _insert_stream_if_absent(
+    created = await _insert_stream_if_absent(
         db,
         stream_id=payload["channel_stream_id"],
         workspace_id=body["workspace_id"],
@@ -109,9 +127,10 @@ async def _reduce_channel_created(db: AsyncSession, body: dict[str, Any]) -> Non
         name=payload["name"],
         visibility=payload["visibility"],
     )
-    await _add_member_if_absent(
-        db, stream_id=payload["channel_stream_id"], user_id=body["author_user_id"]
-    )
+    if created:
+        await _add_member_if_absent(
+            db, stream_id=payload["channel_stream_id"], user_id=body["author_user_id"]
+        )
 
 
 async def _reduce_channel_renamed(db: AsyncSession, body: dict[str, Any]) -> None:
@@ -159,9 +178,17 @@ async def _reduce_dm_created(db: AsyncSession, body: dict[str, Any]) -> None:
 
     No DM-creation endpoint ships in ENG-65 (M3 lazy-on-first-message); the
     reducer + predicate support exist so the machinery is ready.
+
+    SECURITY (round 1): the member-adds are gated on the stream insert actually
+    creating the row — a ``dm_stream_id`` colliding with an existing stream must
+    be a total no-op, or the colliding author could graft their chosen
+    ``member_user_ids`` onto someone else's stream (cross-stream read grant).
+    Defense-in-depth only: **ENG-66's upload validator must additionally REJECT
+    colliding genesis ids.** Full-log replay is unaffected (see
+    ``_reduce_channel_created``).
     """
     payload = body["payload"]
-    await _insert_stream_if_absent(
+    created = await _insert_stream_if_absent(
         db,
         stream_id=payload["dm_stream_id"],
         workspace_id=body["workspace_id"],
@@ -169,8 +196,9 @@ async def _reduce_dm_created(db: AsyncSession, body: dict[str, Any]) -> None:
         name=None,
         visibility=None,
     )
-    for user_id in payload["member_user_ids"]:
-        await _add_member_if_absent(db, stream_id=payload["dm_stream_id"], user_id=user_id)
+    if created:
+        for user_id in payload["member_user_ids"]:
+            await _add_member_if_absent(db, stream_id=payload["dm_stream_id"], user_id=user_id)
 
 
 #: Reducer registry keyed by event ``type``.  Types absent here have no reducer
