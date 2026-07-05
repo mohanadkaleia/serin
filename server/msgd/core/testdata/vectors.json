@@ -72,6 +72,13 @@
       "hash": "sha256:7da714c11781fdd17c9dff3844dd3106deeecdda94241f3e75409d749f918f1d"
     },
     {
+      "id": "dup-key-last-wins",
+      "desc": "Duplicate object key: json.loads keeps the LAST value (CPython and V8 are both last-wins). Pins parse-then-hash semantics so a future non-standard TS parser cannot silently diverge; consumers MUST parse with a last-wins parser.",
+      "input_json": "{\"a\":1,\"a\":2}",
+      "canonical_b64": "eyJhIjoyfQ==",
+      "hash": "sha256:7e8059f495589fcd981232cc11d00b00da3802c01d688fa1cf1f6bed6e5bb33c"
+    },
+    {
       "id": "keys-unsorted",
       "desc": "Object keys emitted in sorted order.",
       "input_json": "{\"b\":1,\"a\":2,\"c\":3}",
