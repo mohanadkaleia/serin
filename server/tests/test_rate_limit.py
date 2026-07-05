@@ -87,3 +87,37 @@ async def test_window_advance_resets(settings: Settings, db_session: AsyncSessio
         clock.now += 61  # advance past the 60s window
         allowed = await do_login(client, email="same@example.com", password="pw-abcdefghij")
         assert allowed.status_code == 401  # limiter reset → back to normal auth path
+
+
+def test_evicts_elapsed_buckets() -> None:
+    """Elapsed windows are swept, bounding memory to ~one window of keys.
+
+    Pure unit test (no container): fill distinct buckets, advance the injected
+    clock past the window, and confirm the next check drops all stale entries.
+    """
+    clock = Clock()
+    limiter = RateLimiter(10, 60, now=clock)
+    for i in range(50):
+        limiter.check(f"ip:10.0.0.{i}")
+    assert limiter.bucket_count == 50
+
+    clock.now += 61  # every window has ended; the next check triggers the sweep
+    limiter.check("ip:fresh")
+    assert limiter.bucket_count == 1  # only the fresh bucket survives
+
+
+def test_eviction_keeps_live_buckets() -> None:
+    """The sweep drops only elapsed windows; an active bucket keeps its count."""
+    clock = Clock()
+    limiter = RateLimiter(10, 60, now=clock)
+    limiter.check("old")  # window [1000, 1060)
+    clock.now += 45
+    limiter.check("young")  # window [1045, 1105)
+    clock.now += 20  # now=1065: "old" elapsed, "young" still live
+
+    limiter.check("young")
+    assert limiter.bucket_count == 1  # "old" swept, "young" retained
+    # "young" kept its count across the sweep: 2 hits so far, 8 more allowed.
+    for _ in range(8):
+        assert limiter.check("young").allowed
+    assert not limiter.check("young").allowed

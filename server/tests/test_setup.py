@@ -3,22 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
 
-from authutil import OWNER, auth_header, do_setup
-from httpx import ASGITransport, AsyncClient
-from msgd.api.app import create_app
-from msgd.db.engine import get_session
+from authutil import OWNER, auth_header, committing_app, do_setup, truncate_auth_tables
+from httpx import AsyncClient
 from msgd.settings import Settings
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import (
-    AsyncEngine,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
-
-_AUTH_TABLES = "sessions, devices, invites, users, workspaces"
+from sqlalchemy.ext.asyncio import create_async_engine
 
 
 async def test_first_run_creates_owner(client: AsyncClient) -> None:
@@ -49,33 +38,7 @@ async def test_second_setup_conflicts(client: AsyncClient) -> None:
     assert body["status"] == 409
 
 
-# --- concurrency: committing fixture (the harness client cannot race) ---------
-
-
-def _committing_app(settings: Settings) -> tuple[AsyncClient, AsyncEngine]:
-    """An app whose ``get_session`` yields real, independently-committing sessions.
-
-    The shared harness ``client`` routes every request through one connection, so
-    it cannot exercise the advisory-lock race. This builds a throwaway app on its
-    own engine (a fresh session/connection per request) so two concurrent setups
-    genuinely contend on ``pg_advisory_xact_lock``.
-    """
-    engine = create_async_engine(settings.database_url)
-    maker = async_sessionmaker(engine, expire_on_commit=False)
-    app = create_app(settings)
-
-    async def _override_get_session() -> AsyncIterator[AsyncSession]:
-        async with maker() as session:
-            yield session
-
-    app.dependency_overrides[get_session] = _override_get_session
-    client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
-    return client, engine
-
-
-async def _truncate(engine: AsyncEngine) -> None:
-    async with engine.begin() as conn:
-        await conn.execute(text(f"TRUNCATE {_AUTH_TABLES} RESTART IDENTITY CASCADE"))
+# --- concurrency: committing fixture lives in authutil (shared with invites) --
 
 
 async def test_setup_race_exactly_one_winner(settings: Settings, migrated_db: str) -> None:
@@ -85,10 +48,10 @@ async def test_setup_race_exactly_one_winner(settings: Settings, migrated_db: st
     the loser, unblocked, sees ``count(users) > 0`` and returns 409.
     """
     cleanup_engine = create_async_engine(settings.database_url)
-    await _truncate(cleanup_engine)  # start from a genuinely empty server
+    await truncate_auth_tables(cleanup_engine)  # start from an empty server
 
-    c1, e1 = _committing_app(settings)
-    c2, e2 = _committing_app(settings)
+    c1, e1 = committing_app(settings)
+    c2, e2 = committing_app(settings)
     try:
         async with c1, c2:
             r1, r2 = await asyncio.gather(
@@ -99,7 +62,7 @@ async def test_setup_race_exactly_one_winner(settings: Settings, migrated_db: st
         winner = r1 if r1.status_code == 200 else r2
         assert winner.json()["role"] == "owner"
     finally:
-        await _truncate(cleanup_engine)  # don't leak committed rows to other tests
+        await truncate_auth_tables(cleanup_engine)  # no committed-row leakage
         await e1.dispose()
         await e2.dispose()
         await cleanup_engine.dispose()

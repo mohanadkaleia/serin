@@ -6,8 +6,13 @@ Mechanism
 ``dict[key -> (window_start, count)]``. When a request arrives, the current
 window is derived from the injected clock; if it advanced past the stored
 window, the counter resets. Each check increments and reports whether the limit
-was exceeded (the attempt still counts toward the window). ``Retry-After`` is the
-seconds until the current window ends.
+was exceeded (the attempt still counts toward the window). ``Retry-After`` is
+the seconds until the current window ends, rounded up.
+
+Elapsed windows are evicted lazily: at most once per window, a check sweeps the
+bucket dict and drops every entry whose window has ended, so the map is bounded
+by the distinct keys seen within roughly one window rather than growing for the
+process lifetime.
 
 The clock is injectable (a monotonic ``now()`` by default) so tests advance time
 without sleeping.
@@ -17,9 +22,12 @@ Single-worker honesty note
 This state is **per-process in-memory**. The MVP runs **exactly one uvicorn
 worker** (TDD §1/§11), so per-process == whole-server and this is correct as-is.
 Horizontal scaling / multiple workers would need a shared store (e.g. Redis) —
-explicitly out of MVP scope. The read-modify-write happens synchronously on the
-event loop with no ``await`` between read and write, so no lock is needed; the
-CPU-bound argon2 verify runs in a threadpool, separate from this state.
+explicitly out of MVP scope. Each :meth:`RateLimiter.check` call is a plain
+synchronous method — its read-modify-write completes without yielding to the
+event loop, so single-bucket updates cannot interleave and no lock is needed.
+Callers that check *multiple* buckets may ``await`` between checks; the buckets
+are independent, so that interleaving is harmless. The CPU-bound argon2 verify
+runs in a threadpool and never touches this state.
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ class RateLimiter:
         self._window = window_seconds
         self._now = now
         self._buckets: dict[str, tuple[float, int]] = {}
+        self._last_sweep = now()
 
     @property
     def limit(self) -> int:
@@ -62,6 +71,24 @@ class RateLimiter:
     def window_seconds(self) -> int:
         return self._window
 
+    @property
+    def bucket_count(self) -> int:
+        """Number of tracked buckets (observability + eviction tests)."""
+        return len(self._buckets)
+
+    def _evict_elapsed(self, now: float) -> None:
+        """Drop every bucket whose window has ended; runs at most once/window.
+
+        Keeps memory bounded by the keys seen within ~one window. O(n) over the
+        bucket dict, amortized to once per window — fine for a single worker.
+        """
+        if now - self._last_sweep < self._window:
+            return
+        self._last_sweep = now
+        expired = [k for k, (start, _) in self._buckets.items() if now - start >= self._window]
+        for key in expired:
+            del self._buckets[key]
+
     def check(self, key: str) -> RateLimitResult:
         """Record one hit on ``key``; report whether it is within the limit.
 
@@ -69,6 +96,7 @@ class RateLimiter:
         extends its own denial for the remainder of the window.
         """
         now = self._now()
+        self._evict_elapsed(now)
         window_start, count = self._buckets.get(key, (now, 0))
         if now - window_start >= self._window:
             # Window elapsed → start a fresh one at the current instant.

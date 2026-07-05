@@ -14,7 +14,13 @@ from httpx import ASGITransport, AsyncClient
 from msgd.api.app import create_app
 from msgd.db.engine import get_session
 from msgd.settings import Settings
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 # A valid owner payload (password ≥ 12 chars, no composition rules).
 OWNER = {
@@ -122,3 +128,37 @@ def make_app(
 def make_client(app: FastAPI) -> AsyncClient:
     """Wrap ``app`` in an in-process ASGI client (caller uses ``async with``)."""
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+# --- committing fixtures (true-concurrency tests only) -------------------------
+
+AUTH_TABLES = "sessions, devices, invites, users, workspaces"
+
+
+def committing_app(settings: Settings) -> tuple[AsyncClient, AsyncEngine]:
+    """An app whose ``get_session`` yields real, independently-committing sessions.
+
+    The shared harness ``client`` routes every request through one
+    connection/session (rollback isolation), so it cannot exercise true DB
+    concurrency — the advisory-lock setup race or a blocking unique-index race.
+    This builds a throwaway app on its own engine: every request gets a fresh
+    session (own pooled connection), and commits are real. Callers must
+    ``truncate_auth_tables`` afterwards so committed rows don't leak.
+    """
+    engine = create_async_engine(settings.database_url)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    app = create_app(settings)
+
+    async def _override_get_session() -> AsyncIterator[AsyncSession]:
+        async with maker() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = _override_get_session
+    client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    return client, engine
+
+
+async def truncate_auth_tables(engine: AsyncEngine) -> None:
+    """Wipe the auth tables a committing test wrote (cleanup + preconditions)."""
+    async with engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {AUTH_TABLES} RESTART IDENTITY CASCADE"))

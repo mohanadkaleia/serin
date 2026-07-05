@@ -7,10 +7,12 @@ rate limiter (per-IP + per-email, D6) *before* any argon2 work runs.
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msgd.api import problems
@@ -40,6 +42,8 @@ from msgd.auth.tokens import hash_token
 from msgd.core.ids import new_user_id, new_workspace_id
 from msgd.db.engine import get_session
 from msgd.db.models import Device, Invite, User, Workspace
+
+logger = logging.getLogger("msgd.auth")
 
 router = APIRouter(prefix="/v1", tags=["auth"])
 
@@ -130,8 +134,14 @@ async def login(req: LoginRequest, db: DbSession, settings: AppSettings) -> Logi
     if not await verify_password(settings, user.password_hash, req.password):
         raise problems.invalid_credentials()
 
-    # Wired for a future param-upgrade flow; M1 checks but does not act (D8).
-    needs_rehash(settings, user.password_hash)
+    # D8 seam: rehash-on-login (with the plaintext in hand) is deferred past M1;
+    # until then, surface stale-parameter hashes in the logs so operators see
+    # when a params bump has left old hashes behind. Never log the hash itself.
+    if needs_rehash(settings, user.password_hash):
+        logger.info(
+            "password hash uses stale argon2 parameters; rehash deferred (D8)",
+            extra={"user_id": user.user_id},
+        )
 
     device = await mint_or_reuse_device(
         db,
@@ -199,6 +209,13 @@ async def accept_invite(
 
     Single-use is enforced by an atomic ``UPDATE ... WHERE used_by IS NULL
     RETURNING``: two concurrent accepts race on that update and exactly one wins.
+
+    Claim-then-check (security round 1): the claim runs FIRST; email uniqueness
+    is enforced by letting ``UNIQUE(workspace_id, email)`` reject the INSERT.
+    The resulting rollback un-claims the invite in the same transaction — a
+    duplicate-email attempt never burns a single-use invite — and the generic
+    409 body discloses nothing about which emails exist (no pre-check SELECT,
+    so no oracle and no concurrent-duplicate 500).
     """
     now = utcnow()
     token_hash = hash_token(req.token)
@@ -209,16 +226,6 @@ async def accept_invite(
         raise problems.invite_used()
     if now >= invite.expires_at:
         raise problems.invite_expired()
-
-    # Guard email uniqueness before consuming the invite so a duplicate email
-    # doesn't burn a single-use invite (UNIQUE(workspace_id, email)).
-    existing = await db.scalar(
-        select(User)
-        .where(User.workspace_id == invite.workspace_id, User.email == req.email)
-        .limit(1)
-    )
-    if existing is not None:
-        raise problems.forbidden("an account with this email already exists")
 
     new_user_ident = new_user_id()
     claimed = await db.execute(
@@ -242,7 +249,16 @@ async def accept_invite(
             role=invite.role,
         )
     )
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # UNIQUE(workspace_id, email) rejected the INSERT (Postgres checks it at
+        # statement execution, i.e. here — a concurrent same-email accept blocks
+        # on the index until the winner commits, then raises the same way).
+        # Roll back the whole transaction: the invite claim above is undone, so
+        # the invite stays usable. Generic 409 — no email-existence oracle.
+        await db.rollback()
+        raise problems.account_conflict() from None
 
     # ENG-65 seam: emit user.joined to workspace-meta here (deferred, plan D7).
 

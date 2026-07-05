@@ -162,6 +162,18 @@ def invite_expired() -> ProblemException:
     )
 
 
+def account_conflict() -> ProblemException:
+    # Deliberately generic — no email-existence oracle: the same body is
+    # returned for any uniqueness clash on account creation, so acceptance
+    # discloses nothing about which emails already exist.
+    return ProblemException(
+        status=409,
+        type="/problems/account-conflict",
+        title="Account cannot be created",
+        detail="account cannot be created with these details",
+    )
+
+
 def invalid_invite() -> ProblemException:
     return ProblemException(
         status=404,
