@@ -6,6 +6,18 @@ dependencies = [
     "pydantic>=2.7",
     "python-ulid>=2.2",
     "rfc8785>=0.1.4,<0.2",
+    # Server runtime stack (TDD §4.1). CLI-edge (ENG-63 D-1): because `msgctl`
+    # depends on `msgd` via the workspace, these heavy server deps flow into any
+    # `msgctl` install. Accepted at M0 (§1.1/§11: msgctl ships in the app image,
+    # so it carries these regardless) — cli/msgctl imports only msgd.core.* at
+    # runtime. Revisit at M6 (desktop must not ship FastAPI): extract an
+    # `msgd-core` workspace member so the CLI depends on core alone.
+    "fastapi",
+    "uvicorn[standard]",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg",
+    "alembic",
+    "pydantic-settings",
 ]
 
 [build-system]

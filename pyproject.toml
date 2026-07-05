@@ -15,7 +15,18 @@ msgd = { workspace = true }
 msgctl = { workspace = true }
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11", "hypothesis>=6.100"]
+# httpx drives the in-process ASGI test client; testcontainers runs the
+# ephemeral Postgres for server integration tests; pytest-asyncio runs the
+# async fixtures/tests. Dev-only — these never ship.
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "hypothesis>=6.100",
+    "httpx",
+    "testcontainers[postgres]",
+    "pytest-asyncio",
+]
 
 [tool.ruff]
 target-version = "py312"
@@ -28,7 +39,19 @@ select = ["E", "F", "I", "UP", "B"]
 python_version = "3.12"
 strict = true
 files = ["server/msgd", "server/tests", "cli/msgctl", "cli/tests"]
+# server/tests/ and cli/tests/ each hold a top-level `conftest.py`; mypy would
+# map both to the module name `conftest` and abort with "duplicate module".
+# They cannot be disambiguated by package: making a `tests/` dir a package would
+# break the existing sibling imports there (e.g. the M0 schema-freeze test), and
+# `explicit_package_bases` double-maps the editable `msgd` distribution. All
+# real harness logic lives in server/tests/harness.py (unique module name,
+# fully type-checked); only the thin re-export shim conftest.py is excluded.
+exclude = ["^server/tests/conftest\\.py$"]
 
 [tool.pytest.ini_options]
 testpaths = ["server/tests", "cli/tests"]
 addopts = "-q"
+asyncio_mode = "auto"
+markers = [
+    "integration: needs a Docker daemon (spins an ephemeral Postgres container)",
+]
