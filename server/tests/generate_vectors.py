@@ -128,6 +128,16 @@ CASES: list[_Case] = [
         "input_json": '{"a":{},"z":[1,{"y":[2,{"x":[3,[]]}]}]}',
         "valid": True,
     },
+    {
+        "id": "dup-key-last-wins",
+        "desc": (
+            "Duplicate object key: json.loads keeps the LAST value (CPython and V8 are "
+            "both last-wins). Pins parse-then-hash semantics so a future non-standard TS "
+            "parser cannot silently diverge; consumers MUST parse with a last-wins parser."
+        ),
+        "input_json": '{"a":1,"a":2}',
+        "valid": True,
+    },
     # Valid — key ordering
     {
         "id": "keys-unsorted",

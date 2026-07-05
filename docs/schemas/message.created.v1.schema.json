@@ -1,0 +1,59 @@
+{
+  "$id": "https://msg.dev/schemas/message.created.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``message.created`` v1 (\u00a72.2).\n\n``model_config`` uses ``extra=\"allow\"`` so additive-only v1 changes (\u00a72.3.2)\nround-trip without loss when validated by an older reader.\n\nId fields are **format-validated only** \u2014 the prefix and ULID validity are\nchecked here to catch malformed references early.  Referential *existence*\n(does the message/user/file exist?) is a server-side concern (\u00a73.2) and out\nof scope for this model.",
+  "properties": {
+    "file_ids": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "File Ids",
+      "type": "array"
+    },
+    "format": {
+      "default": "markdown",
+      "enum": [
+        "markdown",
+        "plain"
+      ],
+      "title": "Format",
+      "type": "string"
+    },
+    "mentions": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Mentions",
+      "type": "array"
+    },
+    "message_id": {
+      "title": "Message Id",
+      "type": "string"
+    },
+    "text": {
+      "title": "Text",
+      "type": "string"
+    },
+    "thread_root_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Thread Root Id"
+    }
+  },
+  "required": [
+    "message_id",
+    "text"
+  ],
+  "title": "msg message.created payload (v1)",
+  "type": "object"
+}

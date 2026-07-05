@@ -145,9 +145,11 @@ Rules:
 
 - `event_id` is a **ULID** minted by the client (sortable, offline-safe). All entity IDs (`u_`, `s_`, `m_`, `f_`, `d_`, `w_` + ULID) are client- or server-minted ULIDs with type prefixes.
 - `signature` is **reserved, always null in MVP**. When device keys arrive (federation era), it signs `event_hash`. No `prev_event_hash` anywhere (assessment §3.4).
-- `server.payload_redacted` is **reserved for post-MVP redaction**: the server may null `body.payload` and set this true; redacted events are exempt from hash verification. The field ships now so exports and clients handle it from day one.
+- `server.payload_redacted` is **reserved for post-MVP redaction**: the server may null `body.payload` and set this true; redacted events are exempt from hash verification. The field ships now so exports and clients handle it from day one. At M0 there is no redaction authority, so `msgctl verify` treats any event with `payload_redacted` set as a **failure**: the flag is client-writable in-band and cannot be allowed to waive its own hash check. The exemption described above is the **target** semantics — it re-activates at M1 only for authenticated, audited server redactions validated against their audit record, never the bare flag. (ENG-60 security ruling.)
 - **`client_created_at` is untrusted** (D14). It may be displayed as "composed at" detail; all ordering, display timestamps, and "new since" logic use `server_sequence` and `server_received_at`.
-- Max serialized event size: **64 KB** (hard reject at upload).
+- Max serialized event size: **64 KB** (hard reject at upload). The limit is measured over the §3.2 upload wire form — the UTF-8 bytes of `{ "body": …, "event_hash": … }` serialized compactly — **not** the full stored envelope; `signature` and `server` metadata are excluded, so the measured size is stable for a given `body` regardless of any server-attached metadata. (ENG-54 review clarification.)
+- **JCS canonicalization depth cap (D1):** container nesting inside `body` is capped at **128 levels** (`MAX_DEPTH`); deeper input is rejected before hashing. The cap is a fixed protocol constant, not an implementation artifact, so the accept/reject boundary is identical across server processes and across the Python and TypeScript implementations. (ENG-55 security round.)
+- **Integer interop cap (D1):** every integer appearing in a canonicalized `body` must lie within ±(2^53 − 1); values outside this range are rejected before hashing. This is inherent to RFC 8785's ECMAScript number model and is restated here because it is a hard wire-format constraint the TypeScript client must enforce on **magnitude** — its `JSON.parse` silently truncates values beyond 2^53 rather than raising. In practice a real `body` cannot reach the cap: all IDs are ULID strings and `type_version` is small, while sequences/counts live in `server` metadata, which is never canonicalized. (ENG-55 ruling.)
 
 ### 2.2 MVP event types
 
@@ -164,6 +166,8 @@ All flow through the same envelope; `payload` schemas are Pydantic models in `co
 | `reaction.removed` | `message_id`, `emoji` | Idempotent remove |
 | `pin.added` / `pin.removed` | `message_id` | |
 | `file.uploaded` | `file_id`, `sha256`, `name`, `mime_type`, `size_bytes` | Emitted after blob upload confirmed (§6) |
+
+> **`message.created.format` domain (locked at `type_version` 1):** `format` is exactly `"markdown"` or `"plain"`. New format values arrive via a `type_version` bump (§2.3), **not** an additive enum widening — an older reader must never receive a `format` it cannot render. (ENG-54 ruling.)
 
 **`workspace-meta` stream** (one per workspace; every member is subscribed):
 
@@ -649,3 +653,5 @@ Cut entirely: federation experiment (design doc M6). The envelope reserves what 
 ## 15. Deviations from the design doc (for the record)
 
 All adopted from the tech-lead assessment: per-stream sequencing replaces per-workspace (§11.4 reversed) · `prev_event_hash` dropped, `signature` reserved · envelope split into hashed body + server metadata · web MVP is online-first (no browser NDJSON/SQLite-WASM); full offline moves to desktop M6 · server-side search replaces client FTS5 for MVP · MinIO cut from compose · `thread.created` event removed · unread/presence/typing designed as non-event classes · milestone order reworked (server before web UI; portability before plugins; federation cut). Everything else implements the design doc as written.
+
+- **M0 exit-gate amendments (ENG-62, additive):** §2.1 now states the JCS depth cap (128 levels) and the integer interop cap (±(2^53 − 1)) as explicit D1 protocol constants, clarifies that the 64 KB cap is measured over the §3.2 `{ body, event_hash }` wire form, §2.2 locks `message.created.format` to `"markdown"|"plain"` at `type_version` 1, and §2.1 records that M0 `verify` fails on a set `payload_redacted` flag until authenticated redaction ships at M1. These are clarifications of already-implemented behavior, not decision changes; no envelope field was added, removed, or renamed.

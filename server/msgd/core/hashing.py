@@ -98,6 +98,11 @@ def verify_hash(envelope: Envelope) -> bool:
     Redaction exemption (§2.1): redacted events are exempt from hash verification. When
     ``envelope.server.payload_redacted`` is set the server may have nulled
     ``body.payload`` so the hash no longer matches by design; this returns ``True``.
+    This exemption is sound ONLY because ``payload_redacted`` is **server-minted**: it lives
+    in ``server`` metadata, which the §3.2 upload validator MUST ignore whenever it is
+    client-supplied, so no client can set the flag to waive its own hash check. At M0, where
+    no redaction authority exists, ``msgctl verify`` treats a set flag as a FAILURE rather than
+    honoring it (ENG-60); the waiver here is for models the caller itself constructed and holds.
     """
     if envelope.server is not None and envelope.server.payload_redacted:
         return True

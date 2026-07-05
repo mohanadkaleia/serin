@@ -22,7 +22,7 @@ from typing import Any
 from hypothesis import assume, given
 from hypothesis import strategies as st
 from msgd.core import ids
-from msgd.core.envelope import Body, Envelope
+from msgd.core.envelope import Body, Envelope, ServerMetadata
 from msgd.core.hashing import HASH_ALGORITHM, hash_event, verify_hash
 from msgd.core.jcs import canonicalize
 from msgd.core.payloads import build_message_created_body
@@ -192,6 +192,45 @@ def test_redacted_event_is_exempt_from_verification() -> None:
         },
     )
     assert verify_hash(env)  # redacted -> exempt, True despite the wrong hash
+
+
+def test_verify_hash_redaction_exemption_is_server_minted_only() -> None:
+    """verify_hash waives the check iff server.payload_redacted is set — the
+    exemption rides on server-minted metadata, never on body content."""
+    body = build_message_created_body(
+        workspace_id="w_01JZ7N6A4M6Y8W5K2H7DGKX4PB",
+        stream_id="s_01JZ7N6A4M6Y8W5K2H7DGKX4PC",
+        author_user_id="u_01JZ7N6A4M6Y8W5K2H7DGKX4PD",
+        author_device_id="d_01JZ7N6A4M6Y8W5K2H7DGKX4PE",
+        client_created_at="2026-07-04T18:22:10.123Z",
+        text="hi",
+    )
+    good = hash_event(body.model_dump(mode="json"))
+    # Deliberately wrong hash: normally False …
+    env = Envelope(
+        body=body,
+        event_hash="sha256:" + "0" * 64,
+        signature=None,
+        server=ServerMetadata(
+            server_sequence=1,
+            server_received_at="2026-07-04T18:22:10.456Z",
+            payload_redacted=False,
+        ),
+    )
+    assert verify_hash(env) is False
+    # … but a server-minted redaction flag waives it.
+    env_redacted = env.model_copy(
+        update={
+            "server": ServerMetadata(
+                server_sequence=1,
+                server_received_at="2026-07-04T18:22:10.456Z",
+                payload_redacted=True,
+            )
+        }
+    )
+    assert verify_hash(env_redacted) is True
+    # Correct-hash sanity.
+    assert verify_hash(env.model_copy(update={"event_hash": good})) is True
 
 
 def test_non_redacted_wrong_hash_still_fails() -> None:

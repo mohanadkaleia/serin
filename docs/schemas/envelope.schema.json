@@ -1,0 +1,127 @@
+{
+  "$defs": {
+    "Body": {
+      "additionalProperties": true,
+      "description": "The hashed client body.  ``event_hash`` is SHA-256 of JCS(this).",
+      "properties": {
+        "author_device_id": {
+          "title": "Author Device Id",
+          "type": "string"
+        },
+        "author_user_id": {
+          "title": "Author User Id",
+          "type": "string"
+        },
+        "client_created_at": {
+          "title": "Client Created At",
+          "type": "string"
+        },
+        "event_id": {
+          "title": "Event Id",
+          "type": "string"
+        },
+        "payload": {
+          "additionalProperties": true,
+          "title": "Payload",
+          "type": "object"
+        },
+        "stream_id": {
+          "title": "Stream Id",
+          "type": "string"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        },
+        "type_version": {
+          "title": "Type Version",
+          "type": "integer"
+        },
+        "workspace_id": {
+          "title": "Workspace Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "workspace_id",
+        "stream_id",
+        "type",
+        "type_version",
+        "author_user_id",
+        "author_device_id",
+        "client_created_at",
+        "payload"
+      ],
+      "title": "Body",
+      "type": "object"
+    },
+    "ServerMetadata": {
+      "additionalProperties": true,
+      "description": "Unhashed server-assigned metadata (absent on the client upload form).",
+      "properties": {
+        "payload_redacted": {
+          "default": false,
+          "title": "Payload Redacted",
+          "type": "boolean"
+        },
+        "server_received_at": {
+          "title": "Server Received At",
+          "type": "string"
+        },
+        "server_sequence": {
+          "title": "Server Sequence",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "server_sequence",
+        "server_received_at"
+      ],
+      "title": "ServerMetadata",
+      "type": "object"
+    }
+  },
+  "$id": "https://msg.dev/schemas/envelope.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "A full event: hashed ``body`` + opaque hash + reserved sig + server meta.",
+  "properties": {
+    "body": {
+      "$ref": "#/$defs/Body"
+    },
+    "event_hash": {
+      "title": "Event Hash",
+      "type": "string"
+    },
+    "server": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ServerMetadata"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "signature": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Signature"
+    }
+  },
+  "required": [
+    "body",
+    "event_hash"
+  ],
+  "title": "msg event envelope",
+  "type": "object"
+}
