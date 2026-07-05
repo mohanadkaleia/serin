@@ -13,8 +13,9 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from msgd.api.app import create_app
 from msgd.db.engine import get_session
+from msgd.db.models import Event, Stream
 from msgd.settings import Settings
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -130,9 +131,38 @@ def make_client(app: FastAPI) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
+# --- stored event/stream read helpers (ENG-65) --------------------------------
+
+
+async def fetch_stream_events(db: AsyncSession, stream_id: str) -> list[Event]:
+    """All events homed in ``stream_id``, ascending ``server_sequence``."""
+    rows = await db.execute(
+        select(Event).where(Event.stream_id == stream_id).order_by(Event.server_sequence)
+    )
+    return list(rows.scalars().all())
+
+
+async def fetch_meta_stream_id(db: AsyncSession, workspace_id: str) -> str | None:
+    """The single workspace-meta stream id for ``workspace_id`` (or ``None``)."""
+    stream_id: str | None = await db.scalar(
+        select(Stream.stream_id).where(
+            Stream.workspace_id == workspace_id,
+            Stream.kind == "workspace-meta",
+        )
+    )
+    return stream_id
+
+
+async def fetch_stream(db: AsyncSession, stream_id: str) -> Stream | None:
+    """Load a ``streams`` row by id (``None`` if absent)."""
+    return await db.get(Stream, stream_id)
+
+
 # --- committing fixtures (true-concurrency tests only) -------------------------
 
-AUTH_TABLES = "sessions, devices, invites, users, workspaces"
+# ENG-65: events/streams/stream_members carry the committed rows the concurrency
+# test writes; they MUST be truncated too or committed rows leak across tests.
+AUTH_TABLES = "sessions, devices, invites, events, stream_members, streams, users, workspaces"
 
 
 def committing_app(settings: Settings) -> tuple[AsyncClient, AsyncEngine]:
