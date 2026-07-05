@@ -52,13 +52,10 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 
 # Entrypoint (migrate → serve, single worker). Reused verbatim from ENG-63; the
-# Dockerfile does not rewrite it (TDD §11 / plan D2).
+# Dockerfile does not rewrite it (TDD §11 / plan D2). No alembic.ini is shipped:
+# migrate.py builds Config(None) with the packaged msgd/db/migrations
+# script_location, verified in-image under --no-editable (R2).
 COPY server/docker-entrypoint.sh /app/docker-entrypoint.sh
-# Belt-and-suspenders: migrate.py resolves the packaged migrations dir and falls
-# back to Config(None) when alembic.ini is absent, so migrations run under
-# --no-editable regardless. This copy + WORKDIR /app removes any residual doubt
-# (R2). Verified path in-image: packaged msgd/db/migrations + Config(None).
-COPY server/alembic.ini /app/alembic.ini
 
 # Data root (blobs live at /data/blobs per §6); owned by the runtime user.
 RUN mkdir -p /data/blobs \
