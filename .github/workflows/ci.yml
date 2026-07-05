@@ -40,5 +40,14 @@ jobs:
         env:
           CI: "true"
 
+      # Warm the image cache so the session-scoped testcontainer (server
+      # integration tests, ENG-63) starts predictably rather than paying a cold
+      # pull inside the 30 s readiness budget. Docker is preinstalled on
+      # ubuntu-latest; no separate job is needed.
+      - name: Pre-pull Postgres image
+        run: docker pull postgres:17
+
+      # Runs the full suite, including the server integration tests, which spin
+      # an ephemeral Postgres via testcontainers (Docker present on the runner).
       - name: Pytest
         run: uv run pytest
