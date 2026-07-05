@@ -20,17 +20,53 @@ from pydantic import BaseModel
 from msgd.core import ids
 from msgd.core.envelope import Body
 from msgd.core.payloads.message import MessageCreatedV1
+from msgd.core.payloads.meta import (
+    ChannelArchivedV1,
+    ChannelCreatedV1,
+    ChannelMemberAddedV1,
+    ChannelMemberRemovedV1,
+    ChannelRenamedV1,
+    DmCreatedV1,
+    UserJoinedV1,
+    UserLeftV1,
+    UserProfileUpdatedV1,
+    WorkspaceCreatedV1,
+    build_user_joined_body,
+    build_workspace_created_body,
+)
 
 __all__ = [
     "PAYLOAD_MODELS",
     "MessageCreatedV1",
+    "WorkspaceCreatedV1",
+    "UserJoinedV1",
+    "UserLeftV1",
+    "UserProfileUpdatedV1",
+    "ChannelCreatedV1",
+    "ChannelRenamedV1",
+    "ChannelArchivedV1",
+    "ChannelMemberAddedV1",
+    "ChannelMemberRemovedV1",
+    "DmCreatedV1",
     "get_payload_model",
     "build_message_created_body",
+    "build_workspace_created_body",
+    "build_user_joined_body",
 ]
 
 #: Registry of every known ``(type, type_version)`` payload model.
 PAYLOAD_MODELS: dict[tuple[str, int], type[BaseModel]] = {
     ("message.created", 1): MessageCreatedV1,
+    ("workspace.created", 1): WorkspaceCreatedV1,
+    ("user.joined", 1): UserJoinedV1,
+    ("user.left", 1): UserLeftV1,
+    ("user.profile_updated", 1): UserProfileUpdatedV1,
+    ("channel.created", 1): ChannelCreatedV1,
+    ("channel.renamed", 1): ChannelRenamedV1,
+    ("channel.archived", 1): ChannelArchivedV1,
+    ("channel.member_added", 1): ChannelMemberAddedV1,
+    ("channel.member_removed", 1): ChannelMemberRemovedV1,
+    ("dm.created", 1): DmCreatedV1,
 }
 
 

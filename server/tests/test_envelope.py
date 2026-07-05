@@ -144,10 +144,57 @@ def test_client_upload_form_has_no_server() -> None:
 # --- per registered (type, version) round-trip -------------------------------
 
 
+def _sample_payload(type_: str) -> dict[str, Any]:
+    """A representative valid payload for each registered event ``type``."""
+    u = ids.new_user_id()
+    s = ids.new_stream_id()
+    samples: dict[str, dict[str, Any]] = {
+        "message.created": {
+            "message_id": ids.new_message_id(),
+            "text": "hello",
+            "format": "markdown",
+            "thread_root_id": None,
+            "file_ids": [],
+            "mentions": [],
+        },
+        "workspace.created": {"name": "Acme"},
+        "user.joined": {"user_id": u, "display_name": "Dana"},
+        "user.left": {"user_id": u, "display_name": "Dana"},
+        "user.profile_updated": {"user_id": u},
+        "channel.created": {"channel_stream_id": s, "name": "general", "visibility": "public"},
+        "channel.renamed": {"channel_stream_id": s, "name": "general"},
+        "channel.archived": {"channel_stream_id": s},
+        "channel.member_added": {"channel_stream_id": s, "user_id": u},
+        "channel.member_removed": {"channel_stream_id": s, "user_id": u},
+        "dm.created": {"dm_stream_id": s, "member_user_ids": [u]},
+    }
+    return samples[type_]
+
+
 @pytest.mark.parametrize("type_version", sorted(PAYLOAD_MODELS.keys()))
 def test_round_trip_per_registered_type_version(type_version: tuple[str, int]) -> None:
     type_, version = type_version
-    data = _valid_envelope_dict()
+    body = {
+        "event_id": ids.new_event_id(),
+        "workspace_id": ids.new_workspace_id(),
+        "stream_id": ids.new_stream_id(),
+        "type": type_,
+        "type_version": version,
+        "author_user_id": ids.new_user_id(),
+        "author_device_id": ids.new_device_id(),
+        "client_created_at": "2026-07-04T18:22:10.123Z",
+        "payload": _sample_payload(type_),
+    }
+    data: dict[str, Any] = {
+        "body": body,
+        "event_hash": "sha256:" + "0" * 64,
+        "signature": None,
+        "server": {
+            "server_sequence": 1,
+            "server_received_at": "2026-07-04T18:22:10.456Z",
+            "payload_redacted": False,
+        },
+    }
     original = copy.deepcopy(data)
     env = Envelope.model_validate(data)
     assert env.model_dump(mode="json") == original

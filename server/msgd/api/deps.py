@@ -28,6 +28,7 @@ from msgd.auth.ratelimit import RateLimiter, client_ip
 from msgd.auth.sessions import bump_session, lookup_session, utcnow
 from msgd.auth.tokens import hash_token
 from msgd.db.engine import get_session
+from msgd.events.permissions import can_read
 from msgd.settings import Settings
 
 
@@ -160,3 +161,22 @@ def require_role(*roles: str) -> Callable[[AuthContext], Awaitable[AuthContext]]
         return ctx
 
     return dependency
+
+
+async def require_readable_stream(
+    stream_id: str,
+    ctx: CurrentAuth,
+    db: Annotated[AsyncSession, Depends(get_session)],
+) -> str:
+    """Dependency: 404 unless ``stream_id`` exists **and** is readable by the caller (D5).
+
+    The **404-not-403 discipline** (§3.6 point 2): existence is not disclosed, so
+    an unknown stream and a forbidden stream return the identical
+    ``/problems/not-found`` body. ``stream_id`` is resolved from the path (if the
+    route declares it) or the query string. ENG-65 ships this dependency but
+    wires it to no endpoint (channels are event-born, not CRUD); ENG-66+ mounts
+    it on the pull endpoints.
+    """
+    if not await can_read(db, ctx=ctx, stream_id=stream_id):
+        raise problems.not_found("no such stream")
+    return stream_id

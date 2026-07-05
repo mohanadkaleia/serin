@@ -39,9 +39,12 @@ from msgd.auth.sessions import (
     utcnow,
 )
 from msgd.auth.tokens import hash_token
-from msgd.core.ids import new_user_id, new_workspace_id
+from msgd.core.ids import new_stream_id, new_user_id, new_workspace_id
+from msgd.core.payloads import build_user_joined_body, build_workspace_created_body
+from msgd.core.time import now_rfc3339
 from msgd.db.engine import get_session
-from msgd.db.models import Device, Invite, User, Workspace
+from msgd.db.models import Device, Invite, Stream, User, Workspace
+from msgd.events.emit import emit_event
 
 logger = logging.getLogger("msgd.auth")
 
@@ -108,12 +111,47 @@ async def setup(req: SetupRequest, db: DbSession, settings: AppSettings) -> Logi
     )
     await db.flush()
 
-    # ENG-65 seam: emit workspace.created + user.joined to workspace-meta here.
-    # Deferred to the streams ticket — no fake stream is stubbed (plan D1).
-
+    # ENG-65 (D2/D8): mint the device FIRST (reorder — ``author_device_id`` is
+    # validated, so the device must exist before we author events), then emit the
+    # two server-authored meta events into a fresh workspace-meta stream. The
+    # reducer inside ``emit_event`` creates the meta stream row before the insert
+    # sequences into it (D4 bootstrap invariant). Both land atomically with the
+    # workspace/owner rows at the ``_login_response`` commit.
     device = await mint_or_reuse_device(db, user_id=user_id, device_label=None, device_id=None)
     assert device is not None  # mint path (no device_id) never returns None
     await db.flush()
+
+    authored_at = now_rfc3339()
+    meta_stream_id = new_stream_id()
+    # seq 1 — workspace.created, authored by the owner (D2).
+    await emit_event(
+        db,
+        home_stream_id=meta_stream_id,
+        body=build_workspace_created_body(
+            workspace_id=workspace_id,
+            stream_id=meta_stream_id,
+            author_user_id=user_id,
+            author_device_id=device.device_id,
+            client_created_at=authored_at,
+            name=req.workspace_name,
+        ),
+    )
+    # seq 2 — owner user.joined, so every workspace member has exactly one
+    # ``user.joined`` in the meta log (uniform member-list invariant, D2).
+    await emit_event(
+        db,
+        home_stream_id=meta_stream_id,
+        body=build_user_joined_body(
+            workspace_id=workspace_id,
+            stream_id=meta_stream_id,
+            author_user_id=user_id,
+            author_device_id=device.device_id,
+            client_created_at=authored_at,
+            user_id=user_id,
+            display_name=req.display_name,
+        ),
+    )
+
     user = await db.get(User, user_id)
     assert user is not None
     return await _login_response(db, user=user, device=device, settings=settings)
@@ -260,13 +298,37 @@ async def accept_invite(
         await db.rollback()
         raise problems.account_conflict() from None
 
-    # ENG-65 seam: emit user.joined to workspace-meta here (deferred, plan D7).
-
+    # ENG-65 (D2/D8): mint the device FIRST (reorder — the device must exist
+    # before we author events), then emit ``user.joined`` for the invitee into
+    # the workspace's meta stream (single-workspace MVP → exactly one). Authored
+    # by the joining user (D2). Lands atomically at the ``_login_response`` commit.
     device = await mint_or_reuse_device(
         db, user_id=new_user_ident, device_label=None, device_id=None
     )
     assert device is not None
     await db.flush()
+
+    meta_stream_id = await db.scalar(
+        select(Stream.stream_id).where(
+            Stream.workspace_id == invite.workspace_id,
+            Stream.kind == "workspace-meta",
+        )
+    )
+    assert meta_stream_id is not None  # setup always creates the meta stream
+    await emit_event(
+        db,
+        home_stream_id=meta_stream_id,
+        body=build_user_joined_body(
+            workspace_id=invite.workspace_id,
+            stream_id=meta_stream_id,
+            author_user_id=new_user_ident,
+            author_device_id=device.device_id,
+            client_created_at=now_rfc3339(),
+            user_id=new_user_ident,
+            display_name=req.display_name,
+        ),
+    )
+
     user = await db.get(User, new_user_ident)
     assert user is not None
     return await _login_response(db, user=user, device=device, settings=settings)
