@@ -3,8 +3,11 @@
 Flow (§7):
 
 1. **Auth, pre-accept.** The bearer token arrives via ``Sec-WebSocket-Protocol:
-   bearer, <token>`` — i.e. ``websocket.scope["subprotocols"] == ["bearer",
-   <token>]`` — **not** the query string. This overturns the plan's ``?token=…``
+   bearer, <token>`` — surfaced as ``websocket.scope["subprotocols"]`` — **not** the
+   query string. The exact list *shape* is backend-dependent (ENG-92: uvicorn's
+   default ``websockets`` backend yields the un-split ``["bearer, <token>"]``, while
+   ``wsproto`` / the ASGI test transport yield ``["bearer", "<token>"]``); see
+   :func:`_bearer_token`, which normalizes both. This overturns the plan's ``?token=…``
    after security round 1 (finding b): a query token leaks the raw session token
    into ``uvicorn.error`` request-line logs (and any proxy access log / browser
    history / ``Referer``), defeating ENG-64 D2. The subprotocol form is the
@@ -67,21 +70,36 @@ _BEARER_SUBPROTOCOL = "bearer"
 
 
 def _bearer_token(websocket: WebSocket) -> str | None:
-    """Return the bearer token from ``["bearer", <token>]`` subprotocols, else None.
+    """Return the bearer token from a ``bearer, <token>`` subprotocol offer, else None.
 
-    Starlette parses ``Sec-WebSocket-Protocol`` into ``scope["subprotocols"]``. A
-    well-formed request is exactly ``[_BEARER_SUBPROTOCOL, <token>]``; anything else
-    (absent, ``["bearer"]`` with no token, a non-``bearer`` first element) yields
-    ``None`` → the uniform pre-accept ``4401``.
+    The token rides in ``Sec-WebSocket-Protocol: bearer, <token>``, surfaced by the
+    ASGI server as ``scope["subprotocols"]``. Crucially, **different WS backends
+    represent that list differently** (ENG-92):
 
-    Elements are stripped of the RFC 7230 optional whitespace (OWS) around
-    list items: uvicorn strips it, but a naive comma-split (the ASGI test transport)
-    leaves a leading space on ``" <token>"``. A subprotocol token is ``tchar`` only
-    (``token_urlsafe`` output has no whitespace), so stripping is loss-free.
+    * uvicorn's default ``websockets`` sans-io backend surfaces the *raw, un-split*
+      header value(s) — ``event.headers.get_all("Sec-WebSocket-Protocol")`` — so a
+      ``bearer, <token>`` offer arrives as a **single** element ``["bearer, <token>"]``.
+    * ``wsproto`` and the in-process Starlette/httpx ASGI test transport pre-split on
+      commas, arriving as ``["bearer", "<token>"]`` (the transport may also leave a
+      leading OWS: ``["bearer", " <token>"]``).
+
+    So we normalize *both* shapes: split every element on commas and strip the RFC 7230
+    optional whitespace (OWS), flattening to a canonical ``["bearer", "<token>"]``. A
+    subprotocol token is ``tchar`` only (``token_urlsafe`` output has no whitespace or
+    commas), so splitting/stripping is loss-free. A well-formed offer normalizes to
+    exactly ``[_BEARER_SUBPROTOCOL, <token>]``; anything else (absent, ``["bearer"]``
+    with no token, a non-``bearer`` first element) yields ``None`` → the uniform
+    pre-accept ``4401``.
+
+    Reading the raw ``scope["subprotocols"]`` without this flatten is the ENG-92 bug:
+    under a real uvicorn on the default backend the single-element form failed the
+    ``len >= 2`` check and 403'd a valid token, while the in-process WS tests (which
+    use the pre-split transport) stayed green.
     """
-    protocols: list[str] = list(websocket.scope.get("subprotocols") or [])
-    if len(protocols) >= 2 and protocols[0].strip() == _BEARER_SUBPROTOCOL:
-        token = protocols[1].strip()
+    raw: list[str] = list(websocket.scope.get("subprotocols") or [])
+    protocols = [item.strip() for element in raw for item in element.split(",") if item.strip()]
+    if len(protocols) >= 2 and protocols[0] == _BEARER_SUBPROTOCOL:
+        token = protocols[1]
         if token:
             return token
     return None
