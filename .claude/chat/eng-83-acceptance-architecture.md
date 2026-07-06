@@ -120,6 +120,14 @@ shrinking so a failing case reduces to a minimal reproduction. The generators:
   vs after the client's batch POST completes — both arrival orders). fast-check
   draws the command sequence, the stream each send targets, and the race order.
   The invariant is asserted on the terminal DB state after every drawn script.
+  The WS frame is the FULL wire envelope with a REAL `event_hash` (the stored
+  `hashEvent(body)`, via `server.wireFor(...)` / `emitEvent(...)` — the outbox
+  §9 pattern), because the real sync engine hash-verifies inbound frames and
+  DROPS any mismatch. The property PROVES the frame is genuinely applied, not
+  silently dropped: the `ws-first` arm (batch still paused) asserts the events
+  cache grows by exactly the raced event, and a `console.warn` spy asserts ZERO
+  hash-mismatch drops across the whole run. A regression to a fabricated hash
+  makes the events-count guard fail — the race can never go vacuous again.
 
 - **Invariant 6 client** generates a randomized *event history*: N streams, each
   with a drawn sequence of `message.created` v1 events (varying text incl.
@@ -216,7 +224,12 @@ discipline: a deliberately-injected client bug must turn the suite RED.
    subprocess — the ENG-68 WS tests all run in-process (ASGI transport), so they
    never exercised it. **Flagged for the server owner**: uvicorn+websockets-v16
    WS is broken for this app; either pin the ws backend or the websockets version
-   server-side. The e2e harness works around it with `--ws wsproto`.
+   server-side. The e2e harness works around it with `--ws wsproto`. **Tracked by
+   ENG-92.** Consequence for the gate: the live-WS golden-path leg passes ONLY
+   under the `--ws wsproto` override; live WS on the DEFAULT self-host config is
+   NOT yet proven, so **M2 live-sync is not exit-certified for the default config
+   until ENG-92 lands and the override is removed**. (Pull-based sync + reload
+   history — the other golden-path legs — are unaffected.)
 2. **Same-origin topology (no proxy).** vite's `preview` proxy does not forward
    the WS subprotocol header either, so rather than proxy, the harness serves the
    built SPA directly from msgd (`MSG_SERVE_SPA` + `MSG_WEB_DIST_DIR`) — the

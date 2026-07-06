@@ -32,7 +32,7 @@ import {
   dumpMessages,
   HANDLERS,
 } from '../../../src/worker/projection'
-import type { EventRow, MsgDb, OutboxRow } from '../../../src/worker/types'
+import type { EventRow, MessageRow, MsgDb, OutboxRow } from '../../../src/worker/types'
 
 import { fakeIdbOptions } from './helpers'
 import {
@@ -43,6 +43,48 @@ import {
 } from './projfixtures'
 
 const MUTATION = process.env.MSG_MUTATE
+
+// ---------------------------------------------------------------------------
+// GATE-ONLY normalization. The shipping `dumpMessages` (projection.ts) is the
+// UI/tab surface and deliberately OMITS the `state`/`error_code` lifecycle
+// fields (they are a re-derivable function of the outbox, so rebuild ≡
+// incremental holds without them). We must NOT change `dumpMessages` — its byte
+// output is asserted verbatim by other suites. But an incremental-vs-rebuild
+// divergence CONFINED to a lifecycle field (a `pending`/`failed` skew) would be
+// INVISIBLE to it. Today both paths share `buildPendingMessageRow`, so no skew
+// exists — but the permanent gate must be able to catch one if it ever appears.
+//
+// This gate-only dump reuses the exact ordering + JSON discipline of the
+// shipping `dumpMessages` and APPENDS `state` + `error_code`, so the inv6
+// equivalence assertion is over the FULLER normalization. Test-only; never
+// shipped; never replaces `dumpMessages`.
+function compareForDump(a: MessageRow, b: MessageRow): number {
+  if (a.stream_id !== b.stream_id) return a.stream_id < b.stream_id ? -1 : 1
+  if (a.created_seq !== b.created_seq) return a.created_seq - b.created_seq
+  if (a.message_id !== b.message_id) return a.message_id < b.message_id ? -1 : 1
+  return 0
+}
+
+async function dumpMessagesWithLifecycle(db: MsgDb): Promise<string> {
+  const rows = await db.getAllMessages()
+  rows.sort(compareForDump)
+  return rows
+    .map((row) =>
+      JSON.stringify({
+        message_id: row.message_id,
+        stream_id: row.stream_id,
+        created_seq: row.created_seq,
+        author_user_id: row.author_user_id,
+        text: row.text,
+        format: row.format,
+        thread_root_id: row.thread_root_id ?? null,
+        mention_user_ids: row.mention_user_ids,
+        state: row.state ?? null, // gate-only: NOT in the shipping dumpMessages
+        error_code: row.error_code ?? null, // gate-only: NOT in the shipping dumpMessages
+      }),
+    )
+    .join('\n')
+}
 
 // The D9 skip (malformed / unknown / v>=2 events) warns by design; randomized
 // histories generate many, so silence the expected noise for readable CI logs.
@@ -285,11 +327,13 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
         const db: MsgDb = new MemoryDb()
         const h = materialize(draw)
         await buildIncremental(db, h)
-        const incremental = await dumpMessages(db)
+        // GATE over the FULLER normalization (incl. state/error_code), so a
+        // lifecycle-field divergence can never slip past the byte-equal check.
+        const incremental = await dumpMessagesWithLifecycle(db)
 
         await db.clearDerivedTables()
         await rebuildMaybeSkewed(db)
-        const rebuilt = await dumpMessages(db)
+        const rebuilt = await dumpMessagesWithLifecycle(db)
 
         expect(rebuilt).toBe(incremental) // the gate (goes red under the teeth flag)
         await db.close()
@@ -309,11 +353,13 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
         expect(db.persistence).toBe('persistent') // real Dexie, not the MemoryDb fallback
         const h = materialize(draw)
         await buildIncremental(db, h)
-        const incremental = await dumpMessages(db)
+        // GATE over the FULLER normalization (incl. state/error_code), so a
+        // lifecycle-field divergence can never slip past the byte-equal check.
+        const incremental = await dumpMessagesWithLifecycle(db)
 
         await db.clearDerivedTables()
         await rebuildMaybeSkewed(db)
-        const rebuilt = await dumpMessages(db)
+        const rebuilt = await dumpMessagesWithLifecycle(db)
 
         expect(rebuilt).toBe(incremental) // the gate (goes red under the teeth flag)
         await db.close()

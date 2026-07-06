@@ -21,7 +21,7 @@
 // command + observed failure.
 
 import fc from 'fast-check'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { WorkerCore } from '../../../src/worker/core'
 import { MemoryDb, openDb } from '../../../src/worker/db'
@@ -34,11 +34,11 @@ import {
   META_SESSION_TOKEN,
   META_WORKSPACE_ID,
   PROJECTION_VERSION,
-  type EventBody,
   type FromWorker,
   type MessageRow,
   type MsgDb,
   type SendResult,
+  type WireEvent,
 } from '../../../src/worker/types'
 
 import {
@@ -63,6 +63,30 @@ const MUTATION = process.env.MSG_MUTATE
 
 /** A pending sentinel `created_seq` is a wall-clock ms epoch (> ~1e12). */
 const PENDING_SENTINEL_FLOOR = 1_000_000_000_000
+
+// ---------------------------------------------------------------------------
+// Anti-vacuity guard. The REAL sync engine hash-verifies every inbound WS frame
+// (`hashEvent(body) === event_hash`) and SILENTLY DROPS a mismatch with a
+// `[sync] event hash mismatch` warning. If the WS-race arms ever emit a frame
+// with a fabricated hash again, that frame is dropped — the race becomes
+// vacuous (the "WS arm" never applies anything). We spy on `console.warn`,
+// count those drops, and assert ZERO across every run: a regression to a
+// fabricated hash turns the whole property RED instead of silently passing.
+// ---------------------------------------------------------------------------
+
+let hashMismatchDrops = 0
+
+beforeEach(() => {
+  hashMismatchDrops = 0
+  vi.spyOn(console, 'warn').mockImplementation((...args: unknown[]) => {
+    const first = args[0]
+    if (typeof first === 'string' && first.includes('event hash mismatch')) hashMismatchDrops++
+  })
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 function maybeMutate(db: MsgDb): MsgDb {
   if (MUTATION !== 'inv5-drop-ack') return db
@@ -98,7 +122,14 @@ interface LiveCore {
   frames: Array<{ clientId: string; msg: FromWorker }>
   server: FakeSyncServer
   wsOpen: () => void
-  emit: (wire: EventBody | undefined) => void
+  /**
+   * Emit the FULL wire event over the fake WS — REAL `event_hash` and all — so
+   * the engine's hash-verify accepts and APPLIES it (the outbox.spec §9 pattern).
+   * Passing only `body` + a fabricated hash (the old bug) made the engine drop
+   * the frame, so the WS-race arms were vacuous. `wireFor` returns the stored
+   * envelope whose `event_hash` is the real `hashEvent(body)`.
+   */
+  emit: (wire: WireEvent | undefined) => void
 }
 
 let rpcId = 0
@@ -124,7 +155,7 @@ async function makeLiveCore(makeDb: () => Promise<MsgDb>, streams: string[]): Pr
     server,
     wsOpen: () => last().open(),
     emit: (wire) => {
-      if (wire) last().emitEvent({ body: wire, event_hash: `sha256:${String(wire.event_id)}` })
+      if (wire) last().emitEvent(wire) // full envelope, REAL hash — engine applies it
     },
   }
 }
@@ -207,8 +238,18 @@ async function runCmd(
     const row = await live.db.getOutbox(res.event_id)
     if (!row) throw new Error('missing outbox row for ws-first')
     live.server.processBatch([{ body: row.body as never, event_hash: row.event_hash }])
-    live.emit(live.server.wireFor(res.event_id)?.body)
+    // GUARD (anti-vacuity): the batch POST is still paused, so the ONLY path an
+    // event can reach the client's `events` cache is the WS frame passing
+    // hash-verify and being APPLIED. Snapshot before, emit the real-hash frame,
+    // and assert the cache grew by exactly this event. If the frame were dropped
+    // (fabricated hash), this fails — the WS-first arm can never be vacuous again.
+    const before = await live.db.getEventsForStream(streamId)
+    expect(before.some((e) => e.event_id === res.event_id)).toBe(false)
+    live.emit(live.server.wireFor(res.event_id))
     await flush()
+    const after = await live.db.getEventsForStream(streamId)
+    expect(after.length).toBe(before.length + 1) // WS frame genuinely applied
+    expect(after.some((e) => e.event_id === res.event_id)).toBe(true)
     live.server.resumeBatch()
     await untilAsync(async () => (await live.db.getOutbox(res.event_id)) === undefined)
     return { messageId: res.message_id, stream: streamId, state: 'settled', seq }
@@ -218,16 +259,27 @@ async function runCmd(
   const res = await sendRpc(live, streamId, text)
   await untilAsync(async () => (await live.db.getOutbox(res.event_id)) === undefined)
   if (cmd.race === 'ws-after') {
-    // The duplicate WS frame for the SAME event arrives after settling — the
-    // idempotent-upsert dedup must keep it at one row.
-    live.emit(live.server.wireFor(res.event_id)?.body)
+    // The ack already settled the event into `events`; the SAME event now also
+    // arrives as a real-hash WS frame. It must pass hash-verify (guarded globally
+    // by `hashMismatchDrops === 0`) and the idempotent-upsert dedup must keep it
+    // at exactly one row (asserted in `assertInvariant5` — the events cache for
+    // this stream never grows past the settled count).
+    const before = await live.db.getEventsForStream(streamId)
+    live.emit(live.server.wireFor(res.event_id))
     await flush()
+    const after = await live.db.getEventsForStream(streamId)
+    expect(after.length).toBe(before.length) // dup frame deduped, not a second row
   }
   return { messageId: res.message_id, stream: streamId, state: 'settled', seq }
 }
 
 /** Assert invariant 5 on the terminal DB state for the whole executed history. */
 async function assertInvariant5(live: LiveCore, expected: Expected[]): Promise<void> {
+  // Anti-vacuity: NO WS frame was silently dropped for a hash mismatch anywhere
+  // in this run. If a race arm ever regressed to a fabricated hash, the engine
+  // would drop the frame (never applying it) — this catches that immediately.
+  expect(hashMismatchDrops).toBe(0)
+
   const all = await live.db.getAllMessages()
 
   // No lost / no duplicated renders: exactly one row per intended send, and no
