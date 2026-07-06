@@ -237,6 +237,15 @@ def cmd_rebuild_projections(args: argparse.Namespace) -> int:
     **lazy** — inside the handler, not at module top — so the M0 commands
     (``init``/``send``/``project``/``rebuild``/``verify``) keep their light,
     async-DB-free import cost.
+
+    SECURITY (review round 1): every DB failure mode — URL parse, connect, and
+    replay — is funnelled into a :class:`MsgctlError` whose message names only the
+    exception *class*, never the exception text. SQLAlchemy's URL-parse and
+    connection errors embed the full DSN (``Could not parse SQLAlchemy URL from
+    string '<dsn-with-credentials>'``); ``main`` prints an uncaught non-MsgctlError
+    as a raw traceback, which would leak ``MSG_DATABASE_URL`` (password included)
+    to stderr / CI logs. Catching here keeps the operator-facing failure clean
+    and credential-free.
     """
     import asyncio
     import os
@@ -258,7 +267,17 @@ def cmd_rebuild_projections(args: argparse.Namespace) -> int:
         finally:
             await engine.dispose()
 
-    applied, skipped = asyncio.run(_run())
+    try:
+        applied, skipped = asyncio.run(_run())
+    except Exception as exc:
+        # Sanitized: name the error class only — never ``str(exc)``, which can
+        # embed the DSN (and its credentials). No re-raise ``from exc`` either,
+        # so the DSN-bearing traceback is not chained onto the MsgctlError.
+        raise MsgctlError(
+            f"rebuild-projections failed: {type(exc).__name__} "
+            "(check MSG_DATABASE_URL and database connectivity)"
+        ) from None
+
     print(
         json.dumps(
             {"rebuilt": True, "applied": applied, "skipped": skipped},

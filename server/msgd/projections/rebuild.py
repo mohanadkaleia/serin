@@ -50,8 +50,11 @@ __all__ = ["RebuildResult", "rebuild_projections"]
 class RebuildResult:
     """Outcome of a :func:`rebuild_projections` run (mirrors M0 ``ProjectResult``).
 
-    ``applied`` counts events that projected a row; ``skipped`` counts events
-    replayed but not projected (meta / unknown types / unhandled versions — D9).
+    ``applied`` counts events **dispatched to a handler** (``message.created`` v1);
+    ``skipped`` counts events replayed but with no handler (meta / unknown types /
+    unhandled versions — D9). ``applied`` is a dispatch count, NOT a rows-inserted
+    count: ``ON CONFLICT (message_id) DO NOTHING`` means a re-seen ``message_id``
+    is counted as applied while inserting zero rows.
     """
 
     applied: int = 0
