@@ -112,6 +112,52 @@ describe('createHttpClient', () => {
     expect(onUnauthorized).toHaveBeenCalledOnce()
   })
 
+  it('does NOT call onUnauthorized on a 401 from an unauthed request', async () => {
+    const onUnauthorized = vi.fn()
+    const { fetchImpl } = fakeFetch(
+      () =>
+        new Response(
+          JSON.stringify({ type: '/problems/invalid-credentials', title: 'x', status: 401 }),
+          { status: 401 },
+        ),
+    )
+    const http = createHttpClient(deps({ fetchImpl, onUnauthorized }))
+
+    // A wrong-password login is an unauthed 401 — the caller handles it; a live
+    // session (if any) must not be wiped.
+    const res = await http.post('/v1/auth/login', {}, { authed: false })
+
+    expect(onUnauthorized).not.toHaveBeenCalled()
+    if (res.ok) throw new Error('expected error')
+    expect(res.error.code).toBe('invalid-credentials')
+  })
+
+  it('returns a typed invalid-response error for a non-JSON 2xx body', async () => {
+    const { fetchImpl } = fakeFetch(() => new Response('not json at all', { status: 200 }))
+    const http = createHttpClient(deps({ fetchImpl }))
+
+    const res = await http.get('/v1/auth/sessions')
+
+    if (res.ok) throw new Error('expected error')
+    expect(res.error).toMatchObject({ status: 200, code: 'invalid-response' })
+  })
+
+  it('returns a typed timeout ApiResult when the request exceeds the timeout', async () => {
+    // A fetch that never resolves but honors the abort signal.
+    const fetchImpl = ((_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('Aborted', 'AbortError'))
+        })
+      })) as typeof fetch
+    const http = createHttpClient(deps({ fetchImpl, timeoutMs: 10 }))
+
+    const res = await http.get('/v1/slow')
+
+    if (res.ok) throw new Error('expected error')
+    expect(res.error).toMatchObject({ status: 0, code: 'timeout' })
+  })
+
   it('parses Retry-After on a 429', async () => {
     const { fetchImpl } = fakeFetch(
       () =>

@@ -1,16 +1,23 @@
 // worker/http.ts — the authed HTTP client (ENG-78, R2). A small injectable
 // `fetch` wrapper: every ENG-79/81 server call reuses it. Transport-agnostic and
 // mockable — no real network is needed to unit-test auth logic (the injected
-// `fetchImpl` is the seam). It NEVER throws for an HTTP error; it returns a typed
-// `ApiResult`. The only rejection surface (network) is folded into an ApiError.
+// `fetchImpl` is the seam). It NEVER throws — every outcome (HTTP error, a
+// non-JSON body, a network reject, a timeout) is folded into a typed `ApiResult`.
 //
 // The token is attached here, worker-side, as `Authorization: Bearer <token>` and
 // never leaves this realm (R1). Errors are parsed from RFC 9457 problem+json.
 
-/** A parsed error, shaped from problem+json (or synthesized for opaque failures). */
+/** Default per-request timeout; aligns with the RPC caller's 15s (rpc.ts). */
+const DEFAULT_TIMEOUT_MS = 15_000
+
+/**
+ * A parsed error. `code` is either a problem `type` slug (e.g. 'invalid-credentials')
+ * or one of the synthesized transport codes: `http-<status>` (opaque non-problem
+ * error body), `network` (fetch reject), `timeout` (exceeded the request timeout),
+ * `invalid-response` (a 2xx body that was not valid JSON).
+ */
 export interface ApiError {
   status: number
-  /** problem `type` slug, e.g. 'invalid-credentials' (tail of `/problems/<slug>`). */
   code: string
   title: string
   detail?: string
@@ -36,8 +43,14 @@ export interface HttpClientDeps {
   fetchImpl?: typeof fetch
   /** Worker-held token accessor (R1). Returns null when unauthenticated. */
   getToken: () => string | null
-  /** Invoked on a 401 before the typed error is returned (session invalid → clear). */
+  /**
+   * Invoked on a 401 to an AUTHED request, before the typed error is returned
+   * (an expired/revoked session → clear). NOT fired for an unauthed 401 (a wrong
+   * password on login/setup/accept-invite must never wipe a live session).
+   */
   onUnauthorized: () => void | Promise<void>
+  /** Per-request timeout in ms (AbortController). Default 15s. */
+  timeoutMs?: number
 }
 
 /** Minimal problem+json shape the client reads (server: msgd/api/problems.py). */
@@ -50,6 +63,7 @@ interface ProblemDocument {
 
 export function createHttpClient(deps: HttpClientDeps): HttpClient {
   const baseUrl = deps.baseUrl ?? ''
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const rawFetch = deps.fetchImpl ?? globalThis.fetch
   // Wrap so we never trip an "Illegal invocation" when the platform `fetch`
   // relies on its receiver, and so the injected impl is called uniformly.
@@ -69,32 +83,60 @@ export function createHttpClient(deps: HttpClientDeps): HttpClient {
       if (token) headers['Authorization'] = `Bearer ${token}`
     }
 
-    let res: Response
+    // Bound the whole request (headers + body) so a hung server never leaks a
+    // pending worker-side promise. The timer is always cleared in `finally`.
+    const controller = new AbortController()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, timeoutMs)
+
     try {
-      res = await doFetch(baseUrl + path, {
-        method,
-        headers,
-        ...(hasBody ? { body: JSON.stringify(body) } : {}),
-      })
-    } catch {
-      // Only a network/fetch rejection reaches here — HTTP errors are Responses.
-      return { ok: false, error: { status: 0, code: 'network', title: 'Network error' } }
-    }
+      let res: Response
+      try {
+        res = await doFetch(baseUrl + path, {
+          method,
+          headers,
+          signal: controller.signal,
+          ...(hasBody ? { body: JSON.stringify(body) } : {}),
+        })
+      } catch {
+        // A network/fetch reject or our own abort — timeout is distinct from network.
+        return timedOut ? timeoutError<T>() : networkError<T>()
+      }
 
-    // The single choke point that turns an expired/revoked session into a
-    // re-login state for the whole app (R2). Runs before we return the error.
-    if (res.status === 401) {
-      await deps.onUnauthorized()
-    }
+      // The single choke point that turns an expired/revoked session into a
+      // re-login state for the whole app (R2). Fired only for AUTHED requests: an
+      // unauthed 401 is a wrong password, not a dead session, so it must not clear.
+      if (authed && res.status === 401) {
+        await deps.onUnauthorized()
+      }
 
-    if (res.ok) {
-      if (res.status === 204) return { ok: true, value: undefined as T }
-      const text = await res.text()
-      if (!text) return { ok: true, value: undefined as T }
-      return { ok: true, value: JSON.parse(text) as T }
-    }
+      if (res.ok) {
+        if (res.status === 204) return { ok: true, value: undefined as T }
+        let text: string
+        try {
+          text = await res.text()
+        } catch {
+          return timedOut ? timeoutError<T>() : networkError<T>()
+        }
+        if (!text) return { ok: true, value: undefined as T }
+        try {
+          return { ok: true, value: JSON.parse(text) as T }
+        } catch {
+          // A 2xx with a non-JSON body — surface a typed error, never throw.
+          return {
+            ok: false,
+            error: { status: res.status, code: 'invalid-response', title: 'Invalid response body' },
+          }
+        }
+      }
 
-    return { ok: false, error: await parseError(res) }
+      return { ok: false, error: await parseError(res) }
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   return {
@@ -135,4 +177,12 @@ function parseRetryAfter(header: string | null): number | undefined {
   if (!header) return undefined
   const seconds = Number.parseInt(header, 10)
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined
+}
+
+function networkError<T>(): ApiResult<T> {
+  return { ok: false, error: { status: 0, code: 'network', title: 'Network error' } }
+}
+
+function timeoutError<T>(): ApiResult<T> {
+  return { ok: false, error: { status: 0, code: 'timeout', title: 'Request timed out' } }
 }
