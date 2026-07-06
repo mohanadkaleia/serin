@@ -152,6 +152,36 @@ describe('JCS integer interop cap (parse-time, on the source literal)', () => {
       expect(() => enforceIntegerCap(9007199254740992, '9007199254740992')).toThrow(JCSError)
     })
   })
+
+  // Direct-construct path (the send path: body builder → hashEvent → canonicalize,
+  // no parse). Perfect int/float parity with Python is provably impossible here —
+  // canonicalize sees only a JS number with no int/float type, and no value-only
+  // threshold can reject 2^53 while accepting the larger, integer-valued float
+  // 1e21 that the frozen vectors require canonicalize to accept. So the cap stays
+  // a parse-boundary rule; this pins the resulting documented, fail-safe asymmetry.
+  describe('direct-construct integer cap (documented Python-parity limit)', () => {
+    it('accepts an integer-valued float > 2^53 (matches Python float; why a value cap is impossible)', () => {
+      // These reach canonicalize in the vector runner and MUST pass, exactly as
+      // Python's canonicalize accepts the float 1e21 / 1e30 / 9.999e22.
+      expect(canon(1e21)).toBe('1e+21')
+      expect(canon(1e30)).toBe('1e+30')
+      expect(canon(9.999e22)).toBe('9.999e+22')
+    })
+
+    it('does NOT cap a directly-constructed over-cap integer (the documented asymmetry)', () => {
+      // No source literal on the direct path → cannot distinguish int from float,
+      // and a value cap would reject 1e21 above. Python (int type) would reject
+      // 2^53; TS canonicalize accepts it. Fail-safe: see the wire round-trip below.
+      expect(canon(2 ** 53)).toBe('9007199254740992')
+    })
+
+    it('is fail-safe on the wire: the same value re-parses and is rejected at the boundary', () => {
+      // A directly-constructed 2^53 serializes to an integer literal, which the
+      // parse-boundary cap (server-side and here) rejects — so no forged accept.
+      expect(JSON.stringify(2 ** 53)).toBe('9007199254740992')
+      expect(() => parseJcsJson(JSON.stringify(2 ** 53))).toThrow(JCSError)
+    })
+  })
 })
 
 describe('JCS lone-surrogate rejection', () => {

@@ -33,9 +33,11 @@
  * - Numbers serialize per ES6 `Number::toString` via `String(n)`; `-0` → `0`.
  * - NaN / Infinity are rejected.
  * - Integer interop cap `[-(2^53)+1, 2^53-1]` is enforced at *parse* time in
- *   {@link parseJcsJson} (see below), not here — JS erases the int-vs-float
- *   distinction and truncates ≥2^53 after parse, so the source literal is the
- *   only place the cap is enforceable.
+ *   {@link parseJcsJson} (see below), not in {@link canonicalize} — JS erases
+ *   the int-vs-float distinction and truncates ≥2^53 after parse, so the source
+ *   literal is the only place the cap is enforceable. Python instead caps inside
+ *   its `canonicalize` (by the `int` type). This leaves one documented, fail-safe
+ *   direct-construct asymmetry — see the number branch of {@link canonicalize}.
  * - Strings are emitted as UTF-8 bytes with RFC 8785 §3.2.2.2 escaping;
  *   `0x7f` (DEL) is NOT escaped; no NFC normalization (D1 — client's job).
  * - Container nesting deeper than {@link MAX_DEPTH} (128) is rejected via an
@@ -128,7 +130,25 @@ function serializeValue(value: JSONValue): string {
     if (!Number.isFinite(value)) {
       throw new JCSError('number is not finite')
     }
-    // String(n) === ES6 Number::toString; String(-0) === "0".
+    // The ±(2^53−1) integer interop cap is deliberately NOT enforced here — it is
+    // a parse-boundary rule ({@link parseJcsJson}). Python's canonicalize can cap
+    // by the *Python type* (`int` is capped, `float` is uncapped: it accepts the
+    // float `1e21` but rejects the int `2^53`). A directly-constructed JS number
+    // has no int/float type, so canonicalize could only classify by value — and
+    // that is impossible to reconcile with the frozen vectors: `1e21`, `1e30`,
+    // `9.999e22` are accepted floats that are ALSO integer-valued and > 2^53, so
+    // any "reject Number.isInteger(n) && |n| > 2^53−1" rule would reject them too
+    // (and flow through canonicalize in the vector runner), breaking conformance
+    // on the very values Python accepts. Since no value-only threshold can reject
+    // 2^53 while accepting the larger 1e21, perfect parity on the direct path is
+    // provably impossible; the cap therefore lives at parse. This leaves one
+    // documented, fail-safe asymmetry: a directly-constructed over-cap *integer*
+    // (e.g. `2**53`) is accepted here, whereas Python's int path rejects it. It is
+    // unreachable on the send path (the only numeric body field is `type_version`,
+    // builder-set to 1) and cannot forge an accept — such a value serializes to an
+    // integer literal on the wire (`JSON.stringify(2**53) === "9007199254740992"`)
+    // that the server re-parses and rejects. String(n) === ES6 Number::toString;
+    // String(-0) === "0".
     return String(value)
   }
   if (typeof value === 'string') {
