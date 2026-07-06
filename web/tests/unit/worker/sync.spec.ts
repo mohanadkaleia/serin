@@ -65,7 +65,6 @@ function makeHarness(overrides: HarnessOptions): Harness {
     applyToProjection: seam,
     emitStatus: (s) => statuses.push(s),
     publishStream: (sid) => streamPushes.push(sid),
-    now: clock.now,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
     isOnline: () => onlineRef.value,
@@ -226,6 +225,35 @@ describe('bootstrap', () => {
     expect(h.seamCalls).toEqual([{ streamId: 's1', seqs: [1, 2] }])
   })
 
+  it('cold newest-page: a top-of-page hash mismatch does NOT falsely advance the frontier (no permanent hole)', async () => {
+    const server = new FakeSyncServer()
+    server.addStream({ stream_id: 's1' })
+    await server.seed('s1', 5) // head 5, seqs 1..5, no local cursor → cold path
+    const evs = server.events('s1')
+    evs[4] = corruptHash(evs[4]!) // corrupt the TOP event (seq 5)
+    const h = makeHarness({ server })
+
+    await boot(h)
+
+    // The frontier stops at the actual stored contiguous top (4) — NOT head 5.
+    expect((await h.db.getCursor('s1'))?.last_contiguous_seq).toBe(4)
+    expect(await seqs(h.db, 's1')).toEqual([1, 2, 3, 4]) // seq 5 was dropped, not stored
+    expect(warnSpy).toHaveBeenCalled()
+    expect(h.seamCalls).toEqual([{ streamId: 's1', seqs: [1, 2, 3, 4] }])
+
+    // The skipped seq is reachable, not a permanent hole: heal the server, then a
+    // reconnect's forward catch-up (after=4) reobtains seq 5.
+    evs[4] = await buildWireEvent({ streamId: 's1', seq: 5 })
+    h.ws.last().serverClose()
+    h.clock.advance(1_500)
+    h.ws.last().open()
+    await until(() => h.engine.status().state === 'live')
+
+    expect((await h.db.getCursor('s1'))?.last_contiguous_seq).toBe(5)
+    expect(await seqs(h.db, 's1')).toEqual([1, 2, 3, 4, 5])
+    expect(h.http.countGets('after=4')).toBeGreaterThanOrEqual(1)
+  })
+
   it('runs green with the default no-op projection seam', async () => {
     const server = new FakeSyncServer()
     server.addStream({ stream_id: 's1' })
@@ -285,7 +313,7 @@ describe('delivery contract', () => {
 
     // Server advances to 8; a frame for seq 8 arrives (missing 6,7).
     await server.extend('s1', 3) // append 6,7,8
-    const e8 = server.events('s1').find((e) => e.server.server_sequence === 8)!
+    const e8 = server.events('s1').find((e) => e.server?.server_sequence === 8)!
     h.ws.last().emitEvent(e8)
 
     await untilAsync(async () => (await h.db.getCursor('s1'))?.last_contiguous_seq === 8)
@@ -313,13 +341,59 @@ describe('delivery contract', () => {
     await boot(h)
     await server.extend('s1', 5) // append 6..10
 
-    const e8 = server.events('s1').find((e) => e.server.server_sequence === 8)!
-    const e9 = server.events('s1').find((e) => e.server.server_sequence === 9)!
+    const e8 = server.events('s1').find((e) => e.server?.server_sequence === 8)!
+    const e9 = server.events('s1').find((e) => e.server?.server_sequence === 9)!
     h.ws.last().emitEvent(e8)
     h.ws.last().emitEvent(e9)
 
     await untilAsync(async () => (await h.db.getCursor('s1'))?.last_contiguous_seq === 10)
     expect(h.http.countGets('after=5')).toBe(1) // exactly one pull, not two
+  })
+
+  it('an unknown-stream frame does a newest-page pull + /v1/sync refresh (new channel mid-session)', async () => {
+    const server = new FakeSyncServer()
+    server.addStream({ stream_id: 's1' })
+    await server.seed('s1', 3)
+    const h = makeHarness({ server })
+    await boot(h) // s1 known, cursor 3
+
+    // A channel 's2' is created server-side after bootstrap; a frame for it arrives.
+    server.addStream({ stream_id: 's2', name: 'random' })
+    await server.seed('s2', 4) // head 4
+    const e = server.events('s2').find((x) => x.server?.server_sequence === 4)!
+    h.ws.last().emitEvent(e)
+
+    await untilAsync(async () => (await h.db.getCursor('s2'))?.last_contiguous_seq === 4)
+
+    // Newest-page pull (before=head+1), NOT a walk-from-1 (after=0).
+    expect(h.http.countGets('stream_id=s2&before=5')).toBe(1)
+    expect(h.http.countGets('stream_id=s2&after=0')).toBe(0)
+    // /v1/sync was refreshed → s2's metadata landed in `streams` immediately.
+    expect((await h.db.getStream('s2'))?.name).toBe('random')
+    expect(await seqs(h.db, 's2')).toEqual([1, 2, 3, 4])
+  })
+
+  it('retries a failed live gap pull with backoff, then converges', async () => {
+    const server = new FakeSyncServer()
+    server.addStream({ stream_id: 's1' })
+    await server.seed('s1', 5)
+    const h = makeHarness({ server })
+    await boot(h) // cursor 5
+    await server.extend('s1', 5) // 6..10
+
+    // The first gap-pull attempt fails (transient 503).
+    server.eventsError = { status: 503, code: 'unavailable', title: 'Unavailable' }
+    const e8 = server.events('s1').find((x) => x.server?.server_sequence === 8)!
+    h.ws.last().emitEvent(e8)
+    await flush()
+    expect((await h.db.getCursor('s1'))?.last_contiguous_seq).toBe(5) // wedged, retry pending
+    expect(h.engine.status().state).toBe('live') // socket NOT torn down for one bad page
+
+    // Heal the server and advance the backoff clock → the retry drains the gap.
+    server.eventsError = undefined
+    h.clock.advance(2_000)
+    await untilAsync(async () => (await h.db.getCursor('s1'))?.last_contiguous_seq === 10)
+    expect(h.http.countGets('stream_id=s1&after=5')).toBeGreaterThanOrEqual(2) // retried
   })
 
   it('replies pong to a server ping', async () => {

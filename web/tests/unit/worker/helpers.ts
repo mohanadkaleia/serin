@@ -10,6 +10,7 @@ import { DexieDb, MsgDB } from '../../../src/worker/db'
 import type { ApiError, ApiResult, HttpClient } from '../../../src/worker/http'
 import type { ChannelLike, LockManagerLike } from '../../../src/worker/leader'
 import type {
+  EventBody,
   FromWorker,
   MessageSink,
   StoredEvent,
@@ -201,7 +202,7 @@ export async function buildWireEvent(opts: {
   })
   const event_hash = await hashEvent(body)
   return {
-    body: body as unknown as Record<string, unknown>,
+    body: body as unknown as EventBody,
     event_hash,
     signature: null,
     server: {
@@ -224,6 +225,11 @@ export async function buildEventRun(streamId: string, count: number): Promise<Wi
 /** Return a shallow copy of `ev` with a corrupted `event_hash` (verify-reject test). */
 export function corruptHash(ev: WireEvent): WireEvent {
   return { ...ev, event_hash: 'sha256:deadbeef' }
+}
+
+/** The server sequence of a wire event (test builders always populate `server`). */
+export function wireSeq(ev: WireEvent): number {
+  return ev.server?.server_sequence ?? 0
 }
 
 interface FakeStream {
@@ -263,7 +269,7 @@ export class FakeSyncServer {
   append(streamId: string, events: readonly WireEvent[]): void {
     const s = this.get(streamId)
     s.events.push(...events)
-    s.events.sort((a, b) => a.server.server_sequence - b.server.server_sequence)
+    s.events.sort((a, b) => wireSeq(a) - wireSeq(b))
   }
 
   /** Build + append a gapless run `1..count` (real hashes). */
@@ -289,7 +295,7 @@ export class FakeSyncServer {
     const s = this.get(streamId)
     if (s.headOverride !== undefined) return s.headOverride
     const last = s.events[s.events.length - 1]
-    return last ? last.server.server_sequence : 0
+    return last ? wireSeq(last) : 0
   }
 
   /** Hold every subsequent `/v1/events` response until {@link resumeEvents}. */
@@ -336,15 +342,15 @@ export class FakeSyncServer {
     const limit = Math.min(Number(query.get('limit') ?? '500'), 500)
     const beforeRaw = query.get('before')
     const afterRaw = query.get('after')
-    const asc = [...s.events].sort((a, b) => a.server.server_sequence - b.server.server_sequence)
+    const asc = [...s.events].sort((a, b) => wireSeq(a) - wireSeq(b))
     if (beforeRaw !== null) {
       const before = Number(beforeRaw)
-      const below = asc.filter((e) => e.server.server_sequence < before)
+      const below = asc.filter((e) => wireSeq(e) < before)
       const page = below.slice(Math.max(0, below.length - limit))
       return { events: page, has_more: below.length > page.length }
     }
     const after = afterRaw !== null ? Number(afterRaw) : 0
-    const above = asc.filter((e) => e.server.server_sequence > after)
+    const above = asc.filter((e) => wireSeq(e) > after)
     const page = above.slice(0, limit)
     return { events: page, has_more: above.length > page.length }
   }
@@ -517,7 +523,7 @@ export const inertWsFactory: WsFactory = () => ({
 /** A cheap, synchronous placeholder envelope for tests that don't verify hashes. */
 export function stubEnvelope(seq: number): StoredEvent {
   return {
-    body: {},
+    body: { type: 'stub', type_version: 1, author_user_id: '', payload: null },
     event_hash: 'sha256:stub',
     signature: null,
     server: { server_sequence: seq, server_received_at: '', payload_redacted: false },

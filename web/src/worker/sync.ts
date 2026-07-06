@@ -46,6 +46,8 @@ export const HEARTBEAT_TIMEOUT_MS = 40_000
 /** Reconnect backoff: 1 s → 30 s cap with jitter (§6, mirrors the outbox numbers). */
 export const RECONNECT_BASE_MS = 1_000
 export const RECONNECT_CAP_MS = 30_000
+/** A live gap-pull retries a few times (with backoff) before it reports stalled. */
+export const LIVE_PULL_MAX_RETRIES = 3
 
 /** Injected timer handle — a number in browser/worker; tests supply their own. */
 export type TimerId = number
@@ -63,8 +65,7 @@ export interface SyncEngineDeps {
   emitStatus: (status: SyncStatus) => void
   /** Async "events changed for stream X" signal — WorkerCore fans `{kind:'stream'}`. */
   publishStream: (streamId: string) => void
-  /** Injectable clock (tests advance deterministically). */
-  now?: () => number
+  /** Injectable clock (tests advance backoff / watchdog / retry timers). */
   setTimeout?: (cb: () => void, ms: number) => TimerId
   clearTimeout?: (handle: TimerId) => void
   /** Snapshot of `navigator.onLine`; default assumes online. */
@@ -80,6 +81,14 @@ class BootstrapAborted extends Error {
   constructor() {
     super('bootstrap aborted')
     this.name = 'BootstrapAborted'
+  }
+}
+
+/** Thrown by a LIVE catch-up pull page fetch so the caller can bound-retry it. */
+class PullFailed extends Error {
+  constructor(readonly code: string) {
+    super(`pull failed: ${code}`)
+    this.name = 'PullFailed'
   }
 }
 
@@ -401,7 +410,7 @@ export class SyncEngine {
     if (!cursor) {
       // Brand-new stream → newest-page pull for cold-start render (§3.2); do NOT
       // walk from seq 1. Empty streams (head 0) need nothing.
-      if (stream.head_seq > 0) await this.coldNewestPage(stream, epoch)
+      if (stream.head_seq > 0) await this.coldNewestPage(stream, epoch, 'bootstrap')
       return
     }
     if (stream.head_seq > last) {
@@ -410,33 +419,57 @@ export class SyncEngine {
     // else up-to-date — nothing to pull.
   }
 
-  /** Cold-start newest page: `before = head+1`, set cursor to the head frontier (§7). */
-  private async coldNewestPage(stream: SyncStreamMeta, epoch: number): Promise<void> {
+  /** Cold-start newest page: `before = head+1`, set cursor to the stored frontier (§7). */
+  private async coldNewestPage(
+    stream: SyncStreamMeta,
+    epoch: number,
+    context: 'bootstrap' | 'live',
+  ): Promise<void> {
     const path = `/v1/events?stream_id=${encodeURIComponent(stream.stream_id)}&before=${
       stream.head_seq + 1
     }&limit=${PULL_LIMIT}`
     const res = await this.http.get<EventsPageResponse>(path)
     if (this.isStale(epoch)) throw new BootstrapAborted()
     if (!res.ok) {
-      this.handleDegraded(`events ${res.error.code}`)
-      throw new BootstrapAborted()
+      if (context === 'bootstrap') {
+        this.handleDegraded(`events ${res.error.code}`)
+        throw new BootstrapAborted()
+      }
+      throw new PullFailed(res.error.code)
     }
     const rows = await this.verifyAndStore(stream.stream_id, res.value.events)
     const firstRow = rows[0]
-    const firstSeq = firstRow ? firstRow.server_sequence : stream.head_seq
-    // "Contiguous from the newest-loaded window forward": last_contiguous jumps to
-    // head even though seqs 1..firstSeq-1 are absent (fetched later via backfill).
+    if (!firstRow) return // nothing verified (empty page or every event dropped)
+
+    // Cold-start cursor = "contiguous from the newest-loaded window forward". The
+    // frontier is the top of the run that is ACTUALLY gapless from the bottom of
+    // the stored page — NOT head_seq unconditionally. Server pages are gapless, so
+    // with nothing dropped this == head_seq; but a hash-mismatch skip (e.g. the
+    // page's top event) must NOT be claimed contiguous, or forward catch-up
+    // (after=head) would never re-request it and backfill only descends below
+    // oldest_loaded → a permanent hole. Mirrors how `applyForward` wedges before a
+    // hole. The skipped seq is re-obtained by the next catch-up/reconnect (which
+    // pulls after=frontier) or a live gap frame.
+    const firstSeq = firstRow.server_sequence
+    let frontier = firstSeq
+    const applied: EventRow[] = [firstRow]
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i]
+      if (row && row.server_sequence === frontier + 1) {
+        frontier = row.server_sequence
+        applied.push(row)
+      } else break
+    }
     await this.db.putCursors([
       {
         stream_id: stream.stream_id,
-        last_contiguous_seq: stream.head_seq,
+        last_contiguous_seq: frontier,
         oldest_loaded_seq: firstSeq,
       },
     ])
-    if (rows.length > 0) {
-      await this.callSeam(stream.stream_id, rows)
-      this.publishStream(stream.stream_id)
-    }
+    // Seam only over the contiguous run the cursor now covers (its contract).
+    await this.callSeam(stream.stream_id, applied)
+    this.publishStream(stream.stream_id)
   }
 
   /**
@@ -468,16 +501,14 @@ export class SyncEngine {
           this.handleDegraded(`events ${res.error.code}`)
           throw new BootstrapAborted()
         }
-        // A live gap-pull transient failure: record + stop; the next frame
-        // re-triggers. Do not tear the socket down for one bad page.
-        this.lastError = `events ${res.error.code}`
-        this.emitStatus(this.snapshot())
-        return
+        // A live gap-pull page failure: throw so the driver can bound-retry it
+        // (don't tear the socket down for one bad page, but don't wedge silently).
+        throw new PullFailed(res.error.code)
       }
       const page = res.value
       if (page.events.length > 0) await this.applyForward(streamId, page.events)
       const lastEvent = page.events[page.events.length - 1]
-      const maxSeq = lastEvent ? lastEvent.server.server_sequence : after
+      const maxSeq = lastEvent?.server ? lastEvent.server.server_sequence : after
       if (!page.has_more) return
       if (maxSeq <= after) return // no forward progress — avoid an infinite loop
       after = maxSeq
@@ -557,7 +588,7 @@ export class SyncEngine {
     if (computed !== ev.event_hash) {
       console.warn('[sync] event hash mismatch, skipping', {
         streamId,
-        seq: ev.server.server_sequence,
+        seq: ev.server?.server_sequence,
         expected: ev.event_hash,
         got: computed,
       })
@@ -587,6 +618,17 @@ export class SyncEngine {
     // stale cursor and each fire a redundant pull.
     return this.withStreamLock(sid, async () => {
       const cursor = await this.db.getCursor(sid)
+      if (!cursor) {
+        // No cursor. If we've also never seen this stream's metadata it is a
+        // channel created (or made visible to us) mid-session (§9): do a
+        // newest-page cold-start pull AND refresh /v1/sync so its `streams` row
+        // lands immediately — NOT a walk-from-1 of full history.
+        const known = await this.db.getStream(sid)
+        if (!known) {
+          this.triggerNewChannel(sid, seq)
+          return
+        }
+      }
       const cur = cursor?.last_contiguous_seq ?? 0
       if (seq === cur + 1) {
         await this.applyForward(sid, [ev]) // contiguous — the fast path
@@ -597,22 +639,83 @@ export class SyncEngine {
     })
   }
 
-  /** Start a coalesced catch-up pull for `sid` (one in-flight per stream, §9). */
+  /**
+   * Start a coalesced, bound-retried live catch-up pull for `sid` (§9). Runs
+   * DETACHED from the per-stream apply lock: safe because WS frames are delivered
+   * in order, so a frame observed after this pull started reflects a seq the pull
+   * already covers (or re-triggers, coalesced). One in-flight pull per stream.
+   */
   private triggerPull(streamId: string, after: number): void {
     if (this.inflightPulls.has(streamId)) return // an existing pull will cover it
     this.inflightPulls.add(streamId)
     const epoch = this.epoch
-    void (async () => {
+    void this.runLiveGapPull(streamId, after, epoch).finally(() => {
+      this.inflightPulls.delete(streamId)
+    })
+  }
+
+  /** Drive a live gap pull with a few backoff retries before reporting stalled. */
+  private async runLiveGapPull(streamId: string, after: number, epoch: number): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      if (this.isStale(epoch)) return
       try {
         await this.catchUp(streamId, after, epoch, 'live')
+        return // drained cleanly
       } catch (err) {
-        if (!(err instanceof BootstrapAborted)) {
+        if (err instanceof BootstrapAborted) return
+        if (!(err instanceof PullFailed)) {
           console.warn('[sync] gap pull failed', { streamId, error: errText(err) })
+          return
+        }
+        if (attempt >= LIVE_PULL_MAX_RETRIES) {
+          // Persistent failure on a healthy socket: reflect the stalled stream in
+          // status rather than wedging silently. The next frame / reconnect retries.
+          console.warn('[sync] gap pull stalled', { streamId, code: err.code })
+          this.lastError = `gap pull stalled (${streamId}): ${err.code}`
+          this.emitStatus(this.snapshot())
+          return
+        }
+        await this.delay(this.backoffDelay(attempt))
+      }
+    }
+  }
+
+  /** Trigger a coalesced newest-page pull + `/v1/sync` refresh for a new channel. */
+  private triggerNewChannel(streamId: string, seq: number): void {
+    if (this.inflightPulls.has(streamId)) return
+    this.inflightPulls.add(streamId)
+    const epoch = this.epoch
+    void (async () => {
+      try {
+        const res = await this.http.get<SyncResponse>('/v1/sync')
+        if (this.isStale(epoch) || !res.ok) return
+        await this.db.putStreams(res.value.streams.map(toStreamRow))
+        const meta =
+          res.value.streams.find((s) => s.stream_id === streamId) ??
+          ({
+            stream_id: streamId,
+            kind: 'channel',
+            name: null,
+            visibility: null,
+            head_seq: seq,
+            member: false,
+          } satisfies SyncStreamMeta)
+        if (meta.head_seq > 0) await this.coldNewestPage(meta, epoch, 'live')
+      } catch (err) {
+        if (!(err instanceof BootstrapAborted) && !(err instanceof PullFailed)) {
+          console.warn('[sync] new-channel pull failed', { streamId, error: errText(err) })
         }
       } finally {
         this.inflightPulls.delete(streamId)
       }
     })()
+  }
+
+  /** A cancellable-by-epoch delay on the injected clock (backoff between retries). */
+  private delay(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      this.setTimer(() => resolve(), ms)
+    })
   }
 
   // -- backward backfill (§10) --------------------------------------------
@@ -692,11 +795,15 @@ export class SyncEngine {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-/** Map a wire event to its denormalized `EventRow` (envelope stored verbatim). */
+/**
+ * Map a wire event to its denormalized `EventRow` (envelope stored verbatim).
+ * Only ever called on events that passed the `verifyAndStore` server guard, so
+ * `server.server_sequence` is present — `?? 0` just satisfies the optional type.
+ */
 function toEventRow(streamId: string, ev: WireEvent): EventRow {
   return {
     stream_id: streamId,
-    server_sequence: ev.server.server_sequence,
+    server_sequence: ev.server?.server_sequence ?? 0,
     event_id: typeof ev.body?.event_id === 'string' ? ev.body.event_id : '',
     type: typeof ev.body?.type === 'string' ? ev.body.type : '',
     envelope: ev,

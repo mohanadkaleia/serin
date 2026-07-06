@@ -6,7 +6,13 @@ import type { WireEvent } from '../../../src/worker/types'
 describe('parseFrame (BrowserWsConnection text-frame parsing)', () => {
   it('parses a JSON text event frame into a WsFrame', () => {
     const event: WireEvent = {
-      body: { stream_id: 's1', type: 'message.created' },
+      body: {
+        stream_id: 's1',
+        type: 'message.created',
+        type_version: 1,
+        author_user_id: 'u_1',
+        payload: {},
+      },
       event_hash: 'sha256:abc',
       signature: null,
       server: {
