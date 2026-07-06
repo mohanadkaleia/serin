@@ -134,4 +134,22 @@ uv run mypy
 
 CI runs all of the above on every push and PR, plus a dedicated **`Equivalence gate (rebuild ≡ incremental)`** step — a hypothesis property test proving that dropping the projection and replaying the log always reproduces the incremental state byte-for-byte. That gate is the M0 exit criterion and is kept forever (TDD §5); it extends to server projections at M1 and the browser cache at M2. At M1 the `pytest` step also runs the `integration`-marked E2Es — including the exit-gate test that stands up a real Postgres + the live server and drives two `msgctl` clients to convergence — and a separate **`Simulation suite`** step runs the §12 property-based harness (four of six invariants at M1).
 
+### The M2 hard gate — all six §12 invariants green in CI
+
+M2's exit criterion (TDD §13) is that **all six §12 invariants** are asserted green in CI. They are split across two languages, each owning the property in the language it lives in (see [`.claude/chat/eng-83-acceptance-architecture.md`](.claude/chat/eng-83-acceptance-architecture.md)):
+
+| # | Invariant | CI job · step |
+|---|---|---|
+| 1 | Idempotency | `lint · type · test` · **Simulation suite** |
+| 2 | Convergence | `lint · type · test` · **Simulation suite** |
+| 3 | Cursor integrity | `lint · type · test` · **Simulation suite** |
+| 4 | Permission isolation | `lint · type · test` · **Simulation suite** |
+| 5 | Pending settling | `web · lint · type · test · build` · **Invariant suite (§12)** |
+| 6 | Rebuild equivalence — client (Dexie) | `web · lint · type · test · build` · **Invariant suite (§12)** |
+| 6 | Rebuild equivalence — server (`messages_proj`) | `lint · type · test` · **Equivalence gate** |
+
+Invariants 5 and client-6 are [`fast-check`](https://github.com/dubzzz/fast-check) property suites that drive the **real** worker engine (`web/tests/unit/worker/invariant{5,6}-*.property.spec.ts`). The `e2e · golden path` job additionally runs a Playwright smoke over the real production stack (login → send → reload → history intact → a second browser sees the message live via WS fanout). The suites have **teeth**: `MSG_MUTATE=inv5-drop-ack` and `MSG_MUTATE=inv6-rebuild-skew` flip in a client bug that turns the respective suite red (green by default).
+
+**Required checks (branch protection).** The M2/M3 gate is the conjunction of the jobs whose names are **`lint · type · test`** (inv 1–4 + server-6), **`web · lint · type · test · build`** (inv 5 + client-6), and **`e2e · golden path`**. Marking these "required" in GitHub branch protection is a repo-settings change (outside CI-file scope) — a maintainer must set it.
+
 Contribution conventions: work is tracked in Linear (`ENG-xx`); commits follow `<type>[ENG-xx]: description`; protocol changes require amending `docs/technical-design.md`, not drive-by PRs — the D1–D14 decision table is the contract.
