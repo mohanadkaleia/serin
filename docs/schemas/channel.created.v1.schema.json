@@ -1,0 +1,31 @@
+{
+  "$id": "https://msg.dev/schemas/channel.created.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``channel.created`` v1 (\u00a72.2).",
+  "properties": {
+    "channel_stream_id": {
+      "title": "Channel Stream Id",
+      "type": "string"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "visibility": {
+      "enum": [
+        "public",
+        "private"
+      ],
+      "title": "Visibility",
+      "type": "string"
+    }
+  },
+  "required": [
+    "channel_stream_id",
+    "name",
+    "visibility"
+  ],
+  "title": "msg channel.created payload (v1)",
+  "type": "object"
+}

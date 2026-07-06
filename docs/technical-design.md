@@ -169,7 +169,7 @@ All flow through the same envelope; `payload` schemas are Pydantic models in `co
 
 > **`message.created.format` domain (locked at `type_version` 1):** `format` is exactly `"markdown"` or `"plain"`. New format values arrive via a `type_version` bump (§2.3), **not** an additive enum widening — an older reader must never receive a `format` it cannot render. (ENG-54 ruling.)
 
-**`workspace-meta` stream** (one per workspace; every member is subscribed):
+**`workspace-meta` stream** (one per workspace; every **non-guest** member is subscribed):
 
 | Type | Payload | Notes |
 |---|---|---|
@@ -181,6 +181,8 @@ All flow through the same envelope; `payload` schemas are Pydantic models in `co
 | `channel.member_added` / `channel.member_removed` | `channel_stream_id`, `user_id` | Only these events grant/revoke private-channel access |
 | `dm.created` | `dm_stream_id`, `member_user_ids` | DM/group-DM streams are created lazily on first message |
 | `bot.installed` / `bot.removed` | `bot_user_id`, `name`, `scopes` | Plugin-era (M5) |
+
+> **Guest exclusion (ENG-65 / §3.6):** "every member" here means every **non-guest** member (owner/admin/member). A `guest` is a member with restricted scope — §3.6: a guest sees only streams they are explicitly added to — so granting guests `workspace-meta` would leak the full public-channel and member roster. Guests read `workspace-meta` only via an explicit `stream_members` row, which they are never given for meta. The read predicate enforces this directly as `kind == 'workspace-meta' AND role != 'guest'`. (Consequence for the M2 member-list projection: guests do not receive meta.)
 
 Membership events for **private** channels are visible in `workspace-meta` only to members of that channel? **No — simpler MVP rule:** private channel lifecycle events go into the **private channel's own stream**, not `workspace-meta`; `workspace-meta` carries only public-channel and workspace-level events. This keeps `workspace-meta` universally readable with zero filtering. (Consequence: a user's list of private channels is learned from `GET /v1/sync`, which only returns streams they can read.)
 
@@ -229,6 +231,7 @@ All endpoints under `/v1`, authenticated by `Authorization: Bearer <session_toke
 - **Idempotency:** `event_id` is unique per workspace (Postgres unique index). A re-upload of an already-accepted event returns the *original* accepted record (same sequence), not an error and not a duplicate. This makes the client outbox a dumb retry loop.
 - Validation order: session → workspace membership → stream write permission → schema (type + version) → `event_hash` recomputation (JCS) → payload referential checks (e.g., `file_ids` exist and were uploaded by this user; `message_id` exists for reactions/edits — or the event is rejected, no "pending reference" support in MVP) → size caps.
 - Author fields (`author_user_id`, `author_device_id`) must match the session; mismatch ⇒ reject. Bot tokens (M5) may author only as their bot user.
+- **Storability gate (envelope scalars, ENG-66):** the lax `Body` shape gate (`extra="allow"`) and a verifying `event_hash` are necessary but not sufficient — the envelope's scalar fields must also be **storable as typed** or the event is rejected `invalid_schema`. `type_version` must be a JSON **integer** within Postgres `INT4` range, and `client_created_at` must be a parseable RFC 3339 timestamp. An honestly-hashed but non-conforming form (e.g. a string `"1"` for `type_version`, hashed faithfully) is rejected **after** the hash check: the hash proves the bytes are the client's, not that they are storable. A JSONB-fatal body (e.g. a ` ` NUL inside a string — JSON-valid and JCS-hashable but rejected by Postgres JSONB) is likewise a per-event `invalid_schema`, isolated from the rest of the batch. This makes acceptance **total**: an event the server reports `accepted` is guaranteed round-trippable from storage. This narrows the §2.1 scalar domain (`type_version`, `client_created_at`) at the accept boundary. (ENG-66 deviation-1; supersedes that plan's "stored verbatim" companion ruling.)
 
 **`GET /v1/sync`** — reconnect bootstrap.
 
@@ -254,7 +257,7 @@ One round trip tells a reconnecting client exactly what to pull. Public channels
 
 ### 3.3 WebSocket
 
-`GET /v1/ws?token=…` — one socket per client (per SharedWorker). Messages are JSON frames:
+`GET /v1/ws` — one socket per client (per SharedWorker), authenticated via the **`Sec-WebSocket-Protocol: bearer, <token>`** subprotocol header, **not** a `?token=` query parameter: the raw session token must never appear in a URL, where it leaks into reverse-proxy access logs, browser history, and `Referer` headers that no in-process log filter can reach. The server echoes `Sec-WebSocket-Protocol: bearer` on accept (required for the browser handshake to complete). The M2 web client opens the socket as `new WebSocket(url, ["bearer", token])`; the session token is `secrets.token_urlsafe(32)`, whose alphabet (`[A-Za-z0-9-_]`, no `=` padding) is entirely valid subprotocol characters, so it rides the header unencoded. The delivery contract and frame set below are unchanged. (ENG-68 security ruling; supersedes the `?token=` form.) Messages are JSON frames:
 
 **Server → client:**
 - `{"t": "event", "event": {envelope}}` — a newly sequenced event on a stream the connection's user can read. Fanout is permission-scoped at send time: the hub resolves recipients from the in-memory membership map (invalidated by membership events).
@@ -435,7 +438,7 @@ CREATE TABLE invites (
 
 Accept path for one event (single transaction): validate → `SELECT ... FOR UPDATE` on the stream row → `head_seq + 1` → insert into `events` → apply to `messages_proj` → commit → hand to WS hub for fanout. On `UNIQUE (workspace_id, event_id)` violation: fetch and return the original accepted record (idempotent path).
 
-**Server-side projections follow the same rebuild contract as clients:** `msgctl rebuild-projections` truncates `messages_proj` and replays `events`. CI runs it and diffs against incremental state (M0 exit criterion, kept forever).
+**Server-side projections follow the same rebuild contract as clients:** `msgctl rebuild-projections` truncates `messages_proj` and replays `events`. CI runs it and diffs against incremental state (M0 exit criterion, kept forever). The rebuild is a **single transaction** — one `TRUNCATE messages_proj` followed by an ordered replay of `events` through `apply_projection`, committed once (ENG-69) — so it is atomic and safe to interrupt: a killed rebuild rolls back to the prior projection, never a partial one. `TRUNCATE` takes an `ACCESS EXCLUSIVE` lock that briefly blocks concurrent reads of `messages_proj` for the rebuild's duration, which is acceptable for a single-operator admin op at M1 scale; `DELETE FROM messages_proj` (ROW-EXCLUSIVE, MVCC-invisible to other snapshots until commit) is the documented drop-in should read-during-rebuild concurrency ever matter.
 
 ### 4.3 Operational guardrails
 
@@ -613,6 +616,8 @@ Two services, no MinIO, no Redis (assessment §4/§28). TLS via the operator's r
 5. **Pending settling:** optimistic messages end in correct server order with no lost/duplicated renders (asserted at the projection layer; visual jank is a manual QA item).
 6. **Rebuild equivalence:** dropping projections and replaying equals incremental state — client (Dexie) and server (`messages_proj`) both.
 
+> **M1 ships a subset (ENG-71), M2 turns on all six.** The M1 exit gate ships the property-based harness asserting **four** of the six invariants on every example: idempotency (1), convergence (2 — the pull/log-equality half), cursor integrity (3), and permission isolation (4 — the adversary-client acceptance criterion, asserted every run and audited across the four live §3.6 enforcement points). **Pending settling (5)** and the projection-equivalence half of **rebuild equivalence (6)** are documented seams, not asserted at M1: invariant 5 needs the M2 web client's optimistic-render layer, and the projection-equivalence half is already held by the permanent M0/M1 `rebuild ≡ incremental` gates. The M1 skeleton's client-state model and invariant shapes are the M2 shapes, so **M2 extends this suite rather than rewriting it** — and M2's hard gate is exactly "all six green in CI."
+
 Plus: unit tests for JCS/hashing against shared cross-language test vectors (`core/testdata/vectors.json` — Python and TS must both pass); schema round-trip tests per event type/version; API contract tests from the OpenAPI schema; Playwright smoke for the golden path (login → send → reload → history intact → second browser sees message live).
 
 ---
@@ -655,3 +660,4 @@ Cut entirely: federation experiment (design doc M6). The envelope reserves what 
 All adopted from the tech-lead assessment: per-stream sequencing replaces per-workspace (§11.4 reversed) · `prev_event_hash` dropped, `signature` reserved · envelope split into hashed body + server metadata · web MVP is online-first (no browser NDJSON/SQLite-WASM); full offline moves to desktop M6 · server-side search replaces client FTS5 for MVP · MinIO cut from compose · `thread.created` event removed · unread/presence/typing designed as non-event classes · milestone order reworked (server before web UI; portability before plugins; federation cut). Everything else implements the design doc as written.
 
 - **M0 exit-gate amendments (ENG-62, additive):** §2.1 now states the JCS depth cap (128 levels) and the integer interop cap (±(2^53 − 1)) as explicit D1 protocol constants, clarifies that the 64 KB cap is measured over the §3.2 `{ body, event_hash }` wire form, §2.2 locks `message.created.format` to `"markdown"|"plain"` at `type_version` 1, and §2.1 records that M0 `verify` fails on a set `payload_redacted` flag until authenticated redaction ships at M1. These are clarifications of already-implemented behavior, not decision changes; no envelope field was added, removed, or renamed.
+- **M1 exit-gate amendments (ENG-73, additive):** §3.3 records that the WebSocket authenticates via `Sec-WebSocket-Protocol: bearer, <token>` (raw token off the URL — no log/proxy/history leak; server echoes `bearer` on accept), superseding the `?token=` form; §3.2 adds the storability gate (envelope scalars — integer `type_version` within `INT4`, parseable RFC 3339 `client_created_at`, JSONB-safe strings — are rejected `invalid_schema` at accept even when the lax `Body` gate and the hash both pass, so "accepted" implies round-trippable storage); §2.2 clarifies that "every member" subscribed to `workspace-meta` means every **non-guest** member (§3.6 guest scope); §4.2 states the Postgres rebuild is a single-transaction `TRUNCATE messages_proj` + ordered replay, safe to interrupt; and §12 notes the M1 simulation suite asserts four of the six invariants (pending-settling and the projection half of rebuild-equivalence are M2). These are clarifications and within-milestone surface corrections of already-implemented behavior — no envelope field and no locked D-decision changed.

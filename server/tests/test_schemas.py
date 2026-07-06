@@ -37,6 +37,21 @@ def test_committed_schema_is_frozen(filename: str) -> None:
     assert committed == expected, f"{filename}: {_REGENERATE_HINT}"
 
 
+def test_every_payload_type_is_published() -> None:
+    # ENG-73 (ENG-65 M1-exit flag): every registered payload type publishes a
+    # frozen `<type>.v<version>.schema.json` alongside the envelope — the M1 meta
+    # types (workspace/user/channel/dm) as well as message.created. A newly
+    # registered payload model that forgets its published schema fails here.
+    from msgd.core.payloads import PAYLOAD_MODELS
+
+    expected = {"envelope.schema.json"} | {
+        f"{type_name}.v{version}.schema.json" for (type_name, version) in PAYLOAD_MODELS
+    }
+    assert set(_DOCUMENTS) == expected
+    for filename in expected:
+        assert (SCHEMAS_DIR / filename).is_file(), f"{filename} not committed under docs/schemas/"
+
+
 def test_schema_wrapper_metadata() -> None:
     # Every published schema carries the 2020-12 dialect, a stable msg.dev $id
     # matching its filename, and a human title — the shape M2/M5 tooling keys off.

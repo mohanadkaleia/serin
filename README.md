@@ -11,11 +11,13 @@ msg is a local-first, file-based team messaging app for 5–50-person technical 
 
 **M0 — Protocol spike: complete** (tagged [`m0`](https://github.com/mohanadkaleia/msg/releases/tag/m0)). The event protocol is proven end-to-end in miniature: envelope schema locked, cross-language hash vectors frozen, and the rebuild ≡ incremental equivalence gate running permanently in CI.
 
+**M1 — Sync server: complete** (tagged `m1`). msg is now a client-server system: token auth + sessions + single-use invites, streams + membership with a §3.6 read/write permission predicate, a `workspace-meta` stream, idempotent batch upload with gapless per-stream sequencing, pull/sync bootstrap, permission-scoped WebSocket fanout, Postgres + Alembic migrations, one-command compose self-host, and a simulation-suite skeleton (four of six §12 invariants) green in CI. The M1 exit gate proves two `msgctl` clients converge over the *real* server under interleaved bidirectional traffic.
+
 | Milestone | Scope | Status |
 |---|---|---|
 | **M0 — Protocol spike** | `core/` envelope + JCS + hashing; `msgctl` append → project → rebuild → verify | ✅ Done |
-| M1 — Sync server | Auth, streams, batch upload, sync, WebSocket fanout, Postgres | Next |
-| M2 — Web client + sync proof | Vue shell, SharedWorker + Dexie, six invariants green in CI | — |
+| **M1 — Sync server** | Auth, streams, batch upload, sync, WebSocket fanout, Postgres | ✅ Done |
+| M2 — Web client + sync proof | Vue shell, SharedWorker + Dexie, six invariants green in CI | Next |
 | M3 — Messaging core | Threads, reactions, mentions, files, search, presence | — |
 | M4 — Portability | `export` / `import` / `verify` round-trip | — |
 | M5 — Plugins | Industry-standard incoming webhooks, bot tokens | — |
@@ -35,18 +37,25 @@ msg/
     msgd/
       core/           # event envelope, JCS canonicalization, hashing, payload schemas
         testdata/     # frozen cross-language hash vectors (47 cases)
-    tests/            # core tests + schema/vector freeze guards
+      api/            # FastAPI app: auth, /v1/events(/batch), /v1/sync, /v1/ws
+      db/             # SQLAlchemy models + Alembic migrations (Postgres)
+      ws/             # WebSocket hub — permission-scoped fanout, heartbeat
+      projections/    # server messages_proj: incremental apply + rebuild
+    tests/            # core + api/db/ws tests, schema/vector freeze guards, simulation suite
   cli/
-    msgctl/           # workspace CLI: init, send, project, verify, rebuild
-    tests/            # incl. the permanent rebuild ≡ incremental equivalence gate
+    msgctl/           # workspace CLI: init, send, project, verify, rebuild;
+                      #   remote verbs: login, push, pull, invite
+    tests/            # rebuild ≡ incremental gate + the M1 exit-gate E2E (integration)
   docs/
-    schemas/          # published JSON Schemas (envelope, message.created v1)
-  .github/workflows/  # CI: ruff, mypy (strict), equivalence gate, pytest
+    schemas/          # published JSON Schemas (envelope + message.created & meta payloads)
+    deploy.md         # self-hosted compose deployment guide
+  docker-compose.yml  # one-command self-host: Postgres + the sync server
+  .github/workflows/  # CI: ruff, mypy (strict), equivalence gate, pytest (incl. integration E2E), simulation suite
 ```
 
 ## Quickstart (M0: local workspace via `msgctl`)
 
-Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
+The offline story — no server. Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
@@ -71,6 +80,48 @@ uv run msgctl verify ./demo --json     # machine-readable, CI-friendly exit code
 
 The workspace is just a folder: `workspace.json` plus `streams/<stream_id>/<YYYY-MM>.ndjson` — the same tree the M4 export format uses. `verify` is the ownership pitch made testable: it re-derives every `event_hash` from the stored bytes and proves per-stream sequence contiguity.
 
+## Quickstart (M1: self-hosted server + `msgctl` remote)
+
+The client-server story — one operator self-hosts the sync server; each teammate binds a local workspace to it and syncs.
+
+**1. Bring up the server** (Postgres + the sync daemon) via Docker Compose. See [`docs/deploy.md`](docs/deploy.md) for the full guide.
+
+```bash
+cp .env.example .env          # fill in MSG_SECRET_KEY and the Postgres password
+docker compose up -d          # starts Postgres + runs migrations + serves the API
+curl -fsS http://localhost:8000/healthz   # -> {"status":"ok"}
+```
+
+**2. The owner sets up the workspace** and mints an invite for a teammate:
+
+```bash
+# First run: create the workspace + owner account (also creates the public `general`)
+uv run msgctl login ./acme --setup \
+  --server-url http://localhost:8000 \
+  --email owner@example.com --password '…' \
+  --workspace-name Acme --display-name Owner
+
+uv run msgctl send ./acme --stream general --text "hello from the owner"
+uv run msgctl push ./acme                       # upload queued events to the server
+
+uv run msgctl invite ./acme --role member       # prints a single-use join URL
+```
+
+**3. A teammate joins** with the invite token and syncs:
+
+```bash
+uv run msgctl login ./bob --invite-token <token-from-the-join-url> \
+  --server-url http://localhost:8000 \
+  --email bob@example.com --password '…' --display-name Bob
+
+uv run msgctl pull ./bob                          # mirror the server's streams locally
+uv run msgctl send ./bob --stream general --text "hi, owner"
+uv run msgctl push ./bob
+uv run msgctl pull ./acme                          # owner sees Bob's message
+```
+
+`push` is only a hint that new events are queued; **cursors are the truth** — `pull` is idempotent and drives every client to the same gapless per-stream sequence the server assigned. Run `verify` on any synced workspace to re-derive every `event_hash` from the stored bytes, exactly as in M0. These are the same commands the M1 exit-gate E2E drives to prove two clients converge over the real server.
+
 ## Development
 
 ```bash
@@ -81,6 +132,6 @@ uv run ruff format --check .
 uv run mypy
 ```
 
-CI runs all of the above on every push and PR, plus a dedicated **`Equivalence gate (rebuild ≡ incremental)`** step — a hypothesis property test proving that dropping the projection and replaying the log always reproduces the incremental state byte-for-byte. That gate is the M0 exit criterion and is kept forever (TDD §5); it extends to server projections at M1 and the browser cache at M2.
+CI runs all of the above on every push and PR, plus a dedicated **`Equivalence gate (rebuild ≡ incremental)`** step — a hypothesis property test proving that dropping the projection and replaying the log always reproduces the incremental state byte-for-byte. That gate is the M0 exit criterion and is kept forever (TDD §5); it extends to server projections at M1 and the browser cache at M2. At M1 the `pytest` step also runs the `integration`-marked E2Es — including the exit-gate test that stands up a real Postgres + the live server and drives two `msgctl` clients to convergence — and a separate **`Simulation suite`** step runs the §12 property-based harness (four of six invariants at M1).
 
 Contribution conventions: work is tracked in Linear (`ENG-xx`); commits follow `<type>[ENG-xx]: description`; protocol changes require amending `docs/technical-design.md`, not drive-by PRs — the D1–D14 decision table is the contract.
