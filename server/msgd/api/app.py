@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from sqlalchemy import text
 
+from msgd import ws
 from msgd.api.problems import register_problem_handlers
 from msgd.api.routers import admin, auth, events_read, events_upload, health, sync
 from msgd.auth.ratelimit import RateLimiter
@@ -72,4 +73,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(events_upload.router)
     app.include_router(events_read.router)
     app.include_router(sync.router)
+    app.include_router(ws.router)  # ENG-68: GET /v1/ws (append-only)
     return app

@@ -32,14 +32,18 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from httpx_ws.transport import ASGIWebSocketTransport
 from msgd.api.app import create_app
 from msgd.db import engine as engine_module
 from msgd.db.migrate import run_migrations
 from msgd.settings import Settings
+from msgd.ws.hub import SessionFactory, hub
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
     AsyncSession,
@@ -50,7 +54,15 @@ from testcontainers.postgres import PostgresContainer  # type: ignore[import-unt
 
 # Fixtures whose presence means a test needs the ephemeral Postgres container.
 _CONTAINER_FIXTURES = frozenset(
-    {"postgres_container", "database_url", "migrated_db", "db_connection", "db_session", "client"}
+    {
+        "postgres_container",
+        "database_url",
+        "migrated_db",
+        "db_connection",
+        "db_session",
+        "client",
+        "ws_app",
+    }
 )
 
 
@@ -170,3 +182,82 @@ async def client(settings: Settings, db_session: AsyncSession) -> AsyncIterator[
         yield ac
 
     app.dependency_overrides.clear()
+
+
+# --- WebSocket fixtures (ENG-68) ---------------------------------------------
+#
+# httpx==0.28 has no WS support and Starlette's sync TestClient runs the app in a
+# portal thread with its own loop — fatal for the asyncpg session bound to the
+# test's loop (§8). ``httpx-ws``'s ``ASGIWebSocketTransport`` layers on the same
+# in-process ASGI app IN THE SAME LOOP and honors ``dependency_overrides``, so WS
+# auth flows through the same overridden ``get_session`` → same rolled-back
+# transaction as every other harness test. That transport also serves plain HTTP
+# (it subclasses ``ASGITransport``), so one client drives both the setup / batch
+# HTTP calls and the sockets.
+#
+# CRITICAL (why ``ws_app`` is a plain fixture, not a client fixture): the WS
+# transport opens an anyio task group in ``__aenter__``. pytest-asyncio drives an
+# async-generator fixture's setup and teardown in *different* tasks, and anyio
+# forbids exiting a cancel scope in a task other than the one that entered it — so
+# a fixture that holds the transport open across its ``yield`` blows up at
+# teardown. The fixture therefore yields only the configured *app*; each test
+# enters ``make_ws_client(ws_app)`` in its own task (``async with … as client``).
+
+
+def bound_session_factory(session: AsyncSession) -> SessionFactory:
+    """A hub ``session_factory`` yielding the bound per-test ``session`` (R1).
+
+    Per-send fanout resolution then reads the SAME rolled-back transaction as the
+    upload that triggered it — the reason the factory is injectable rather than
+    hard-wired to the (test-absent) global sessionmaker (§3a). The context manager
+    never closes the shared session.
+    """
+
+    @asynccontextmanager
+    async def factory() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    return factory
+
+
+def make_ws_client(app: FastAPI) -> AsyncClient:
+    """Wrap ``app`` in an in-process WS-capable ASGI client (caller uses ``async with``).
+
+    Entered inside the test coroutine so the transport's anyio task group is opened
+    and closed in the same task (see the module note above).
+    """
+    return AsyncClient(transport=ASGIWebSocketTransport(app=app), base_url="http://test")
+
+
+@pytest.fixture(autouse=True)
+def _reset_ws_hub() -> Iterator[None]:
+    """Reset the process-global hub around every test (R2).
+
+    The hub is a module singleton (the fanout seam has no app handle), so stale
+    connections would leak across tests; ``reset_for_tests`` also restores the
+    production session factory. No DB dependency, so this stays a global autouse
+    without pulling the container into pure-unit tests — the bound-session
+    injection lives in ``ws_app`` (below), which the WS tests request.
+    """
+    hub.reset_for_tests()
+    yield
+    hub.reset_for_tests()
+
+
+@pytest.fixture
+def ws_app(settings: Settings, db_session: AsyncSession) -> FastAPI:
+    """A WS-ready app bound to the rolled-back ``db_session`` (§8).
+
+    Overrides ``get_session`` (WS auth + upload) AND injects the hub's per-send
+    session factory (fanout resolution) onto the same ``db_session``, so the whole
+    connect → upload → fanout path shares one per-test transaction. Tests wrap it in
+    ``make_ws_client`` themselves (see the module note on the task-group lifecycle).
+    """
+    app = create_app(settings)
+
+    async def _override_get_session() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    app.dependency_overrides[engine_module.get_session] = _override_get_session
+    hub.set_session_factory(bound_session_factory(db_session))
+    return app

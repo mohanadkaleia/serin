@@ -7,6 +7,7 @@ module name under the strict gate — and is re-exported here.
 """
 
 from harness import (  # noqa: F401
+    _reset_ws_hub,
     client,
     database_url,
     db_connection,
@@ -15,4 +16,5 @@ from harness import (  # noqa: F401
     postgres_container,
     pytest_collection_modifyitems,
     settings,
+    ws_app,
 )
