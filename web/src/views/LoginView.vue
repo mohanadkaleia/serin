@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import { safeRedirectPath } from '../router/redirect'
 import { useAuthStore } from '../stores/auth'
 
 const auth = useAuthStore()
@@ -26,8 +27,8 @@ async function onSubmit(): Promise<void> {
   try {
     const result = await auth.login({ email: email.value.trim(), password: password.value })
     if (result.ok) {
-      const redirect = typeof route.query.redirect === 'string' ? route.query.redirect : '/'
-      await router.push(redirect)
+      // Guard the attacker-influenceable ?redirect= against off-origin values.
+      await router.push(safeRedirectPath(route.query.redirect))
       return
     }
     errorMessage.value = result.message ?? 'Sign in failed. Please try again.'
