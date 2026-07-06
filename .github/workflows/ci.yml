@@ -49,8 +49,10 @@ jobs:
 
       # Runs the full suite, including the server integration tests, which spin
       # an ephemeral Postgres via testcontainers (Docker present on the runner).
+      # Excludes server/tests/simulation — the heavy hypothesis sim runs ONLY in
+      # its dedicated derandomized step below, so it is not paid for twice (R3).
       - name: Pytest
-        run: uv run pytest
+        run: uv run pytest --ignore=server/tests/simulation
 
       # ENG-71: the §12 convergence acceptance harness — the skeleton of the M2
       # go/no-go gate (TDD §13). Separately visible + timed (not folded into

@@ -70,7 +70,9 @@ def test_suite_detects_sequence_regression(
     """One-sided patch → an invariant fails; undo → the same example passes clean."""
     # emit.py binds ``insert_event`` by name at import, so patch it in emit's namespace.
     monkeypatch.setattr("msgd.events.emit.insert_event", _buggy_insert_event)
-    with pytest.raises(AssertionError):
+    # ``match`` pins the failure to the INTENDED invariant (convergence/gaplessness),
+    # so a teeth test can never "pass" by tripping some incidental assertion.
+    with pytest.raises(AssertionError, match="gapless"):
         asyncio.run(run_plan(settings, MUTATION_PLAN))
 
     # Clean positive control: no false-positive teeth — the same example passes.
