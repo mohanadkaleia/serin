@@ -52,6 +52,17 @@ jobs:
       - name: Pytest
         run: uv run pytest
 
+      # ENG-71: the §12 convergence acceptance harness — the skeleton of the M2
+      # go/no-go gate (TDD §13). Separately visible + timed (not folded into
+      # Pytest) and derandomized via CI=true (bounded max_examples, sized <2 min).
+      # Reuses the already-warmed Postgres testcontainer image. This step is
+      # SEPARATE from and append-only relative to the ENG-69 equivalence-gate step
+      # (COORDINATION ruling); a merge collision rebases this single block.
+      - name: Simulation suite
+        run: uv run pytest server/tests/simulation -q
+        env:
+          CI: "true"
+
   # Image build + compose validation (ENG-72). Runs in parallel with `checks`.
   # Deliberately does NOT run `compose up`: a live migrate→serve cycle is the
   # ENG-73 M1 exit gate, and duplicating it here would cost runner time + flake
