@@ -19,18 +19,16 @@ python -m msgd.db.migrate
 # which reconfigures uvicorn's own loggers (disable_existing_loggers=False,
 # propagate=False) so our JSON formatter wins over uvicorn's defaults.
 #
-# --ws wsproto (ENG-92): pin the WebSocket backend to wsproto. uvicorn's default
-# `auto` backend uses the `websockets` sans-io implementation, which surfaces the
-# `Sec-WebSocket-Protocol` list to ASGI *un-split* — a `bearer, <token>` offer
-# arrives as the single element ["bearer, <token>"]. wsproto pre-splits it per RFC
-# into ["bearer", "<token>"], which is the shape the bearer-subprotocol auth (§3.3)
-# and the WS e2e were validated against. The `_bearer_token` extractor now
-# normalizes both shapes, so the default backend also works — but pinning wsproto
-# keeps the shipped default deterministic and matches the WS e2e harness (so
-# ENG-83's `--ws wsproto` override is now redundant).
+# WebSocket backend: uvicorn's DEFAULT (`--ws auto` -> the `websockets` sans-io
+# impl) is the only WS backend `uvicorn[standard]` ships. wsproto reaches ONLY the
+# dev tree (via httpx-ws) and is excluded by the image's `uv sync --no-dev`, so a
+# `--ws wsproto` pin would crash the container on boot. ENG-92: the default backend
+# surfaces `Sec-WebSocket-Protocol: bearer, <token>` to ASGI *un-split* as the
+# single element ["bearer, <token>"]; the `_bearer_token` extractor
+# (msgd/ws/router.py) now normalizes that shape, so the shipped default backend
+# authenticates the bearer subprotocol correctly with no flag.
 exec uvicorn msgd.api.app:create_app \
   --factory \
   --host 0.0.0.0 \
   --port 8080 \
-  --workers 1 \
-  --ws wsproto
+  --workers 1
