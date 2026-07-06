@@ -1,0 +1,22 @@
+{
+  "$id": "https://msg.dev/schemas/channel.member_removed.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``channel.member_removed`` v1 (\u00a72.2).",
+  "properties": {
+    "channel_stream_id": {
+      "title": "Channel Stream Id",
+      "type": "string"
+    },
+    "user_id": {
+      "title": "User Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "channel_stream_id",
+    "user_id"
+  ],
+  "title": "msg channel.member_removed payload (v1)",
+  "type": "object"
+}

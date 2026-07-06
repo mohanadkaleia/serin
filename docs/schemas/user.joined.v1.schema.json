@@ -1,0 +1,29 @@
+{
+  "$id": "https://msg.dev/schemas/user.joined.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``user.joined`` v1 (\u00a72.2) \u2014 workspace membership grant.",
+  "properties": {
+    "display_name": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Display Name"
+    },
+    "user_id": {
+      "title": "User Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "user_id"
+  ],
+  "title": "msg user.joined payload (v1)",
+  "type": "object"
+}

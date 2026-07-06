@@ -6,9 +6,10 @@ Run it to (re)produce the committed schemas under ``docs/schemas/``::
 
 The M2 web client and M5 plugin authors consume these schemas (§2.2). They are
 **generated from the Pydantic models** — :class:`~msgd.core.envelope.Envelope`
-and :class:`~msgd.core.payloads.message.MessageCreatedV1` — via
-``model_json_schema()``, so the runtime models stay the single source of truth
-and a hand-written schema can never silently drift from them. Each schema is
+and every payload model registered in
+:data:`~msgd.core.payloads.PAYLOAD_MODELS` (``message.created`` plus the M1 meta
+types) — via ``model_json_schema()``, so the runtime models stay the single
+source of truth and a hand-written schema can never silently drift from them. Each schema is
 wrapped with a JSON Schema 2020-12 ``$schema``, a stable ``$id`` and a ``title``,
 then written with a fixed deterministic serialization (``sort_keys=True``,
 ``indent=2``, ``ensure_ascii=True``, LF, trailing newline).
@@ -35,7 +36,7 @@ from pathlib import Path
 from typing import Any
 
 from msgd.core.envelope import Envelope
-from msgd.core.payloads.message import MessageCreatedV1
+from msgd.core.payloads import PAYLOAD_MODELS
 
 #: Output location: <repo>/docs/schemas/ (this file lives in <repo>/server/tests/,
 #: so parents[2] is the repo root). Created if absent.
@@ -56,19 +57,31 @@ def _wrap(model: type[Any], filename: str, title: str) -> dict[str, Any]:
 
 
 def build_documents() -> dict[str, dict[str, Any]]:
-    """Map each committed filename to its wrapped schema document."""
-    return {
+    """Map each committed filename to its wrapped schema document.
+
+    The envelope is published on its own; every typed payload is published from
+    the :data:`~msgd.core.payloads.PAYLOAD_MODELS` registry — one wrapped schema
+    per ``(type, type_version)`` (ENG-73, ENG-65's M1-exit flag), so the M1 meta
+    types (``workspace.created``, ``user.joined/left``, ``channel.*``,
+    ``dm.created``, …) publish alongside ``message.created`` and can never drift
+    from the models. Cross-language payload *test vectors* for the meta types are
+    M2-deferred (they land with the TypeScript client that consumes them).
+    """
+    documents: dict[str, dict[str, Any]] = {
         "envelope.schema.json": _wrap(
             Envelope,
             "envelope.schema.json",
             "msg event envelope",
         ),
-        "message.created.v1.schema.json": _wrap(
-            MessageCreatedV1,
-            "message.created.v1.schema.json",
-            "msg message.created payload (v1)",
-        ),
     }
+    for (type_name, type_version), model in sorted(PAYLOAD_MODELS.items()):
+        filename = f"{type_name}.v{type_version}.schema.json"
+        documents[filename] = _wrap(
+            model,
+            filename,
+            f"msg {type_name} payload (v{type_version})",
+        )
+    return documents
 
 
 def serialize(document: dict[str, Any]) -> str:

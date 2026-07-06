@@ -37,6 +37,13 @@ _REDACTED_KEYS = frozenset(
 # the next whitespace / quote / ``&`` — enough for a query string or a bare pair.
 _QS_TOKEN_RE = re.compile(r"(?i)(token=)[^\s\"'&]+")
 
+# ENG-73: the WS token now rides `Sec-WebSocket-Protocol: bearer, <token>`
+# (ENG-68). At `uvicorn --log-level debug` the ASGI header list is printed, so
+# the query-string scrub above cannot reach it — scrub the subprotocol value
+# shape too. The token alphabet is url-safe base64 (`token_urlsafe`), length 43,
+# so require >=16 tchars after `bearer,` to avoid nuking a literal "bearer, foo".
+_WS_BEARER_RE = re.compile(r"(?i)(bearer\s*,\s*)[A-Za-z0-9\-_]{16,}")
+
 
 class RedactSecretsFilter(logging.Filter):
     """Redact sensitive ``extra=`` keys AND any ``token=…`` in the rendered message.
@@ -52,8 +59,11 @@ class RedactSecretsFilter(logging.Filter):
                 record.__dict__[key] = "[REDACTED]"
         # Scrub the fully-rendered message (``getMessage`` applies ``%``-args), then
         # pin it as ``msg`` with empty ``args`` so the redaction survives formatting.
+        # Chain both scrubs: the query-string ``token=…`` shape and the WS
+        # ``Sec-WebSocket-Protocol: bearer, <token>`` subprotocol-header shape.
         message = record.getMessage()
         scrubbed = _QS_TOKEN_RE.sub(r"\1[REDACTED]", message)
+        scrubbed = _WS_BEARER_RE.sub(r"\1[REDACTED]", scrubbed)
         if scrubbed != message:
             record.msg = scrubbed
             record.args = ()

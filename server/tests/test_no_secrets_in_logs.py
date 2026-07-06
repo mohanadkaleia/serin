@@ -105,3 +105,58 @@ def test_redact_filter_scrubs_token_in_message() -> None:
     assert RedactSecretsFilter().filter(formatted) is True
     assert "tok_DEF-456_secret" not in formatted.getMessage()
     assert "token=[REDACTED]" in formatted.getMessage()
+
+
+def test_redact_filter_scrubs_ws_subprotocol_bearer() -> None:
+    """ENG-73 carryover A: the WS `Sec-WebSocket-Protocol: bearer, <token>` shape is scrubbed.
+
+    ENG-68 moved the WS session token off the URL onto the subprotocol header, but
+    the original message scrub only matched the query-string `token=…` form. At
+    `uvicorn --log-level debug` the ASGI header list is printed and the token
+    surfaces as `sec-websocket-protocol: bearer, <token>` (or a header-tuple
+    ``repr``) — a shape the query-string regex misses. Both wire-trace shapes must
+    redact to `bearer, [REDACTED]` with the raw token absent.
+    """
+    raw_token = "wZ8kQx2Lm9Pv4Rt7Nc1Yb3Fj6Hs0Ad5Ge8Ku2Iw4Qo"  # url-safe, 43 chars
+
+    # (a) the plain header-line string form.
+    header_line = logging.LogRecord(
+        name="uvicorn.error",
+        level=logging.DEBUG,
+        pathname=__file__,
+        lineno=1,
+        msg=f"handshake headers: sec-websocket-protocol: bearer, {raw_token}",
+        args=None,
+        exc_info=None,
+    )
+    assert RedactSecretsFilter().filter(header_line) is True
+    assert raw_token not in header_line.getMessage()
+    assert "bearer, [REDACTED]" in header_line.getMessage()
+
+    # (b) the ASGI header-tuple ``repr`` form uvicorn prints in a debug scope dump.
+    tuple_repr = logging.LogRecord(
+        name="uvicorn.error",
+        level=logging.DEBUG,
+        pathname=__file__,
+        lineno=1,
+        msg=repr([(b"sec-websocket-protocol", f"bearer, {raw_token}".encode())]),
+        args=None,
+        exc_info=None,
+    )
+    assert RedactSecretsFilter().filter(tuple_repr) is True
+    assert raw_token not in tuple_repr.getMessage()
+    assert "bearer, [REDACTED]" in tuple_repr.getMessage()
+
+    # A literal "bearer, foo" in prose (short, <16 chars) must NOT be eaten.
+    benign = logging.LogRecord(
+        name="app",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="auth scheme note: bearer, foo tokens are supported",
+        args=None,
+        exc_info=None,
+    )
+    assert RedactSecretsFilter().filter(benign) is True
+    assert "bearer, foo" in benign.getMessage()
+    assert "[REDACTED]" not in benign.getMessage()

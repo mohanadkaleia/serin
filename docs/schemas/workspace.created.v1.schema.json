@@ -1,0 +1,17 @@
+{
+  "$id": "https://msg.dev/schemas/workspace.created.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``workspace.created`` v1 (\u00a72.2) \u2014 first meta event, seq 1.",
+  "properties": {
+    "name": {
+      "title": "Name",
+      "type": "string"
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "title": "msg workspace.created payload (v1)",
+  "type": "object"
+}

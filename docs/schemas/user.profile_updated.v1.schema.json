@@ -1,0 +1,17 @@
+{
+  "$id": "https://msg.dev/schemas/user.profile_updated.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``user.profile_updated`` v1 (\u00a72.2).\n\nOnly ``user_id`` is required; the changed profile fields are open-ended\n(carried through ``extra=\"allow\"``) so new profile attributes are additive.",
+  "properties": {
+    "user_id": {
+      "title": "User Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "user_id"
+  ],
+  "title": "msg user.profile_updated payload (v1)",
+  "type": "object"
+}

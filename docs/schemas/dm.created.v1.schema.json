@@ -1,0 +1,25 @@
+{
+  "$id": "https://msg.dev/schemas/dm.created.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``dm.created`` v1 (\u00a72.2) \u2014 DM/group-DM stream genesis.",
+  "properties": {
+    "dm_stream_id": {
+      "title": "Dm Stream Id",
+      "type": "string"
+    },
+    "member_user_ids": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Member User Ids",
+      "type": "array"
+    }
+  },
+  "required": [
+    "dm_stream_id",
+    "member_user_ids"
+  ],
+  "title": "msg dm.created payload (v1)",
+  "type": "object"
+}
