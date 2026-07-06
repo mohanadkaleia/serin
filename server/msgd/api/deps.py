@@ -44,6 +44,13 @@ def get_auth_limiter(request: Request) -> RateLimiter:
     return limiter
 
 
+def get_event_limiters(request: Request) -> tuple[RateLimiter, RateLimiter]:
+    """Return the (per-minute, per-second-burst) event limiters (app.state, ENG-66)."""
+    minute: RateLimiter = request.app.state.event_limiter_minute
+    burst: RateLimiter = request.app.state.event_limiter_burst
+    return minute, burst
+
+
 AppSettings = Annotated[Settings, Depends(get_app_settings)]
 
 KeyFn = Callable[[Request], Iterable[str] | Awaitable[Iterable[str]]]
@@ -150,6 +157,28 @@ async def require_auth(
 
 
 CurrentAuth = Annotated[AuthContext, Depends(require_auth)]
+
+
+async def event_rate_limit(ctx: CurrentAuth, request: Request) -> None:
+    """Event-upload rate limit (§4.3, ENG-66): 60/min + 20/s burst, per user.
+
+    Checks BOTH ``app.state`` event limiters keyed ``user:{ctx.user_id}``; the
+    first exceeded bucket raises 429 ``/problems/rate-limited`` with
+    ``Retry-After``. A dedicated dependency (like :func:`auth_rate_limit`)
+    because the generic :func:`rate_limit` factory only sees the ``Request`` and
+    cannot key by the authenticated user — depending on ``require_auth`` gives it
+    the user id and runs the limit before the endpoint body parse.
+
+    Granularity ruling: M1 rate-limits per batch REQUEST (one hit per POST per
+    limiter), not per event — the fixed-window ``RateLimiter`` has no weight
+    parameter. Documented deviation from a literal "events per user"; per-event
+    weighting is a flagged future refinement.
+    """
+    key = f"user:{ctx.user_id}"
+    for limiter in get_event_limiters(request):
+        result = limiter.check(key)
+        if not result.allowed:
+            raise problems.rate_limited(result.retry_after)
 
 
 def require_role(*roles: str) -> Callable[[AuthContext], Awaitable[AuthContext]]:

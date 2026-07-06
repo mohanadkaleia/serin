@@ -56,6 +56,11 @@ class Settings(BaseSettings):
 
     # --- Rate limiting (D6, §4.3) --------------------------------------------
     auth_rate_limit_per_minute: int = 10
+    # Event upload limits (§4.3, ENG-66): sustained + burst, keyed per user.
+    # M1 granularity is per batch REQUEST, not per event (documented deviation —
+    # the fixed-window RateLimiter counts one hit per check and has no weight).
+    event_rate_limit_per_minute: int = 60
+    event_rate_limit_burst_per_second: int = 20
 
     # --- Invites (D7) --------------------------------------------------------
     invite_default_ttl_seconds: int = 604800  # 7 days

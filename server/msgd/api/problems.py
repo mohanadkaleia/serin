@@ -183,6 +183,28 @@ def invalid_invite() -> ProblemException:
     )
 
 
+def payload_too_large() -> ProblemException:
+    # Batch-level 1 MB whole-request cap (§3.2, ENG-66). Distinct from the
+    # per-event ``payload_too_large`` rejection code (the 64 KB single-event
+    # wire-form cap surfaced inside ``rejected[]``) — different layers.
+    return ProblemException(
+        status=413,
+        type="/problems/payload-too-large",
+        title="Request body too large",
+        detail="request body exceeds the 1 MB batch limit",
+    )
+
+
+def batch_too_large() -> ProblemException:
+    # Batch-level count cap: more than 100 events in one upload (§3.2, ENG-66).
+    return ProblemException(
+        status=422,
+        type="/problems/batch-too-large",
+        title="Batch too large",
+        detail="a batch may contain at most 100 events",
+    )
+
+
 # --- handler registration ----------------------------------------------------
 
 

@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from msgd.api.problems import register_problem_handlers
-from msgd.api.routers import admin, auth, events_read, health, sync
+from msgd.api.routers import admin, auth, events_read, events_upload, health, sync
 from msgd.auth.ratelimit import RateLimiter
 from msgd.db.engine import create_engine, create_sessionmaker, set_sessionmaker
 from msgd.logging import configure_logging
@@ -59,6 +59,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Shared per-app state for dependencies (settings + the one auth limiter).
     app.state.settings = settings
     app.state.auth_limiter = RateLimiter(settings.auth_rate_limit_per_minute, 60)
+    # Event-upload limiters (§4.3, ENG-66): sustained/min + burst/s, per user.
+    app.state.event_limiter_minute = RateLimiter(settings.event_rate_limit_per_minute, 60)
+    app.state.event_limiter_burst = RateLimiter(settings.event_rate_limit_burst_per_second, 1)
 
     # RFC 9457 problem+json — the app-wide error convention every router inherits.
     register_problem_handlers(app)
@@ -66,6 +69,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(admin.router)
+    app.include_router(events_upload.router)
     app.include_router(events_read.router)
     app.include_router(sync.router)
     return app
