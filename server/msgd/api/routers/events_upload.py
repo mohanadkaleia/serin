@@ -201,11 +201,26 @@ async def upload_batch(request: Request, ctx: CurrentAuth, db: DbSession) -> Bat
             # failed insert, so no sequence is consumed. Clear the aborted txn,
             # return the ORIGINAL record (D7).
             await db.rollback()
-            original = await _fetch_original(db, workspace_id=workspace_id, event_id=event_id)
-            if original is None:
+            fetched = await _fetch_original(db, workspace_id=workspace_id, event_id=event_id)
+            if fetched is None:
                 # The UNIQUE violation proved a row exists; a fetch-miss is an
                 # impossible state after per-event commits — re-raise, don't reject.
                 raise
+            original, original_author = fetched
+            if original_author != ctx.user_id:
+                # HARDENING (security round 2): the stored event with this
+                # (workspace_id, event_id) was authored by a DIFFERENT user — a
+                # cross-user event_id collision (UNIQUE is per-workspace, not
+                # per-author). We must NOT echo another author's record/sequence.
+                # Reject non-disclosingly instead of leaking their coordinates.
+                rejected.append(
+                    RejectedEvent(
+                        event_id=event_id,
+                        code="invalid_schema",
+                        detail="event_id is already in use",
+                    )
+                )
+                continue
             accepted.append(original)
             continue
         except UnknownStreamError:
@@ -270,19 +285,27 @@ async def upload_batch(request: Request, ctx: CurrentAuth, db: DbSession) -> Bat
 
 async def _fetch_original(
     db: AsyncSession, *, workspace_id: str, event_id: str
-) -> AcceptedEvent | None:
-    """Return the ORIGINAL acceptance's four ``accepted[]`` fields (D7 idempotency).
+) -> tuple[AcceptedEvent, str] | None:
+    """Return the ORIGINAL acceptance's four ``accepted[]`` fields + its author.
 
-    ``server_received_at`` is re-rendered from the stored TIMESTAMPTZ with the
-    **same** ``_format_rfc3339`` (millisecond-``Z`` truncation) ``insert_event``
-    used, so the idempotent response string is byte-identical to the first one.
-
-    Returns ``None`` if no row is found — a state the caller treats as
-    schema-impossible and re-raises on (F4), never shaping it into a reject.
+    The four fields are the D7-idempotency response; ``server_received_at`` is
+    re-rendered from the stored TIMESTAMPTZ with the **same** ``_format_rfc3339``
+    (millisecond-``Z`` truncation) ``insert_event`` used, so the idempotent
+    response string is byte-identical to the first one. The second tuple element
+    is the stored ``author_user_id`` — the caller compares it against the current
+    principal so a cross-user ``event_id`` collision is NOT echoed (security round
+    2). The fetch is intentionally NOT author-scoped so the caller can tell a
+    same-author idempotent replay from a different-author collision (vs. a
+    schema-impossible fetch-miss, which returns ``None`` and re-raises, F4).
     """
     row = (
         await db.execute(
-            select(Event.stream_id, Event.server_sequence, Event.server_received_at).where(
+            select(
+                Event.stream_id,
+                Event.server_sequence,
+                Event.server_received_at,
+                Event.author_user_id,
+            ).where(
                 Event.workspace_id == workspace_id,
                 Event.event_id == event_id,
             )
@@ -290,10 +313,11 @@ async def _fetch_original(
     ).first()
     if row is None:
         return None
-    stream_id, server_sequence, server_received_at = row
-    return AcceptedEvent(
+    stream_id, server_sequence, server_received_at, author_user_id = row
+    accepted = AcceptedEvent(
         event_id=event_id,
         stream_id=stream_id,
         server_sequence=server_sequence,
         server_received_at=_format_rfc3339(server_received_at),
     )
+    return accepted, author_user_id

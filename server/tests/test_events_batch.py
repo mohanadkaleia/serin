@@ -650,6 +650,115 @@ async def test_lifecycle_correct_homing_accepted(
     assert row is not None and row.name == "renamed-private"
 
 
+# --- security round 2: CRITICAL non-total genesis homing ------------------------------
+
+
+async def test_channel_created_v2_null_visibility_injection_blocked(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """CRITICAL exploit: a non-guest member uploads channel.created v2 with
+    visibility=null aimed at a victim stream (tenant B's channel AND a private
+    channel in A they are not in). The non-total homing gate previously fell
+    through to accept with an unconstrained home, appending to the victim stream.
+    It must now reject invalid_schema with the victim stream and stream table
+    completely untouched, and no channel created."""
+    owner = await do_setup(client)
+    attacker = await _invite_user(client, owner, role="member")  # non-guest → passes step iii
+    b = await _seed_foreign_tenant(db_session)
+    a_private = await bootstrap_channel(client, db_session, owner, visibility="private")
+
+    for victim in (b.pub, a_private):
+        victim_before = await _stream_snapshot(db_session, victim)
+        streams_before = await db_session.scalar(select(func.count()).select_from(Stream))
+        fresh = ids.new_stream_id()
+
+        exploit = channel_created_body(
+            auth=attacker,
+            home_stream_id=victim,  # inject into the victim's log
+            channel_stream_id=fresh,
+            name="x",
+            visibility=None,  # v2 skips payload validation, so this reaches homing
+            type_version=2,
+        )
+        resp = await post_batch(client, attacker["token"], [wire_item(exploit)])
+        assert resp.status_code == 200, resp.text
+        (entry,) = resp.json()["rejected"]
+        assert entry["code"] == "invalid_schema", (victim, resp.text)
+
+        # Injection dead: victim stream byte-for-byte unchanged, no head_seq bump.
+        assert await _stream_snapshot(db_session, victim) == victim_before
+        # No channel created (neither the fresh id nor any new streams row).
+        assert await db_session.scalar(select(func.count()).select_from(Stream)) == streams_before
+        assert await fetch_stream(db_session, fresh) is None
+
+
+# --- security round 2: hardening — author-scoped idempotency + lifecycle 500 guard ----
+
+
+async def test_cross_user_event_id_collision_does_not_echo_other_author(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A different author re-using another user's event_id (same workspace) must NOT
+    receive that author's record/sequence — it is a real conflict, rejected."""
+    owner = await do_setup(client)
+    member = await _invite_user(client, owner, role="member")
+    channel = await bootstrap_channel(client, db_session, owner)  # public: both can write
+
+    shared_event_id = ids.new_event_id()
+    owner_msg = message_body(auth=owner, stream_id=channel, text="mine", event_id=shared_event_id)
+    first = await post_batch(client, owner["token"], [wire_item(owner_msg)])
+    (original,) = first.json()["accepted"]
+
+    # The member submits a DIFFERENT body under the SAME event_id.
+    member_msg = message_body(
+        auth=member, stream_id=channel, text="not yours", event_id=shared_event_id
+    )
+    resp = await post_batch(client, member["token"], [wire_item(member_msg)])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["accepted"] == []
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "invalid_schema"
+    assert entry["event_id"] == shared_event_id
+    # The other author's coordinates are NOT disclosed via the reject detail.
+    assert original["server_sequence"] != 0
+    assert str(original["server_sequence"]) not in entry["detail"]
+    assert channel not in entry["detail"]
+
+    # Exactly one stored row for that id — still the owner's, untouched.
+    rows = await _event_rows(db_session, shared_event_id)
+    assert len(rows) == 1
+    assert rows[0].author_user_id == owner["user_id"]
+
+
+async def test_unknown_version_lifecycle_missing_field_rejects_not_500(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """channel.renamed v2 with a valid target but no ``name`` must reject cleanly
+    (invalid_schema, 200) instead of 500ing in the version-agnostic reducer."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner, visibility="public")
+    meta = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta is not None
+    before = await fetch_stream(db_session, channel)
+    assert before is not None
+    name_before = before.name
+
+    body = lifecycle_body(
+        auth=owner,
+        home_stream_id=meta,
+        type="channel.renamed",
+        payload={"channel_stream_id": channel},  # ``name`` omitted
+        type_version=2,
+    )
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    assert resp.status_code == 200, resp.text
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "invalid_schema"
+    # The reducer never ran: the channel's name is unchanged.
+    after = await fetch_stream(db_session, channel)
+    assert after is not None and after.name == name_before
+
+
 # --- F2: narrow storability backstop (DataError only) ---------------------------------
 
 

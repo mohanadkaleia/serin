@@ -14,9 +14,10 @@ from eventsutil import (
 from msgd.auth.context import AuthContext
 from msgd.auth.sessions import utcnow
 from msgd.core import ids
+from msgd.core.envelope import Body
 from msgd.core.hashing import hash_event
 from msgd.db.models import Device, Session, Stream, StreamMember, User, Workspace
-from msgd.events.validate import Accepted, Rejected, validate_event
+from msgd.events.validate import Accepted, Rejected, _check_referential, validate_event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -423,6 +424,166 @@ async def test_lifecycle_unknown_stream(db_session: AsyncSession) -> None:
         _expect_rejected(
             await validate_event(db_session, ctx=w.owner, item=wire_item(body)), "unknown_stream"
         )
+
+
+# --- security round 2: totality of every homing/visibility branch ----------------
+
+
+async def test_channel_created_v2_non_enum_visibility_is_rejected(
+    db_session: AsyncSession,
+) -> None:
+    """CRITICAL: channel.created v2 with a non-enum visibility must NOT fall through
+    to accept — visibility is enforced here regardless of type_version (v2 skips the
+    step-iv payload model that would otherwise enforce the enum)."""
+    w = await _seed(db_session)
+    auth = w.auth(w.member)
+    for visibility in (None, "secret", 123, True):
+        body = channel_created_body(
+            auth=auth,
+            home_stream_id=w.priv,  # a victim home the gate must never leave unconstrained
+            type_version=2,
+            visibility=visibility,
+        )
+        out = _expect_rejected(
+            await validate_event(db_session, ctx=w.member, item=wire_item(body)), "invalid_schema"
+        )
+        assert "visibility" in out.detail, visibility
+
+
+async def test_channel_created_v2_missing_or_bad_channel_stream_id_rejected(
+    db_session: AsyncSession,
+) -> None:
+    """channel.created v2 missing / malformed channel_stream_id → invalid_schema (no accept)."""
+    w = await _seed(db_session)
+    auth = w.auth(w.member)
+    # absent field entirely.
+    body = channel_created_body(
+        auth=auth, home_stream_id=w.meta, type_version=2, include_channel_stream_id=False
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "invalid_schema"
+    )
+    # present but not a stream id.
+    body = channel_created_body(
+        auth=auth, home_stream_id=w.meta, type_version=2, channel_stream_id="not-a-stream"
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "invalid_schema"
+    )
+
+
+async def test_channel_created_home_neither_meta_nor_self_rejected(
+    db_session: AsyncSession,
+) -> None:
+    """Belt-and-braces: a home that is neither workspace-meta nor channel_stream_id
+    is rejected under both visibilities (no unconstrained-home accept path)."""
+    w = await _seed(db_session)
+    auth = w.auth(w.member)
+    fresh = ids.new_stream_id()
+    stray = ids.new_stream_id()  # neither meta nor the channel's own id
+
+    # public homed at a stray stream (not meta) → invalid_schema.
+    body = channel_created_body(
+        auth=auth, home_stream_id=stray, channel_stream_id=fresh, visibility="public"
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "invalid_schema"
+    )
+    # public homed at its OWN channel_stream_id (must be meta) → invalid_schema.
+    body = channel_created_body(
+        auth=auth, home_stream_id=fresh, channel_stream_id=fresh, visibility="public"
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "invalid_schema"
+    )
+    # private homed at a stray stream (must be self) → invalid_schema.
+    body = channel_created_body(
+        auth=auth, home_stream_id=stray, channel_stream_id=fresh, visibility="private"
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "invalid_schema"
+    )
+
+
+async def test_dm_created_branch_is_total_reject(db_session: AsyncSession) -> None:
+    """dm.created is refused (defense-in-depth) — never accepted with an unconstrained home.
+
+    In the normal pipeline it is rejected at step iii (permission_denied); the
+    referential branch itself must also refuse it rather than fall through.
+    """
+    w = await _seed(db_session)
+    dm_id = ids.new_stream_id()
+    body_model = Body.model_validate(
+        {
+            "event_id": ids.new_event_id(),
+            "workspace_id": w.ws,
+            "stream_id": dm_id,
+            "type": "dm.created",
+            "type_version": 1,
+            "author_user_id": w.member.user_id,
+            "author_device_id": w.member.device_id,
+            "client_created_at": "2026-07-05T00:00:00.000Z",
+            "payload": {"dm_stream_id": dm_id, "member_user_ids": [w.member.user_id]},
+        }
+    )
+    out = await _check_referential(
+        db_session,
+        ctx=w.member,
+        body_model=body_model,
+        raw_body=body_model.model_dump(mode="json"),
+    )
+    assert isinstance(out, Rejected) and out.code == "invalid_schema"
+
+
+async def test_lifecycle_unknown_version_missing_field_rejects_not_500(
+    db_session: AsyncSession,
+) -> None:
+    """Unknown-version lifecycle whose payload lacks a reducer field → invalid_schema,
+    rejected BEFORE the reducer (which reads the field unconditionally would 500)."""
+    w = await _seed(db_session)
+    auth = w.auth(w.owner)
+
+    # channel.renamed v2 targeting a real channel, homed correctly, but no ``name``.
+    body = lifecycle_body(
+        auth=auth,
+        home_stream_id=w.meta,
+        type="channel.renamed",
+        payload={"channel_stream_id": w.pub},  # name missing
+        type_version=2,
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.owner, item=wire_item(body)), "invalid_schema"
+    )
+
+    # channel.member_added v2 with a bad user_id.
+    body = lifecycle_body(
+        auth=auth,
+        home_stream_id=w.meta,
+        type="channel.member_added",
+        payload={"channel_stream_id": w.pub, "user_id": "not-a-user"},
+        type_version=2,
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.owner, item=wire_item(body)), "invalid_schema"
+    )
+
+
+async def test_lifecycle_missing_channel_stream_id_rejects_cleanly(
+    db_session: AsyncSession,
+) -> None:
+    """Lifecycle event with no resolvable target field → invalid_schema (no None-accept,
+    no reducer 500)."""
+    w = await _seed(db_session)
+    body = lifecycle_body(
+        auth=w.auth(w.owner),
+        home_stream_id=w.meta,
+        type="channel.archived",
+        payload={},  # no channel_stream_id
+        type_version=2,
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.owner, item=wire_item(body)), "invalid_schema"
+    )
 
 
 # --- step vii: size cap ----------------------------------------------------------

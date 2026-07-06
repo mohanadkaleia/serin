@@ -50,6 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from msgd.api.schemas.events import RejectionCode
 from msgd.auth.context import AuthContext
+from msgd.core import ids
 from msgd.core.envelope import MAX_EVENT_SIZE_BYTES, Body
 from msgd.core.hashing import hash_event
 from msgd.core.jcs import JCSError
@@ -358,63 +359,133 @@ async def _check_referential(
     Returns a :class:`Rejected` (its ``event_id`` filled in by the caller) or
     ``None`` to pass. ``thread_root_id`` / ``file_ids`` / ``mentions`` existence
     are M3 features with no M1 table — deliberately skipped (D8d).
+
+    TOTALITY (security round 2): every ``return None`` accept path leaves the
+    effective home stream id (``body.stream_id``, which reaches ``insert_event``'s
+    global ``UPDATE streams``) provably inside ``ctx.workspace_id`` — enforced here
+    for genesis/lifecycle, and upstream at step iii (workspace-scoped ``can_read`` /
+    ``can_write``) for message.created and unknown types. No branch may fall
+    through to accept with an unconstrained home (cross-tenant injection).
     """
     event_type = body_model.type
     payload = raw_body.get("payload")
     payload = payload if isinstance(payload, dict) else {}
 
+    # SECURITY INVARIANT (round 2) — TOTALITY: every ``return None`` (accept) path
+    # in this function MUST leave the effective home stream id (``body.stream_id``,
+    # the value that reaches ``insert_event``'s global ``UPDATE streams``) provably
+    # inside ``ctx.workspace_id``. A non-total gate that falls through to accept
+    # with an unconstrained home is a cross-tenant injection (an event appended to
+    # another workspace's — or a private/DM — stream, bumping its sequence). Each
+    # branch below states how it upholds this on EVERY accept path.
+
     if event_type == "channel.created":
+        # Home totality: an accept here is only reachable with
+        # body.stream_id == workspace-meta (public) OR == channel_stream_id
+        # (private, self-homed). Meta is in ctx.workspace_id by query; the
+        # self-homed id is guaranteed not to pre-exist ANYWHERE (global genesis
+        # collision) so the reducer creates it fresh inside ctx.workspace_id.
         channel_stream_id = payload.get("channel_stream_id")
+        name = payload.get("name")
         visibility = payload.get("visibility")
-        if isinstance(channel_stream_id, str):
-            # Genesis collision (obligation a): a genesis event may not adopt an
-            # already-existing stream (would be a cross-stream read grant — the
-            # reducer's created-flag guard is the defense-in-depth backstop).
-            #
-            # LOAD-BEARING (F1): this existence check is GLOBAL (all workspaces),
-            # NOT scoped to ctx.workspace_id — and that asymmetry vs. the
-            # workspace-scoped LIFECYCLE resolution below is intentional. Genesis
-            # is protective: scoping it to the caller's workspace would let a
-            # genesis event adopt a stream id that already exists in workspace B,
-            # and for a private/self-homed genesis that re-opens cross-tenant home
-            # injection (the event would home in — and mutate the log of — B's id).
-            # Lifecycle is resolving: it must find the caller's own channel, so it
-            # scopes to ctx.workspace_id (tenant isolation + non-disclosure).
-            if await _stream_exists(db, channel_stream_id):
+
+        # Enforce the genesis payload shape HERE, regardless of type_version. The
+        # step-iv payload model is SKIPPED for an unknown version
+        # (get_payload_model("channel.created", 2) -> None), so leaning on it would
+        # let a v2 genesis with visibility=null fall through the homing gate with an
+        # unconstrained home. The reducer reads all three fields unconditionally.
+        if not isinstance(channel_stream_id, str) or not ids.is_valid_typed_id(
+            channel_stream_id, ids.IdKind.STREAM
+        ):
+            return Rejected(
+                event_id="",
+                code="invalid_schema",
+                detail="channel.created payload.channel_stream_id must be a stream id",
+            )
+        if not isinstance(name, str):
+            return Rejected(
+                event_id="",
+                code="invalid_schema",
+                detail="channel.created payload.name must be a string",
+            )
+        if visibility not in ("public", "private"):
+            return Rejected(
+                event_id="",
+                code="invalid_schema",
+                detail="channel.created payload.visibility must be 'public' or 'private'",
+            )
+
+        # Genesis collision (obligation a): a genesis event may not adopt an
+        # already-existing stream (would be a cross-stream read grant — the
+        # reducer's created-flag guard is the defense-in-depth backstop).
+        #
+        # LOAD-BEARING (F1): this existence check is GLOBAL (all workspaces), NOT
+        # scoped to ctx.workspace_id — and that asymmetry vs. the workspace-scoped
+        # LIFECYCLE resolution below is intentional. Genesis is protective: scoping
+        # it to the caller's workspace would let a genesis event adopt a stream id
+        # that already exists in workspace B, and for a private/self-homed genesis
+        # that re-opens cross-tenant home injection (the event would home in — and
+        # mutate the log of — B's id). Lifecycle is resolving: it must find the
+        # caller's own channel, so it scopes to ctx.workspace_id.
+        if await _stream_exists(db, channel_stream_id):
+            return Rejected(
+                event_id="",
+                code="invalid_schema",
+                detail="channel_stream_id already exists",
+            )
+
+        # TOTAL §2.2 homing (point 9): public -> workspace-meta; private ->
+        # self-homed. ``visibility`` is enum-checked above, so these two arms are
+        # exhaustive — there is NO fall-through-accept with an unconstrained home,
+        # and a home that is neither meta nor channel_stream_id is always rejected.
+        meta_id = await _workspace_meta_stream_id(db, ctx.workspace_id)
+        if visibility == "public":
+            if body_model.stream_id != meta_id:
                 return Rejected(
                     event_id="",
                     code="invalid_schema",
-                    detail="channel_stream_id already exists",
+                    detail="public channel.created must be homed in workspace-meta",
                 )
-            # §2.2 homing (point 9): public genesis homes in workspace-meta;
-            # private genesis is self-homed in the channel's own stream.
-            meta_id = await _workspace_meta_stream_id(db, ctx.workspace_id)
-            if visibility == "public":
-                if body_model.stream_id != meta_id:
-                    return Rejected(
-                        event_id="",
-                        code="invalid_schema",
-                        detail="public channel.created must be homed in workspace-meta",
-                    )
-            elif visibility == "private":
-                if body_model.stream_id != channel_stream_id:
-                    return Rejected(
-                        event_id="",
-                        code="invalid_schema",
-                        detail="private channel.created must be self-homed",
-                    )
+        else:  # visibility == "private" (enum enforced above)
+            if body_model.stream_id != channel_stream_id:
+                return Rejected(
+                    event_id="",
+                    code="invalid_schema",
+                    detail="private channel.created must be self-homed",
+                )
         return None
 
-    # ``dm.created`` homing (§2.2: stream_id == dm_stream_id) is never reached in
-    # M1 — ``dm.created`` is rejected earlier at step iii (``can_write`` -> False ->
-    # permission_denied), so no homing check runs here. Documented, not gated.
+    if event_type == "dm.created":
+        # Home totality: UNREACHABLE. ``dm.created`` is rejected at step iii for
+        # EVERY version (``can_write`` keys on the type string -> False ->
+        # permission_denied), so control never reaches this function for it. This
+        # explicit reject is defense-in-depth in case that ever changes: a
+        # dm.created that somehow arrives here is refused rather than accepted with
+        # an unconstrained home (§2.2 dm homing is deferred with the DM endpoint).
+        return Rejected(
+            event_id="",
+            code="invalid_schema",
+            detail="dm.created is not accepted in M1",
+        )
 
     if event_type in _LIFECYCLE_TYPES:
+        # Home totality: an accept here is only reachable with the target resolved
+        # as a CHANNEL inside ctx.workspace_id AND body.stream_id constrained to
+        # either that channel (private) or the caller's workspace-meta (public) —
+        # both in ctx.workspace_id. Every other path rejects.
         channel_stream_id = payload.get("channel_stream_id")
         if not isinstance(channel_stream_id, str):
-            # Unknown-version lifecycle without a resolvable target field — nothing
-            # to check referentially (payload was not schema-validated, D9).
-            return None
+            # Unresolvable target (missing/mistyped — an unknown version skipped
+            # payload validation, D9). Reject cleanly here: falling through to
+            # accept would (a) leave the home unconstrained and (b) 500 in the
+            # version-agnostic reducer, which reads payload["channel_stream_id"]
+            # unconditionally. invalid_schema, not unknown_stream (nothing to
+            # resolve — this is a shape fault).
+            return Rejected(
+                event_id="",
+                code="invalid_schema",
+                detail="channel lifecycle event payload.channel_stream_id must be a stream id",
+            )
 
         # F1 step 1 — workspace-scoped target resolution (D13 non-disclosing): a
         # stream id from ANOTHER tenant resolves to None exactly like a
@@ -434,13 +505,36 @@ async def _check_referential(
                 detail="no such channel in this workspace",
             )
 
+        # Reducer-field guard (500-proof): the version-agnostic reducer reads these
+        # payload fields unconditionally, and an unknown version skipped payload
+        # validation — so verify them here or reject before emit_event runs the
+        # reducer (a KeyError there would 500 the request). channel.archived needs
+        # only channel_stream_id (already guarded).
+        if event_type == "channel.renamed" and not isinstance(payload.get("name"), str):
+            return Rejected(
+                event_id="",
+                code="invalid_schema",
+                detail="channel.renamed payload.name must be a string",
+            )
+        if event_type in ("channel.member_added", "channel.member_removed"):
+            member_user_id = payload.get("user_id")
+            if not isinstance(member_user_id, str) or not ids.is_valid_typed_id(
+                member_user_id, ids.IdKind.USER
+            ):
+                return Rejected(
+                    event_id="",
+                    code="invalid_schema",
+                    detail="channel membership event payload.user_id must be a user id",
+                )
+
         # F1 step 3 — strict §2.2 lifecycle homing (mirrors the genesis rule):
         # private target -> body.stream_id must be the channel's own stream
         # (self-homed); public target -> the caller workspace's workspace-meta.
-        # Both legal homes are inside ctx.workspace_id by construction, so
-        # cross-tenant home/log injection is dead without an insert_event guard.
-        # A violation is a protocol-placement fault (invalid_schema), not a
-        # permission fault — same code as a genesis homing violation.
+        # ``visibility`` of a resolved channel is 'public' or 'private', so these
+        # arms are exhaustive; both legal homes are inside ctx.workspace_id by
+        # construction, so cross-tenant home/log injection is dead without an
+        # insert_event guard. A violation is a protocol-placement fault
+        # (invalid_schema), not a permission fault.
         visibility = resolved[1]
         if visibility == "private":
             if body_model.stream_id != channel_stream_id:
@@ -449,7 +543,7 @@ async def _check_referential(
                     code="invalid_schema",
                     detail="private channel lifecycle event must be self-homed",
                 )
-        else:  # a channel is 'public' or 'private'; public homes in workspace-meta
+        else:  # a resolved channel is 'public' or 'private'; public homes in meta
             meta_id = await _workspace_meta_stream_id(db, ctx.workspace_id)
             if body_model.stream_id != meta_id:
                 return Rejected(
@@ -459,4 +553,9 @@ async def _check_referential(
                 )
         return None
 
+    # message.created and unknown D9 types: no referential branch. Home totality is
+    # upheld UPSTREAM at step iii — ``can_read`` / ``can_write`` gate on
+    # ``readable_streams_predicate``, which filters ``Stream.workspace_id ==
+    # ctx.workspace_id``, so the only accepted home is a stream in the caller's
+    # workspace. (Unknown types run no reducer; message.created has none in M1.)
     return None

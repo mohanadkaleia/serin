@@ -59,26 +59,33 @@ def channel_created_body(
     auth: Auth,
     home_stream_id: str,
     channel_stream_id: str | None = None,
-    name: str = "general",
-    visibility: str = "public",
+    name: Any = "general",
+    visibility: Any = "public",
+    type_version: int = 1,
+    include_channel_stream_id: bool = True,
 ) -> dict[str, Any]:
-    """A ``channel.created`` v1 body (§2.2 homing is the CALLER's choice)."""
+    """A ``channel.created`` body (§2.2 homing is the CALLER's choice).
+
+    ``type_version`` / ``visibility`` / ``name`` are deliberately typed ``Any`` and
+    ``include_channel_stream_id`` toggles the field's presence, so security tests
+    can build a v2 genesis whose payload (visibility=null, missing fields) skips the
+    step-iv payload model and probes the totality gates.
+    """
+    payload: dict[str, Any] = {"name": name, "visibility": visibility}
+    if include_channel_stream_id:
+        payload["channel_stream_id"] = (
+            channel_stream_id if channel_stream_id is not None else ids.new_stream_id()
+        )
     return {
         "event_id": ids.new_event_id(),
         "workspace_id": auth["workspace_id"],
         "stream_id": home_stream_id,
         "type": "channel.created",
-        "type_version": 1,
+        "type_version": type_version,
         "author_user_id": auth["user_id"],
         "author_device_id": auth["device_id"],
         "client_created_at": now_rfc3339(),
-        "payload": {
-            "channel_stream_id": (
-                channel_stream_id if channel_stream_id is not None else ids.new_stream_id()
-            ),
-            "name": name,
-            "visibility": visibility,
-        },
+        "payload": payload,
     }
 
 
@@ -88,14 +95,19 @@ def lifecycle_body(
     home_stream_id: str,
     type: str,
     payload: dict[str, Any],
+    type_version: int = 1,
 ) -> dict[str, Any]:
-    """A channel lifecycle (renamed/archived/member_*) v1 body."""
+    """A channel lifecycle (renamed/archived/member_*) body.
+
+    ``type_version`` is a param so security tests can send an unknown version
+    (skips the step-iv payload model) with a deliberately incomplete payload.
+    """
     return {
         "event_id": ids.new_event_id(),
         "workspace_id": auth["workspace_id"],
         "stream_id": home_stream_id,
         "type": type,
-        "type_version": 1,
+        "type_version": type_version,
         "author_user_id": auth["user_id"],
         "author_device_id": auth["device_id"],
         "client_created_at": now_rfc3339(),
