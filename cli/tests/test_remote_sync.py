@@ -15,6 +15,7 @@ from typing import Any
 import httpx
 from msgctl import credentials, outbox, sync
 from msgctl.client import MsgClient
+from msgctl.verify import verify_workspace
 from msgctl.workspace import Workspace, init_workspace
 from msgd.core import ids
 from msgd.core.hashing import hash_event
@@ -239,6 +240,67 @@ def test_pull_advances_cursor_incrementally(tmp_path: Path) -> None:
         result = sync.pull(ws, c)
     assert result.events == 1
     assert credentials.read_cursors(ws)[sid] == 2
+
+
+def test_pull_crash_between_page_and_cursor_no_duplicate(tmp_path: Path) -> None:
+    """§8.5 crash window: page fsynced but cursor NOT persisted → resume, no dup.
+
+    The resume point is log-derived, so a stale/empty sidecar cursor after a crash
+    cannot cause the durable page to be re-fetched and appended twice.
+    """
+    ws = _ws(tmp_path)
+    server = FakeServer()
+    sid = CHAN_ID
+    server.add_stream(sid, kind="channel", name="general")
+    server.add_event(sid, _server_event(sid, 1, "2026-07-04T00:00:00.000Z", "one"))
+    server.add_event(sid, _server_event(sid, 2, "2026-07-04T00:00:00.000Z", "two"))
+
+    with _client(server) as c:
+        sync.pull(ws, c)
+    month_file = ws.stream_dir(sid) / "2026-07.ndjson"
+    assert len(month_file.read_text().strip().split("\n")) == 2
+
+    # Simulate the crash: the page's bytes are durable, but the cursor write that
+    # would have followed never happened — roll the sidecar cursor back to empty.
+    credentials.write_cursors(ws, {})
+
+    with _client(server) as c:
+        result = sync.pull(ws, c)
+
+    # No re-append: still exactly two lines, no duplicated server_sequence.
+    lines = [ln for ln in month_file.read_text().split("\n") if ln]
+    assert len(lines) == 2
+    seqs = [json.loads(ln)["server"]["server_sequence"] for ln in lines]
+    assert seqs == [1, 2]
+    assert result.events == 0  # nothing new fetched (log head == server head)
+    # The log-derived resume restored the cursor to the true head.
+    assert credentials.read_cursors(ws)[sid] == 2
+
+    # verify is green on the recovered workspace (no gap / duplicate).
+    report = verify_workspace(ws.root)
+    assert report.exit_code == 0, report.findings
+
+
+def test_pull_crash_then_new_events_appended_without_dup(tmp_path: Path) -> None:
+    """After a crash-window resume, brand-new server events still land, once."""
+    ws = _ws(tmp_path)
+    server = FakeServer()
+    sid = CHAN_ID
+    server.add_stream(sid, kind="channel", name="general")
+    server.add_event(sid, _server_event(sid, 1, "2026-07-04T00:00:00.000Z", "one"))
+    with _client(server) as c:
+        sync.pull(ws, c)
+    credentials.write_cursors(ws, {})  # crash before cursor persist
+    server.add_event(sid, _server_event(sid, 2, "2026-07-04T00:00:00.000Z", "two"))
+
+    with _client(server) as c:
+        result = sync.pull(ws, c)
+
+    lines = [ln for ln in (ws.stream_dir(sid) / "2026-07.ndjson").read_text().split("\n") if ln]
+    seqs = [json.loads(ln)["server"]["server_sequence"] for ln in lines]
+    assert seqs == [1, 2]  # seq 1 not duplicated, seq 2 appended once
+    assert result.events == 1
+    assert verify_workspace(ws.root).exit_code == 0
 
 
 # --- push -------------------------------------------------------------------

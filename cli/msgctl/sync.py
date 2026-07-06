@@ -19,7 +19,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import IO, Any, Final
 
-from msgctl.append import _repair_torn_line, flock_exclusive
+from msgctl.append import _scan_stream, flock_exclusive
 from msgctl.client import MsgClient
 from msgctl.credentials import META_STREAM_NAME, read_cursors, write_cursors
 from msgctl.outbox import OutboxItem, read_all, remove
@@ -32,6 +32,9 @@ __all__ = ["PushResult", "PullResult", "push", "pull"]
 #: wrapper + separators).
 _MAX_BATCH_ITEMS: Final = 100
 _MAX_BATCH_BYTES: Final = 1024 * 1024 - 8192
+#: Per-item over-estimate covering the array separator + ``httpx``'s spaced-
+#: separator re-serialization (compact ``item.line`` underestimates the wire size).
+_ITEM_SPACING_PAD: Final = 16
 
 #: Pull page size — the server clamps ``limit`` into ``[1, 500]``; ask for the max.
 _PULL_LIMIT: Final = 500
@@ -71,11 +74,19 @@ class PullResult:
 
 
 def _batches(items: list[OutboxItem]) -> Iterator[list[OutboxItem]]:
-    """Yield FIFO batches of ≤100 items and ≤~1 MB (each item's wire line size)."""
+    """Yield FIFO batches of ≤100 items and ≤~1 MB.
+
+    ``item.line`` is the COMPACT ``{body, event_hash}`` serialization, whereas the
+    request ``httpx`` builds re-serializes with spaced separators (``", "`` /
+    ``": "``), so the real body is slightly larger than the sum measured here. The
+    ``_ITEM_SPACING_PAD`` per item (a generous upper bound on the spacing overhead)
+    plus the ``_MAX_BATCH_BYTES`` head-room below the hard 1 MB cap absorb that
+    difference, so a batch that passes here never trips the server's 413.
+    """
     batch: list[OutboxItem] = []
     size = 0
     for item in items:
-        item_bytes = len(item.line.encode("utf-8")) + 1  # +1 for the array separator
+        item_bytes = len(item.line.encode("utf-8")) + _ITEM_SPACING_PAD
         if batch and (len(batch) >= _MAX_BATCH_ITEMS or size + item_bytes > _MAX_BATCH_BYTES):
             yield batch
             batch, size = [], 0
@@ -91,12 +102,16 @@ def push(ws: Workspace, client: MsgClient) -> PushResult:
     Each batch is POSTed via :meth:`MsgClient.post_batch`, whose retry loop re-
     sends the SAME ``event_id``s on a transient fault so server idempotency
     (``UNIQUE(workspace_id, event_id)``) yields the original record — no
-    duplicate. Both accepted and permanently-rejected items are drained from the
-    outbox **after** the response (crash-safe order: a crash before the drain
-    leaves the items queued, and the retry re-accepts idempotently). A rejection
-    makes :attr:`PushResult.ok` false so the CLI exits nonzero.
+    duplicate. Drained ``event_id``s (both accepted — which return via ``pull`` —
+    and permanently-rejected — which the client must stop retrying) are collected
+    across all batches and removed from the outbox **once at the end**, avoiding a
+    per-batch read+rewrite. Crash-safe: a crash before the final drain leaves the
+    already-processed items queued, and the next push re-accepts them idempotently
+    (server dedupe) then drains — no duplicate. A rejection makes
+    :attr:`PushResult.ok` false so the CLI exits nonzero.
     """
     result = PushResult()
+    drain: set[str] = set()
     for batch in _batches(read_all(ws)):
         resp = client.post_batch([{"body": it.body, "event_hash": it.event_hash} for it in batch])
         accepted = resp.get("accepted", [])
@@ -110,12 +125,9 @@ def push(ws: Workspace, client: MsgClient) -> PushResult:
                     detail=str(rej.get("detail", "")),
                 )
             )
-        # Both outcomes are terminal for the outbox: accepted events return via
-        # pull; rejected events are permanent faults the client must stop retrying.
-        drain = {str(a["event_id"]) for a in accepted} | {
-            str(r.get("event_id", "")) for r in rejected
-        }
-        remove(ws, drain)
+        drain |= {str(a["event_id"]) for a in accepted}
+        drain |= {str(r.get("event_id", "")) for r in rejected}
+    remove(ws, drain)
     return result
 
 
@@ -154,6 +166,28 @@ def _register_streams(ws: Workspace, streams: list[dict[str, Any]]) -> list[str]
     return registered
 
 
+def _resume_seq(ws: Workspace, stream_id: str) -> int:
+    """The log-derived resume point: the max ``server_sequence`` durably on disk.
+
+    **This is the crash-safety hinge (scan-on-open, matching ``append.py``).** The
+    sidecar cursor is persisted only *after* a page is fsynced, so a crash in that
+    window leaves durable page bytes with a STALE cursor. If the resume point came
+    from the sidecar, ``get_events(after=stale)`` would re-return those durable
+    events and append them twice (two lines at one ``server_sequence`` →
+    ``verify`` fails, byte-equality breaks). Deriving it from the log instead makes
+    the sidecar a pure optimization: the durable log is the source of truth.
+
+    ``_scan_stream`` (reused verbatim from ``append.py``) repairs a torn trailing
+    line and returns the max contiguous sequence; a stream with no dir yet → 0.
+    Held under the per-stream ``flock``.
+    """
+    stream_dir = ws.stream_dir(stream_id)
+    if not stream_dir.is_dir():
+        return 0
+    with flock_exclusive(stream_dir / STREAM_LOCK):
+        return _scan_stream(stream_dir).last_seq
+
+
 def _write_page(ws: Workspace, stream_id: str, events: list[dict[str, Any]]) -> int:
     """Append a page verbatim to the stream's month files; return the new cursor.
 
@@ -161,11 +195,12 @@ def _write_page(ws: Workspace, stream_id: str, events: list[dict[str, Any]]) -> 
     writer uses (``json.dumps(evt, ensure_ascii=False, separators=(",",":"))`` +
     ``"\\n"``) into ``<server_received_at[:7]>.ndjson`` — so both clients derive
     the same month split from the same server-supplied timestamp and their logs
-    are byte-identical. Before the first append to a month file, any torn trailing
-    line from an interrupted prior write is repaired (same semantics as
-    ``append.py``) so it cannot fuse with this page. All touched files are fsynced
-    before returning; the caller advances + persists the cursor only after.
-    Held under the per-stream ``flock``.
+    are byte-identical. All touched files are fsynced before returning; the caller
+    advances + persists the cursor only after. Held under the per-stream ``flock``.
+
+    Torn-line repair is not needed here: the pull loop derives its start from
+    :func:`_resume_seq` (which repairs on open), and every page is fully fsynced
+    before the next, so no torn trailing line can exist when this appends.
     """
     stream_dir = ws.stream_dir(stream_id)
     created_dir = not stream_dir.exists()
@@ -182,9 +217,7 @@ def _write_page(ws: Workspace, stream_id: str, events: list[dict[str, Any]]) -> 
                 path = stream_dir / f"{month}.ndjson"
                 key = str(path)
                 if key not in open_files:
-                    if path.exists():
-                        _repair_torn_line(path, path.read_bytes())
-                    else:
+                    if not path.exists():
                         new_files.add(key)
                     open_files[key] = open(path, "ab")
                 line = json.dumps(evt, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -205,10 +238,13 @@ def pull(ws: Workspace, client: MsgClient) -> PullResult:
     """Mirror every readable stream from sequence 1 into the synced log (§4).
 
     ``GET /v1/sync`` lists the readable streams; each is registered, then paged
-    from its cursor (0 ≡ from seq 1) forward via ``GET /v1/events?after=<cursor>``,
-    appended verbatim, with the cursor advanced + durably persisted **after** each
-    page's bytes are fsynced. On resume, ``after=cursor`` re-fetches nothing
-    already written (``seq ≤ cursor``), so there is no double-append.
+    forward via ``GET /v1/events?after=<cursor>``, appended verbatim, with the
+    cursor advanced + durably persisted **after** each page's bytes are fsynced.
+
+    The per-stream resume point is ``max(sidecar_cursor, log_head)`` — the log is
+    authoritative (:func:`_resume_seq`), so a crash between a page's fsync and its
+    cursor-persist can never cause a re-append: on resume ``after=log_head`` skips
+    every already-durable event. A fresh stream starts at 0 ≡ from seq 1.
     """
     result = PullResult()
     sync = client.get_sync()
@@ -219,7 +255,13 @@ def pull(ws: Workspace, client: MsgClient) -> PullResult:
     cursors = read_cursors(ws)
     for s in streams:
         sid = str(s["stream_id"])
-        cursor = cursors.get(sid, 0)
+        # Log-derived resume (crash-safe): never trust the sidecar cursor alone.
+        cursor = max(cursors.get(sid, 0), _resume_seq(ws, sid))
+        if cursors.get(sid, 0) != cursor:
+            # Reconcile a stale sidecar (e.g. crash before its persist) to the
+            # durable log head so it stays a truthful optimization.
+            cursors[sid] = cursor
+            write_cursors(ws, cursors)
         while True:
             page = client.get_events(stream_id=sid, after=cursor, limit=_PULL_LIMIT)
             events = page.get("events", [])
