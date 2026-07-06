@@ -21,8 +21,10 @@ problem+json error bodies to decode. :class:`MsgClient` wraps a synchronous
 
 from __future__ import annotations
 
+import sys
 import time
 from typing import Any, Final
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -33,6 +35,7 @@ __all__ = [
     "AuthError",
     "NotFoundError",
     "TransientError",
+    "ProtocolError",
     "MsgClient",
 ]
 
@@ -43,6 +46,26 @@ _DEFAULT_TIMEOUT: Final = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool
 
 #: HTTP statuses that are transient (retryable): 429 + all 5xx.
 _RETRY_STATUSES: Final = frozenset({429, 500, 502, 503, 504})
+
+#: Loopback hosts for which cleartext ``http://`` is acceptable (local dev).
+_LOOPBACK_HOSTS: Final = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
+
+
+def _warn_cleartext(server_url: str) -> None:
+    """Warn (once, on stderr) if the bearer token would ride cleartext ``http://``.
+
+    Rule (M1): warn — do not reject — since local dev legitimately uses
+    ``http://localhost``. A non-loopback ``http://`` host sends the bearer token
+    in the clear, so the operator is told to use ``https``. Never rejects (that
+    would block localhost dev over http). The URL host is shown; the token is not.
+    """
+    parts = urlsplit(server_url)
+    if parts.scheme == "http" and (parts.hostname or "") not in _LOOPBACK_HOSTS:
+        print(
+            f"warning: server URL is http://{parts.netloc} — the bearer token is sent in "
+            "cleartext; use https",
+            file=sys.stderr,
+        )
 
 
 class RemoteError(MsgctlError):
@@ -68,6 +91,16 @@ class NotFoundError(RemoteError):
 
 class TransientError(RemoteError):
     """A transient fault survived the whole retry budget (network/timeout/5xx/429)."""
+
+
+class ProtocolError(RemoteError):
+    """The server sent a structurally invalid / hostile response (e.g. a bad id).
+
+    Raised BEFORE any server-supplied value is trusted as a filesystem path, so a
+    malicious server cannot drive path traversal. The message names only the
+    offending value's *shape*, never the raw string (which could itself be a
+    traversal payload echoed into a log/path).
+    """
 
 
 def _problem_fields(resp: httpx.Response) -> tuple[str | None, str]:
@@ -108,6 +141,7 @@ class MsgClient:
         self._token = token
         self._max_retries = max_retries
         self._backoff_base = backoff_base
+        _warn_cleartext(server_url)
         # ``transport`` is an injection seam for unit tests (httpx.MockTransport);
         # production passes None and httpx builds the default networking transport.
         self._client = httpx.Client(

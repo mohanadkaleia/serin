@@ -15,8 +15,10 @@ _TOKEN = "sk_secret_bearer_do_not_leak"
 
 
 def _client(handler: httpx.MockTransport, *, token: str | None = _TOKEN) -> MsgClient:
+    # Loopback base URL so the cleartext-http warning stays silent here; the
+    # warning behavior itself is covered by the dedicated tests below.
     return MsgClient(
-        "http://test",
+        "http://127.0.0.1:8000",
         token=token,
         transport=handler,
         backoff_base=0.0,  # instant retries in tests
@@ -152,3 +154,43 @@ def test_get_events_sends_query_params() -> None:
     with _client(httpx.MockTransport(handler)) as c:
         c.get_events(stream_id="s_abc", after=7, limit=500)
     assert seen == {"stream_id": "s_abc", "after": "7", "limit": "500"}
+
+
+# --- security: cleartext-http bearer-token warning --------------------------
+
+
+def _noop_transport() -> httpx.MockTransport:
+    return httpx.MockTransport(lambda request: httpx.Response(200, json={}))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://example.com",
+        "http://example.com:8000",
+        "http://192.0.2.1",
+    ],
+)
+def test_warns_on_cleartext_http_non_loopback(url: str, capsys: pytest.CaptureFixture[str]) -> None:
+    MsgClient(url, token=_TOKEN, transport=_noop_transport()).close()
+    err = capsys.readouterr().err
+    assert "cleartext" in err
+    assert "use https" in err
+    assert _TOKEN not in err  # the warning names the host, never the token
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://[::1]:8000",
+        "https://example.com",
+    ],
+)
+def test_no_cleartext_warning_for_loopback_or_https(
+    url: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    MsgClient(url, token=_TOKEN, transport=_noop_transport()).close()
+    assert "cleartext" not in capsys.readouterr().err

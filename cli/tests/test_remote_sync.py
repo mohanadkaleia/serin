@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from msgctl import credentials, outbox, sync
-from msgctl.client import MsgClient
+from msgctl.client import MsgClient, ProtocolError
 from msgctl.verify import verify_workspace
 from msgctl.workspace import Workspace, init_workspace
 from msgd.core import ids
@@ -301,6 +302,83 @@ def test_pull_crash_then_new_events_appended_without_dup(tmp_path: Path) -> None
     assert seqs == [1, 2]  # seq 1 not duplicated, seq 2 appended once
     assert result.events == 1
     assert verify_workspace(ws.root).exit_code == 0
+
+
+# --- security: server-supplied stream_id path-traversal guard ---------------
+
+
+def _sync_only_handler(stream_id: Any) -> httpx.MockTransport:
+    """A server whose /v1/sync returns a single stream with ``stream_id``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sync":
+            entry: dict[str, Any] = {
+                "kind": "channel",
+                "name": "x",
+                "visibility": "public",
+                "head_seq": 1,
+                "member": True,
+            }
+            if stream_id is not _MISSING:
+                entry["stream_id"] = stream_id
+            return httpx.Response(200, json={"streams": [entry]})
+        return httpx.Response(200, json={"events": [], "has_more": False})
+
+    return httpx.MockTransport(handler)
+
+
+_MISSING = object()
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "../../evil",
+        "../../../../tmp/evil",
+        "/tmp/evil-abs",
+        "s_not-a-valid-ulid",
+        "s_",
+        "",
+        "streams/../escape",
+        _MISSING,  # stream_id key absent entirely
+        12345,  # non-string
+    ],
+)
+def test_pull_rejects_malicious_stream_id(tmp_path: Path, bad_id: Any) -> None:
+    """A hostile server-supplied stream_id aborts pull and writes nothing outside streams/."""
+    ws = _ws(tmp_path)
+    parent = ws.root.parent
+    before = {p.name for p in parent.iterdir()}
+
+    client = MsgClient(
+        "http://test", token="t", transport=_sync_only_handler(bad_id), backoff_base=0.0
+    )
+    with client:
+        with pytest.raises(ProtocolError) as exc_info:
+            sync.pull(ws, client)
+
+    # The raw traversal payload is NOT echoed into the error message (it could be
+    # a path/log-injection string); only its shape is reported.
+    if isinstance(bad_id, str) and ("/" in bad_id or ".." in bad_id):
+        assert bad_id not in str(exc_info.value)
+    # No path escape: the workspace-root parent is byte-for-byte untouched.
+    assert {p.name for p in parent.iterdir()} == before
+    # No stream dir was created inside streams/ either (validation is up front).
+    assert [p for p in ws.streams_dir.iterdir() if p.is_dir()] == []
+    # The manifest gained no stream (registration never ran for a bad id).
+    assert Workspace.open(ws.root).streams == {}
+
+
+def test_pull_accepts_valid_stream_id(tmp_path: Path) -> None:
+    """Sanity: a real s_ ULID passes the guard (the happy path stays green)."""
+    ws = _ws(tmp_path)
+    server = FakeServer()
+    server.add_stream(CHAN_ID, kind="channel", name="general")
+    server.add_event(CHAN_ID, _server_event(CHAN_ID, 1, "2026-07-04T00:00:00.000Z", "hi"))
+    with _client(server) as c:
+        result = sync.pull(ws, c)
+    assert result.events == 1
+    assert CHAN_ID in Workspace.open(ws.root).streams
 
 
 # --- push -------------------------------------------------------------------

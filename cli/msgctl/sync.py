@@ -19,8 +19,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import IO, Any, Final
 
+from msgd.core import ids
+
 from msgctl.append import _scan_stream, flock_exclusive
-from msgctl.client import MsgClient
+from msgctl.client import MsgClient, ProtocolError
 from msgctl.credentials import META_STREAM_NAME, read_cursors, write_cursors
 from msgctl.outbox import OutboxItem, read_all, remove
 from msgctl.workspace import STREAM_LOCK, StreamInfo, Workspace, _fsync_dir, now_rfc3339
@@ -134,6 +136,29 @@ def push(ws: Workspace, client: MsgClient) -> PushResult:
 # --- pull -------------------------------------------------------------------
 
 
+def _safe_stream_id(value: Any) -> str:
+    """Validate a server-supplied ``stream_id`` BEFORE it is used as a path component.
+
+    SECURITY (path-traversal guard): every ``stream_id`` from a ``GET /v1/sync`` /
+    ``GET /v1/events`` response flows into ``ws.stream_dir(sid) = streams_dir /
+    sid`` (``workspace.py`` does zero sanitization) → ``mkdir(parents=True)`` +
+    append of server-controlled bytes. A hostile/compromised server returning
+    ``"../../../../tmp/evil"`` (or an absolute path) would otherwise write an
+    attacker-controlled log OUTSIDE the workspace root, and ``verify`` — which runs
+    its hash check only AFTER the write — cannot catch a path escape. So each id is
+    checked against the repo's ``s_``-typed-ULID shape at the trust boundary and a
+    bad one aborts the whole pull. The raw value is NEVER echoed (it could itself
+    be a traversal payload); only its shape is reported.
+    """
+    if isinstance(value, str) and ids.is_valid_typed_id(value, ids.IdKind.STREAM):
+        return value
+    kind = type(value).__name__ if not isinstance(value, str) else f"str[len={len(value)}]"
+    raise ProtocolError(
+        f"server returned a stream_id that is not a valid 's_' typed ULID ({kind}); "
+        "refusing to use it as a path component"
+    )
+
+
 def _register_streams(ws: Workspace, streams: list[dict[str, Any]]) -> list[str]:
     """Register every synced stream in ``workspace.json`` if absent (§4.6).
 
@@ -148,7 +173,7 @@ def _register_streams(ws: Workspace, streams: list[dict[str, Any]]) -> list[str]
     with flock_exclusive(ws.lock_path):
         fresh = Workspace.open(ws.root)
         for s in streams:
-            sid = str(s["stream_id"])
+            sid = _safe_stream_id(s["stream_id"])  # never register an unvalidated id
             if sid in fresh.streams:
                 continue
             kind = str(s.get("kind", "channel"))
@@ -245,16 +270,27 @@ def pull(ws: Workspace, client: MsgClient) -> PullResult:
     authoritative (:func:`_resume_seq`), so a crash between a page's fsync and its
     cursor-persist can never cause a re-append: on resume ``after=log_head`` skips
     every already-durable event. A fresh stream starts at 0 ≡ from seq 1.
+
+    SECURITY: every server-supplied ``stream_id`` is validated with
+    :func:`_safe_stream_id` **before** it is used as a filesystem path component or
+    registered, so a hostile server cannot drive path traversal. (The only id that
+    reaches a path is this validated top-level sync id; an event body's
+    ``stream_id`` is written verbatim as hash-covered log data and never touches a
+    path.)
     """
     result = PullResult()
     sync = client.get_sync()
-    streams = sorted(sync.get("streams", []), key=lambda s: str(s["stream_id"]))
+    raw_streams = sync.get("streams", [])
+    # Validate ALL ids up front — abort the whole pull before any path use/register.
+    for s in raw_streams:
+        _safe_stream_id(s.get("stream_id") if isinstance(s, dict) else None)
+    streams = sorted(raw_streams, key=lambda s: str(s["stream_id"]))
     result.streams = len(streams)
     result.registered = _register_streams(ws, streams)
 
     cursors = read_cursors(ws)
     for s in streams:
-        sid = str(s["stream_id"])
+        sid = _safe_stream_id(s["stream_id"])  # defense-in-depth at the path site
         # Log-derived resume (crash-safe): never trust the sidecar cursor alone.
         cursor = max(cursors.get(sid, 0), _resume_seq(ws, sid))
         if cursors.get(sid, 0) != cursor:
