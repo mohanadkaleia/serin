@@ -1,0 +1,547 @@
+"""``POST /v1/events/batch`` endpoint acceptance (ENG-66).
+
+Covers the §3.2 response shaping, batch caps, all five rejection codes, the
+raw-hash discipline (coercion tamper + redacted smuggling), per-event isolation
+and ordering, homing, unknown types (D9), the archived-write gate, idempotency,
+the D13 adversary case, the WS seam, and the per-user rate limit.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+from authutil import (
+    accept_invite,
+    auth_header,
+    create_invite,
+    do_setup,
+    fetch_meta_stream_id,
+    fetch_stream,
+    fetch_stream_events,
+    join_token,
+    make_app,
+    make_client,
+)
+from eventsutil import (
+    BATCH_URL,
+    bootstrap_channel,
+    channel_created_body,
+    custom_body,
+    lifecycle_body,
+    message_body,
+    post_batch,
+    wire_item,
+)
+from httpx import AsyncClient
+from msgd.auth.ratelimit import RateLimiter
+from msgd.core import ids
+from msgd.core.envelope import Envelope
+from msgd.core.hashing import hash_event
+from msgd.db.models import Event, Stream, StreamMember
+from msgd.settings import Settings
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+async def _invite_user(client: AsyncClient, owner: dict[str, Any], *, role: str) -> dict[str, Any]:
+    """Create + accept an invite; return the new user's auth dict."""
+    invite = await create_invite(client, owner["token"], role=role)
+    raw = join_token(invite.json()["url"])
+    accepted = await accept_invite(client, raw, email=f"{ids.new_ulid().lower()}@example.com")
+    assert accepted.status_code == 200, accepted.text
+    body: dict[str, Any] = accepted.json()
+    return body
+
+
+async def _event_rows(db: AsyncSession, event_id: str) -> list[Event]:
+    rows = await db.execute(select(Event).where(Event.event_id == event_id))
+    return list(rows.scalars().all())
+
+
+# --- accept path + response shape ------------------------------------------------
+
+
+async def test_message_upload_accepted_and_stored_verbatim(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A valid message is sequenced at 1 in its channel and stored byte-faithfully."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+
+    body = message_body(auth=owner, stream_id=channel, text="first!")
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["rejected"] == []
+    (entry,) = payload["accepted"]
+    assert entry["event_id"] == body["event_id"]
+    assert entry["stream_id"] == channel
+    assert entry["server_sequence"] == 1
+    assert entry["server_received_at"].endswith("Z")
+
+    (row,) = await _event_rows(db_session, body["event_id"])
+    assert row.body == body  # verbatim — the raw dict, not a model round-trip
+    assert hash_event(row.body) == row.event_hash
+    assert row.payload_redacted is False
+
+
+async def test_empty_batch_returns_empty_arrays(client: AsyncClient) -> None:
+    owner = await do_setup(client)
+    resp = await post_batch(client, owner["token"], [])
+    assert resp.status_code == 200
+    assert resp.json() == {"accepted": [], "rejected": []}
+
+
+# --- batch-level caps + malformed top-level ---------------------------------------
+
+
+async def test_malformed_top_level_is_422(client: AsyncClient) -> None:
+    owner = await do_setup(client)
+    headers = {**auth_header(owner["token"]), "content-type": "application/json"}
+
+    for content in (b"not json", b"[1,2]", b'{"events": 5}', b"{}"):
+        resp = await client.post(BATCH_URL, content=content, headers=headers)
+        assert resp.status_code == 422, content
+        assert resp.json()["type"] == "/problems/validation-error"
+
+
+async def test_batch_count_cap_422(client: AsyncClient) -> None:
+    """>100 events → 422 /problems/batch-too-large (whole request rejected)."""
+    owner = await do_setup(client)
+    resp = await post_batch(client, owner["token"], [{} for _ in range(101)])
+    assert resp.status_code == 422
+    assert resp.json()["type"] == "/problems/batch-too-large"
+
+
+async def test_batch_body_cap_413(client: AsyncClient) -> None:
+    """Body >1 MB → 413 /problems/payload-too-large (whole request rejected)."""
+    owner = await do_setup(client)
+    headers = {**auth_header(owner["token"]), "content-type": "application/json"}
+    blob = b'{"events": [{"body": {"pad": "' + b"a" * 1_100_000 + b'"}}]}'
+    resp = await client.post(BATCH_URL, content=blob, headers=headers)
+    assert resp.status_code == 413
+    assert resp.json()["type"] == "/problems/payload-too-large"
+
+
+async def test_per_event_size_cap_is_a_rejection_not_a_problem(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A >64 KB event lands in rejected[] with code payload_too_large (200 OK)."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    body = message_body(auth=owner, stream_id=channel, text="x" * 70_000)
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    assert resp.status_code == 200
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "payload_too_large"
+    assert entry["event_id"] == body["event_id"]
+
+
+# --- per-event isolation + in-batch ordering ---------------------------------------
+
+
+async def test_bad_event_does_not_sink_neighbors(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """[valid, invalid, valid] → 2 accepted (persisted, consecutive), 1 rejected."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+
+    first = message_body(auth=owner, stream_id=channel, text="one")
+    tampered = message_body(auth=owner, stream_id=channel, text="two")
+    third = message_body(auth=owner, stream_id=channel, text="three")
+    items = [
+        wire_item(first),
+        {"body": tampered, "event_hash": "sha256:" + "0" * 64},
+        wire_item(third),
+    ]
+    resp = await post_batch(client, owner["token"], items)
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert [e["code"] for e in payload["rejected"]] == ["hash_mismatch"]
+    assert [e["server_sequence"] for e in payload["accepted"]] == [1, 2]  # batch order
+    assert [e["event_id"] for e in payload["accepted"]] == [
+        first["event_id"],
+        third["event_id"],
+    ]
+    events = await fetch_stream_events(db_session, channel)
+    assert [e.body["payload"]["text"] for e in events] == ["one", "three"]
+
+
+# --- idempotency (point 6 / D7) -----------------------------------------------------
+
+
+async def test_idempotent_reupload_returns_original_record(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Re-uploading the same {body, event_hash} reproduces the ORIGINAL accepted entry."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    item = wire_item(message_body(auth=owner, stream_id=channel))
+
+    first = await post_batch(client, owner["token"], [item])
+    assert first.status_code == 200, first.text
+    (original,) = first.json()["accepted"]
+
+    again = await post_batch(client, owner["token"], [item])
+    assert again.status_code == 200, again.text
+    (replay,) = again.json()["accepted"]
+    assert replay == original  # same sequence, stream AND server_received_at string
+
+    # Exactly one stored row; no sequence was consumed by the replay.
+    rows = await _event_rows(db_session, item["body"]["event_id"])
+    assert len(rows) == 1
+    stream_row = await fetch_stream(db_session, channel)
+    assert stream_row is not None and stream_row.head_seq == 1
+
+
+async def test_ws_seam_invoked_once_per_new_accept(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """publish_event fires once per NEWLY accepted event, never on re-accepts."""
+    import msgd.api.routers.events_upload as upload_module
+
+    published: list[Envelope] = []
+
+    async def spy(envelope: Envelope) -> None:
+        published.append(envelope)
+
+    monkeypatch.setattr(upload_module, "publish_event", spy)
+
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    item = wire_item(message_body(auth=owner, stream_id=channel))
+
+    await post_batch(client, owner["token"], [item])
+    assert len(published) == 2  # the channel genesis + the message
+    await post_batch(client, owner["token"], [item])  # idempotent re-accept
+    assert len(published) == 2  # NOT re-published
+    assert published[-1].body.event_id == item["body"]["event_id"]
+
+
+# --- raw-hash discipline: coercion tamper + redaction smuggling ---------------------
+
+
+async def test_coercion_tamper_hash_mismatch(client: AsyncClient, db_session: AsyncSession) -> None:
+    """'"type_version":"1"' with a hash over int 1 → hash_mismatch (raw-faithful)."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+
+    body_int = message_body(auth=owner, stream_id=channel)
+    stale = hash_event(body_int)
+    body_str = dict(body_int)
+    body_str["type_version"] = "1"
+    resp = await post_batch(client, owner["token"], [{"body": body_str, "event_hash": stale}])
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "hash_mismatch"
+
+    # Companion (DOCUMENTED DEVIATION): the honestly-hashed string form is
+    # rejected invalid_schema by the storability gate (insert_event's INTEGER
+    # convenience column cannot store a str) instead of the plan's "accepted and
+    # stored verbatim" — see validate.py.
+    honest = await post_batch(client, owner["token"], [wire_item(body_str)])
+    (entry,) = honest.json()["rejected"]
+    assert entry["code"] == "invalid_schema"
+
+
+async def test_redacted_smuggle_is_inert(client: AsyncClient, db_session: AsyncSession) -> None:
+    """Client-supplied server/signature never influence acceptance (point 3)."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+
+    # Wrong hash + smuggled payload_redacted → hash_mismatch (verify_hash's
+    # redaction exemption is unreachable: the validator never calls it).
+    body = message_body(auth=owner, stream_id=channel)
+    smuggled = {
+        "body": body,
+        "event_hash": "sha256:" + "0" * 64,
+        "server": {"payload_redacted": True, "server_sequence": 1},
+        "signature": "forged",
+    }
+    resp = await post_batch(client, owner["token"], [smuggled])
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "hash_mismatch"
+
+    # Correct hash + smuggled flag → accepted, stored payload_redacted=False.
+    ok_item = {
+        "body": body,
+        "event_hash": hash_event(body),
+        "server": {"payload_redacted": True},
+        "signature": "forged",
+    }
+    resp = await post_batch(client, owner["token"], [ok_item])
+    assert len(resp.json()["accepted"]) == 1, resp.text
+    (row,) = await _event_rows(db_session, body["event_id"])
+    assert row.payload_redacted is False
+    assert row.body == body  # no smuggled key leaked into storage
+
+
+# --- permission_denied family --------------------------------------------------------
+
+
+async def test_author_and_workspace_binding(client: AsyncClient, db_session: AsyncSession) -> None:
+    owner = await do_setup(client)
+    member = await _invite_user(client, owner, role="member")
+    channel = await bootstrap_channel(client, db_session, owner)
+
+    for override in (
+        {"author_user_id": member["user_id"]},  # someone else's identity
+        {"author_device_id": ids.new_device_id()},  # not the session's device
+        {"workspace_id": ids.new_workspace_id()},  # foreign workspace
+    ):
+        body = message_body(auth=owner, stream_id=channel, **override)
+        resp = await post_batch(client, owner["token"], [wire_item(body)])
+        (entry,) = resp.json()["rejected"]
+        assert entry["code"] == "permission_denied", override
+
+
+async def test_adversary_write_nondisclosure(client: AsyncClient, db_session: AsyncSession) -> None:
+    """D13: absent vs forbidden private stream → IDENTICAL code + detail."""
+    owner = await do_setup(client)
+    member = await _invite_user(client, owner, role="member")
+    private = await bootstrap_channel(client, db_session, owner, visibility="private")
+
+    to_private = message_body(auth=member, stream_id=private)
+    to_absent = message_body(auth=member, stream_id=ids.new_stream_id())
+    resp = await post_batch(client, member["token"], [wire_item(to_private), wire_item(to_absent)])
+    forbidden, absent = resp.json()["rejected"]
+    assert forbidden["code"] == "permission_denied"
+    assert (forbidden["code"], forbidden["detail"]) == (absent["code"], absent["detail"])
+
+
+async def test_guest_channel_created_denied(client: AsyncClient, db_session: AsyncSession) -> None:
+    owner = await do_setup(client)
+    guest = await _invite_user(client, owner, role="guest")
+    meta = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta is not None
+    body = channel_created_body(auth=guest, home_stream_id=meta)
+    resp = await post_batch(client, guest["token"], [wire_item(body)])
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "permission_denied"
+
+
+async def test_archived_write_gate(client: AsyncClient, db_session: AsyncSession) -> None:
+    """Obligation b: archive via the endpoint, then message.created → permission_denied."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    meta = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta is not None
+
+    archive = lifecycle_body(
+        auth=owner,
+        home_stream_id=meta,
+        type="channel.archived",
+        payload={"channel_stream_id": channel},
+    )
+    resp = await post_batch(client, owner["token"], [wire_item(archive)])
+    assert len(resp.json()["accepted"]) == 1, resp.text
+
+    msg = message_body(auth=owner, stream_id=channel)
+    resp = await post_batch(client, owner["token"], [wire_item(msg)])
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "permission_denied"
+
+
+# --- invalid_schema family: genesis collision + homing -------------------------------
+
+
+async def test_genesis_collision_rejected_no_side_effects(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Obligation a: adopting an existing stream id → invalid_schema, no membership grant."""
+    owner = await do_setup(client)
+    member = await _invite_user(client, owner, role="member")
+    channel = await bootstrap_channel(client, db_session, owner)
+    meta = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta is not None
+    meta_row = await fetch_stream(db_session, meta)
+    assert meta_row is not None
+    head_before = meta_row.head_seq
+
+    body = channel_created_body(auth=member, home_stream_id=meta, channel_stream_id=channel)
+    resp = await post_batch(client, member["token"], [wire_item(body)])
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "invalid_schema"
+
+    # The reducer never ran: no cross-stream read grant for the colliding author
+    # (the ENG-65 reducer guard is the backstop; this validator is the primary gate).
+    grant = await db_session.scalar(
+        select(StreamMember).where(
+            StreamMember.stream_id == channel, StreamMember.user_id == member["user_id"]
+        )
+    )
+    assert grant is None
+    meta_row = await fetch_stream(db_session, meta)
+    assert meta_row is not None and meta_row.head_seq == head_before  # no sequence burned
+
+
+async def test_homing_rules_end_to_end(client: AsyncClient, db_session: AsyncSession) -> None:
+    """§2.2: violations → invalid_schema; correct homing sequences per the spec."""
+    owner = await do_setup(client)
+    meta = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta is not None
+
+    # Private genesis homed in workspace-meta → invalid_schema.
+    body = channel_created_body(auth=owner, home_stream_id=meta, visibility="private")
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    assert resp.json()["rejected"][0]["code"] == "invalid_schema"
+
+    # Public genesis homed anywhere but meta → invalid_schema.
+    stray = ids.new_stream_id()
+    body = channel_created_body(
+        auth=owner, home_stream_id=stray, channel_stream_id=stray, visibility="public"
+    )
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    assert resp.json()["rejected"][0]["code"] == "invalid_schema"
+
+    # Correct private: self-homed genesis at sequence 1 of its own stream.
+    private_id = ids.new_stream_id()
+    body = channel_created_body(
+        auth=owner, home_stream_id=private_id, channel_stream_id=private_id, visibility="private"
+    )
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    (entry,) = resp.json()["accepted"]
+    assert (entry["stream_id"], entry["server_sequence"]) == (private_id, 1)
+
+    # Correct public: appended to meta; the channel's own stream stays head_seq=0.
+    public_id = ids.new_stream_id()
+    body = channel_created_body(
+        auth=owner, home_stream_id=meta, channel_stream_id=public_id, visibility="public"
+    )
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    (entry,) = resp.json()["accepted"]
+    assert entry["stream_id"] == meta
+    channel_row = await fetch_stream(db_session, public_id)
+    assert channel_row is not None and channel_row.head_seq == 0
+
+
+# --- unknown_stream (the non-leaky lifecycle referential) -----------------------------
+
+
+async def test_lifecycle_unknown_stream(client: AsyncClient, db_session: AsyncSession) -> None:
+    owner = await do_setup(client)
+    meta = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta is not None
+    body = lifecycle_body(
+        auth=owner,
+        home_stream_id=meta,
+        type="channel.renamed",
+        payload={"channel_stream_id": ids.new_stream_id(), "name": "ghost"},
+    )
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "unknown_stream"
+
+
+# --- unknown types (D9) ---------------------------------------------------------------
+
+
+async def test_unknown_type_accepted_reducer_noop_sequence_consumed(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """D9: custom.thing is stored + sequenced, has no reducer effect, and burns a seq."""
+    owner = await do_setup(client)
+    member = await _invite_user(client, owner, role="member")
+    channel = await bootstrap_channel(client, db_session, owner)
+
+    streams_before = await db_session.scalar(select(func.count()).select_from(Stream))
+    members_before = await db_session.scalar(select(func.count()).select_from(StreamMember))
+
+    body = custom_body(auth=member, stream_id=channel, payload={"volume": 11})
+    resp = await post_batch(client, member["token"], [wire_item(body)])
+    (entry,) = resp.json()["accepted"]
+    assert entry["server_sequence"] == 1
+
+    (row,) = await _event_rows(db_session, body["event_id"])
+    assert (row.type, row.type_version) == ("custom.thing", 1)
+    assert row.body == body
+
+    # Reducer no-op: no streams/membership changes.
+    assert await db_session.scalar(select(func.count()).select_from(Stream)) == streams_before
+    assert await db_session.scalar(select(func.count()).select_from(StreamMember)) == members_before
+
+    # The sequence was consumed: the next message lands at 2.
+    msg = message_body(auth=member, stream_id=channel)
+    resp = await post_batch(client, member["token"], [wire_item(msg)])
+    assert resp.json()["accepted"][0]["server_sequence"] == 2
+
+
+async def test_known_type_unknown_version_accepted(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """message.created v2 (unknown version) skips payload validation and is accepted."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    body = message_body(auth=owner, stream_id=channel, type_version=2)
+    body["payload"] = {"schema": "from the future"}
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    assert len(resp.json()["accepted"]) == 1, resp.text
+
+
+async def test_known_type_invalid_payload_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Obligation c: a known type with a broken payload → invalid_schema."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    body = message_body(auth=owner, stream_id=channel)
+    body["payload"]["message_id"] = "not-an-id"
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    (entry,) = resp.json()["rejected"]
+    assert entry["code"] == "invalid_schema"
+
+
+# --- rate limiting (§4.3) ---------------------------------------------------------------
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+async def test_event_rate_limit_burst_and_window(
+    settings: Settings, db_session: AsyncSession
+) -> None:
+    """The per-user burst limiter trips with 429 + Retry-After and resets with time."""
+    clock = _Clock()
+
+    def install(app: Any) -> None:
+        app.state.event_limiter_minute = RateLimiter(100, 60, now=clock)
+        app.state.event_limiter_burst = RateLimiter(3, 1, now=clock)
+
+    app = make_app(settings, db_session, configure=install)
+    async with make_client(app) as client:
+        owner = await do_setup(client)
+        for _ in range(3):
+            assert (await post_batch(client, owner["token"], [])).status_code == 200
+        blocked = await post_batch(client, owner["token"], [])
+        assert blocked.status_code == 429
+        assert blocked.json()["type"] == "/problems/rate-limited"
+        assert int(blocked.headers["retry-after"]) >= 1
+
+        clock.now += 2  # the 1 s burst window has elapsed
+        assert (await post_batch(client, owner["token"], [])).status_code == 200
+
+
+async def test_event_rate_limit_sustained_minute(
+    settings: Settings, db_session: AsyncSession
+) -> None:
+    """The 60 s sustained limiter trips independently of the burst limiter."""
+    clock = _Clock()
+
+    def install(app: Any) -> None:
+        app.state.event_limiter_minute = RateLimiter(2, 60, now=clock)
+        app.state.event_limiter_burst = RateLimiter(100, 1, now=clock)
+
+    app = make_app(settings, db_session, configure=install)
+    async with make_client(app) as client:
+        owner = await do_setup(client)
+        for _ in range(2):
+            assert (await post_batch(client, owner["token"], [])).status_code == 200
+        blocked = await post_batch(client, owner["token"], [])
+        assert blocked.status_code == 429
+        assert blocked.json()["type"] == "/problems/rate-limited"
