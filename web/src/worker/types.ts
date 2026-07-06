@@ -55,14 +55,23 @@ export const MAX_CACHED_EVENTS_PER_STREAM = 2000
 // `.stores()` strings in db.ts); the rest are enforced by strict typing here.
 // ---------------------------------------------------------------------------
 
-/** Raw event envelope — the evictable source cache. ENG-79 fills the envelope. */
+/**
+ * Raw event envelope — the evictable source cache (ENG-79 write path).
+ *
+ * The top-level `stream_id`/`server_sequence`/`event_id`/`type` are DENORMALIZED
+ * off the stored `envelope` purely so the Dexie index
+ * (`[stream_id+server_sequence]`, `event_id`, `type`) can key + range-scan the
+ * table. `envelope` is the verbatim, hash-verified wire event ({@link StoredEvent}):
+ * ENG-80 (projection) reads `type_version`/`author_user_id`/`payload` out of
+ * `envelope.body` and `server_sequence` out of `envelope.server`.
+ */
 export interface EventRow {
   stream_id: string
   server_sequence: number
   event_id: string
   type: string
-  /** Full envelope payload lands with ENG-79; opaque plain data until then. */
-  envelope?: Record<string, unknown>
+  /** The full verified wire envelope, stored byte-for-byte (raw-hash discipline). */
+  envelope: StoredEvent
 }
 
 /** Projected message row (derived). ENG-80 fills the render fields. */
@@ -139,6 +148,15 @@ export interface MsgDb {
   /** Server sequences for a stream, ascending. */
   listEventSequences(streamId: string): Promise<number[]>
   deleteEventsBySequence(streamId: string, sequences: readonly number[]): Promise<void>
+  /** Smallest server_sequence stored for a stream (backfill floor), or undefined. */
+  minStoredSeq(streamId: string): Promise<number | undefined>
+
+  // derived reads (ENG-79 bootstrap diff + cursor re-derivation)
+  getCursor(streamId: string): Promise<CursorRow | undefined>
+  /** All cursor rows — boot-time re-derivation / diff. */
+  listCursors(): Promise<CursorRow[]>
+  listStreams(): Promise<StreamRow[]>
+  getStream(streamId: string): Promise<StreamRow | undefined>
 
   // outbox (source; never evicted, never dropped)
   putOutbox(rows: readonly OutboxRow[]): Promise<void>
@@ -188,6 +206,100 @@ export interface RpcError {
 }
 
 // ---------------------------------------------------------------------------
+// Sync engine (ENG-79) — wire shapes, stored-event shape, state machine, and
+// the projection-apply seam shared with ENG-80. All plain, clone-safe data.
+// ---------------------------------------------------------------------------
+
+/** Unhashed server metadata carried alongside each event (D1). */
+export interface EventServerMeta {
+  server_sequence: number
+  server_received_at: string
+  payload_redacted: boolean
+}
+
+/**
+ * The exact server wire event — identical for the pull endpoint
+ * (`events_read._serialize_event`) and the WS fanout frame (`ws.frames.event_frame`).
+ * `body` is the verbatim raw JSONB the `event_hash` was computed over: NEVER
+ * re-serialize it (that would break the hash, mirroring the server's D1 discipline).
+ */
+export interface WireEvent {
+  body: Record<string, unknown>
+  event_hash: string
+  signature: null
+  server: EventServerMeta
+}
+
+/** A verified, stored envelope — same shape as {@link WireEvent} once hash-checked. */
+export type StoredEvent = WireEvent
+
+/** One page of `GET /v1/events` (ascending within the page). */
+export interface EventsPageResponse {
+  events: WireEvent[]
+  has_more: boolean
+}
+
+/** One readable stream in a `GET /v1/sync` snapshot (server `SyncStream`). */
+export interface SyncStreamMeta {
+  stream_id: string
+  kind: string
+  name: string | null
+  visibility: string | null
+  head_seq: number
+  member: boolean
+}
+
+/** The full `GET /v1/sync` snapshot (server `SyncResponse`). */
+export interface SyncResponse {
+  streams: SyncStreamMeta[]
+}
+
+/** Sync engine lifecycle states (§5.3 / §6). */
+export type SyncState = 'idle' | 'connecting' | 'syncing' | 'live' | 'degraded'
+
+/**
+ * Tab-facing sync status — distinct from {@link WorkerStatus} (transport/db/role).
+ * Emitted on every transition via the `{kind:'sync'}` push topic + the
+ * `sync.status` RPC.
+ */
+export interface SyncStatus {
+  state: SyncState
+  online: boolean
+  streamsTotal?: number
+  streamsSynced?: number
+  lastError?: string
+}
+
+/** Result of a `sync.backfill` RPC (§10). */
+export interface BackfillResult {
+  events: number
+  has_more: boolean
+  oldest_loaded_seq: number
+}
+
+/**
+ * The coordination seam with ENG-80 (LOCKED signature). Called by the sync
+ * engine AFTER a contiguous run of verified events has been persisted to
+ * `events` and the stream cursor advanced. `events` is ascending, gapless,
+ * hash-verified and already stored — ENG-80 projects them into `messages`.
+ * Default: {@link noopApplyToProjection} (ENG-79 ships + tests standalone).
+ *
+ * Contract:
+ *  - called once per applied batch per stream (a bootstrap/catch-up page or a
+ *    single live frame), NOT once per event;
+ *  - only ever receives events the cursor now covers (never a gap/duplicate);
+ *  - awaited so a projection read after `sync.status == live` is consistent;
+ *  - must not be used for control flow — a throw is logged and swallowed by the
+ *    engine (the cursor is already committed truth; recovery is a rebuild).
+ */
+export type ApplyEventsToProjection = (
+  streamId: string,
+  events: readonly EventRow[],
+) => Promise<void>
+
+export const noopApplyToProjection: ApplyEventsToProjection = () => Promise.resolve()
+
+// ---------------------------------------------------------------------------
 // Auth taxonomy (ENG-78, R5). Credentials cross tab→worker over the in-process
 // postMessage RPC (never a tab network hop); the worker POSTs them and keeps the
 // resulting token worker-only. Every result below is TOKEN-FREE by construction.
@@ -234,11 +346,15 @@ export type RpcRequest =
   | { method: 'auth.acceptInvite'; params: AcceptInviteCredentials }
   | { method: 'auth.logout'; params: Record<string, never> }
   | { method: 'auth.status'; params: Record<string, never> }
+  | { method: 'sync.status'; params: Record<string, never> }
+  | { method: 'sync.backfill'; params: { stream_id: string } }
+  | { method: 'sync.start'; params: Record<string, never> }
+  | { method: 'sync.stop'; params: Record<string, never> }
 
 export type RpcMethod = RpcRequest['method']
 
 /** Push topics — ENG-79/80 add topics without touching the transport. */
-export type Topic = { kind: 'stream'; stream_id: string } | { kind: 'status' }
+export type Topic = { kind: 'stream'; stream_id: string } | { kind: 'status' } | { kind: 'sync' }
 
 /** Payload delivered on a push, keyed to the topic. */
 export interface StreamPush {
@@ -246,9 +362,11 @@ export interface StreamPush {
 }
 export type PushPayload<T extends Topic> = T extends { kind: 'status' }
   ? WorkerStatus
-  : T extends { kind: 'stream' }
-    ? StreamPush
-    : never
+  : T extends { kind: 'sync' }
+    ? SyncStatus
+    : T extends { kind: 'stream' }
+      ? StreamPush
+      : never
 
 // Tab → Worker frames. Every frame carries `clientId` so the leader's
 // BroadcastChannel can fan responses to the right follower.
@@ -339,6 +457,8 @@ export function topicKey(topic: Topic): string {
   switch (topic.kind) {
     case 'status':
       return 'status'
+    case 'sync':
+      return 'sync'
     case 'stream':
       return `stream:${topic.stream_id}`
   }

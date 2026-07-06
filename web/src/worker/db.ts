@@ -91,6 +91,30 @@ export class DexieDb implements MsgDb {
     await this.db.events.bulkDelete(sequences.map((s): [string, number] => [streamId, s]))
   }
 
+  async minStoredSeq(streamId: string): Promise<number | undefined> {
+    const first = await this.db.events
+      .where('[stream_id+server_sequence]')
+      .between([streamId, Dexie.minKey], [streamId, Dexie.maxKey])
+      .first()
+    return first?.server_sequence
+  }
+
+  async getCursor(streamId: string): Promise<CursorRow | undefined> {
+    return this.db.cursors.get(streamId)
+  }
+
+  async listCursors(): Promise<CursorRow[]> {
+    return this.db.cursors.toArray()
+  }
+
+  async listStreams(): Promise<StreamRow[]> {
+    return this.db.streams.toArray()
+  }
+
+  async getStream(streamId: string): Promise<StreamRow | undefined> {
+    return this.db.streams.get(streamId)
+  }
+
   async putOutbox(rows: readonly OutboxRow[]): Promise<void> {
     await this.db.outbox.bulkPut([...rows])
   }
@@ -206,6 +230,31 @@ export class MemoryDb implements MsgDb {
       this.eventsMap.delete(MemoryDb.eventKey(streamId, seq))
     }
     return Promise.resolve()
+  }
+
+  minStoredSeq(streamId: string): Promise<number | undefined> {
+    let min: number | undefined
+    for (const r of this.eventsMap.values()) {
+      if (r.stream_id !== streamId) continue
+      if (min === undefined || r.server_sequence < min) min = r.server_sequence
+    }
+    return Promise.resolve(min)
+  }
+
+  getCursor(streamId: string): Promise<CursorRow | undefined> {
+    return Promise.resolve(this.cursorsMap.get(streamId))
+  }
+
+  listCursors(): Promise<CursorRow[]> {
+    return Promise.resolve([...this.cursorsMap.values()])
+  }
+
+  listStreams(): Promise<StreamRow[]> {
+    return Promise.resolve([...this.streamsMap.values()])
+  }
+
+  getStream(streamId: string): Promise<StreamRow | undefined> {
+    return Promise.resolve(this.streamsMap.get(streamId))
   }
 
   putOutbox(rows: readonly OutboxRow[]): Promise<void> {
