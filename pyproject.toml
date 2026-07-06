@@ -24,6 +24,7 @@ dev = [
     "mypy>=1.11",
     "hypothesis>=6.100",
     "httpx",
+    "httpx-ws",
     "testcontainers[postgres]",
     "pytest-asyncio",
 ]

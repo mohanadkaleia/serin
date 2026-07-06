@@ -381,6 +381,55 @@ def test_pull_accepts_valid_stream_id(tmp_path: Path) -> None:
     assert CHAN_ID in Workspace.open(ws.root).streams
 
 
+# Each value's YYYY-MM prefix fails ^\d{4}-\d{2}$ — traversal payloads and other
+# malformed shapes. (A syntactically-valid-but-nonsensical month like "9999-99"
+# is deliberately NOT here: it matches the regex, is a harmless in-sandbox
+# filename, and both clients derive it identically, so it is not an escape.)
+@pytest.mark.parametrize("bad_received_at", ["../../x", "2026/07", "..-..", "", "20260704", 42])
+def test_pull_rejects_malformed_month(tmp_path: Path, bad_received_at: Any) -> None:
+    """A hostile server_received_at (path component) aborts pull; nothing escapes streams/."""
+    ws = _ws(tmp_path)
+    parent = ws.root.parent
+    before = {p.name for p in parent.iterdir()}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sync":
+            return httpx.Response(
+                200,
+                json={
+                    "streams": [
+                        {
+                            "stream_id": CHAN_ID,
+                            "kind": "channel",
+                            "name": "general",
+                            "visibility": "public",
+                            "head_seq": 1,
+                            "member": True,
+                        }
+                    ]
+                },
+            )
+        # /v1/events: one event whose server_received_at is malformed.
+        evt = _server_event(CHAN_ID, 1, "2026-07-04T00:00:00.000Z", "hi")
+        evt["server"]["server_received_at"] = bad_received_at
+        return httpx.Response(200, json={"events": [evt], "has_more": False})
+
+    client = MsgClient(
+        "http://test", token="t", transport=httpx.MockTransport(handler), backoff_base=0.0
+    )
+    with client:
+        with pytest.raises(ProtocolError) as exc_info:
+            sync.pull(ws, client)
+
+    if isinstance(bad_received_at, str) and ("/" in bad_received_at or ".." in bad_received_at):
+        assert bad_received_at not in str(exc_info.value)  # raw payload not echoed
+    # No path escape: the workspace-root parent is untouched.
+    assert {p.name for p in parent.iterdir()} == before
+    # The stream dir was registered/created, but holds no malformed-month file.
+    written = list(ws.stream_dir(CHAN_ID).glob("*.ndjson"))
+    assert written == []
+
+
 # --- push -------------------------------------------------------------------
 
 

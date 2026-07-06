@@ -20,9 +20,18 @@ __all__ = ["publish_event"]
 
 
 async def publish_event(envelope: Envelope) -> None:
-    """No-op WS fanout seam (ENG-68 replaces the body).
+    """Permission-scoped WebSocket fanout for one newly accepted event (ENG-68).
 
     Invoked by the upload router after each per-event commit, once per newly
-    accepted event (never on the idempotent re-accept path).
+    accepted event (never on the idempotent re-accept path). Delegates to the
+    process-global ``ws`` hub, which resolves recipients per-send against the live
+    DB predicate and pushes the wire frame to every eligible connected socket.
+
+    The signature is frozen (the seam carries no DB/app handle — the hub reaches
+    the DB via its own injectable session factory). The hub is imported
+    **function-locally** to avoid an ``events`` ↔ ``ws`` import cycle at module
+    load (the only back-edge; ``ws`` never imports ``events.fanout``).
     """
-    return None
+    from msgd.ws.hub import hub
+
+    await hub.publish(envelope)

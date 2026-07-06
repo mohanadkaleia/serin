@@ -66,6 +66,15 @@ class Settings(BaseSettings):
     invite_default_ttl_seconds: int = 604800  # 7 days
     invite_max_ttl_seconds: int = 2592000  # 30 days
 
+    # --- WebSocket fanout (ENG-68, §4.3) -------------------------------------
+    # Max concurrent WS connections per user; the over-cap socket is accepted
+    # then closed with app code 4029 (§5). The heartbeat is a 30 s ping/pong;
+    # a missed pong closes the socket with 4408. Both are config-overridable
+    # like the rate limits — the heartbeat test shrinks the interval (sub-second,
+    # hence a float) to stay fast without a wall-clock 30 s wait (R5).
+    ws_max_connections_per_user: int = 10
+    ws_heartbeat_interval_seconds: float = 30.0
+
 
 @lru_cache
 def get_settings() -> Settings:

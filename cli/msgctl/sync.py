@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import IO, Any, Final
@@ -40,6 +41,10 @@ _ITEM_SPACING_PAD: Final = 16
 
 #: Pull page size — the server clamps ``limit`` into ``[1, 500]``; ask for the max.
 _PULL_LIMIT: Final = 500
+
+#: The month-partition shape ``YYYY-MM`` — a server-supplied path component, so it
+#: is validated before use (defense-in-depth, matching the stream_id guard).
+_MONTH_RE: Final = re.compile(r"^\d{4}-\d{2}$")
 
 
 @dataclass(frozen=True)
@@ -213,6 +218,26 @@ def _resume_seq(ws: Workspace, stream_id: str) -> int:
         return _scan_stream(stream_dir).last_seq
 
 
+def _safe_month(received_at: Any) -> str:
+    """Validate the ``YYYY-MM`` month partition BEFORE it is used as a path component.
+
+    SECURITY (defense-in-depth, same trust-boundary class as :func:`_safe_stream_id`):
+    the month filename is built from the server-controlled ``server_received_at[:7]``
+    (``stream_dir / f"{month}.ndjson"``). The 7-char slice + fixed ``.ndjson`` suffix
+    already make a sandbox escape impossible, but for consistency the month is
+    checked against ``^\\d{4}-\\d{2}$`` here and a mismatch aborts with the same
+    typed :class:`ProtocolError` (shape-only message, no raw echo).
+    """
+    if isinstance(received_at, str):
+        month = received_at[:7]
+        if _MONTH_RE.match(month):
+            return month
+    raise ProtocolError(
+        "server returned a server_received_at whose YYYY-MM prefix is malformed; "
+        "refusing to use it as a path component"
+    )
+
+
 def _write_page(ws: Workspace, stream_id: str, events: list[dict[str, Any]]) -> int:
     """Append a page verbatim to the stream's month files; return the new cursor.
 
@@ -226,6 +251,9 @@ def _write_page(ws: Workspace, stream_id: str, events: list[dict[str, Any]]) -> 
     Torn-line repair is not needed here: the pull loop derives its start from
     :func:`_resume_seq` (which repairs on open), and every page is fully fsynced
     before the next, so no torn trailing line can exist when this appends.
+
+    The server-supplied month partition is validated (:func:`_safe_month`) before
+    it becomes a path component — defense-in-depth against a hostile server.
     """
     stream_dir = ws.stream_dir(stream_id)
     created_dir = not stream_dir.exists()
@@ -238,7 +266,7 @@ def _write_page(ws: Workspace, stream_id: str, events: list[dict[str, Any]]) -> 
         new_files: set[str] = set()
         try:
             for evt in events:
-                month = str(evt["server"]["server_received_at"])[:7]
+                month = _safe_month(evt["server"]["server_received_at"])
                 path = stream_dir / f"{month}.ndjson"
                 key = str(path)
                 if key not in open_files:
