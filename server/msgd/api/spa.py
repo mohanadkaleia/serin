@@ -26,11 +26,17 @@ from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Scope
 
-# Top-level API prefixes that must never be answered with the SPA index.html.
-# Compared against the mount-relative path (the mount is at "/"), so "v1/ws"
-# is covered by "v1". Single source of truth: a future top-level API route
-# registers its prefix here.
-RESERVED_API_PREFIXES = ("v1", "healthz", "metrics")
+# Top-level API/tooling prefixes that must never be answered with the SPA
+# index.html. Compared against the mount-relative path (the mount is at "/"), so
+# "v1/ws" is covered by "v1". Single source of truth: a future top-level API
+# route registers its prefix here.
+#
+# docs/redoc/openapi.json are reserved so that when docs are DISABLED (the
+# secure prod default, PR #12) these paths stay 404 instead of falling through
+# to the SPA shell — masking the disable would silently undo that hardening.
+# When docs are ENABLED the routes register first and win, so the guard never
+# fires for them; reserving the prefixes is therefore harmless in that case.
+RESERVED_API_PREFIXES = ("v1", "healthz", "metrics", "docs", "redoc", "openapi.json")
 
 
 class SPAStaticFiles(StaticFiles):

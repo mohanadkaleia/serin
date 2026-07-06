@@ -34,19 +34,30 @@ class _FakeSession:
         return None
 
 
-@pytest.fixture
-def spa_settings(tmp_path: Path) -> Settings:
-    """Settings pointed at a throwaway ``dist/`` fixture with an index.html."""
+def _make_dist(tmp_path: Path) -> Path:
+    """Create a throwaway ``dist/`` fixture with an index.html; return its path."""
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text(_INDEX_HTML, encoding="utf-8")
+    return dist
+
+
+def _spa_settings(tmp_path: Path, *, docs_enabled: bool = False) -> Settings:
+    """Settings with the SPA mounted over a fixture dist (docs off by default)."""
     return Settings(
         database_url="postgresql+asyncpg://unused/unused",
         data_dir=tmp_path / "data",
         secret_key="test-secret-key",
         serve_spa=True,
-        web_dist_dir=dist,
+        web_dist_dir=_make_dist(tmp_path),
+        docs_enabled=docs_enabled,
     )
+
+
+@pytest.fixture
+def spa_settings(tmp_path: Path) -> Settings:
+    """Settings pointed at a throwaway ``dist/`` fixture with an index.html."""
+    return _spa_settings(tmp_path)
 
 
 @pytest_asyncio.fixture
@@ -99,6 +110,35 @@ async def test_metrics_route_wins(spa_client: AsyncClient) -> None:
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/plain")
     assert "msgd_up 1" in resp.text
+
+
+_DOCS_PATHS = ("/docs", "/redoc", "/openapi.json")
+
+
+async def test_disabled_docs_stay_404_not_spa_shell(tmp_path: Path) -> None:
+    """docs OFF (secure prod default) + SPA mounted: docs paths 404, not the shell.
+
+    Guards the PR #12 docs-disable hardening — reserving docs/redoc/openapi.json
+    stops the SPA fallback from masking a disabled /docs with a 200 index.html.
+    """
+    app = create_app(_spa_settings(tmp_path, docs_enabled=False))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        for path in _DOCS_PATHS:
+            resp = await ac.get(path)
+            assert resp.status_code == 404, path
+            assert resp.text != _INDEX_HTML, path
+
+
+async def test_enabled_docs_serve_real_responses(tmp_path: Path) -> None:
+    """docs ON + SPA mounted: docs routes register first and win (not the shell)."""
+    app = create_app(_spa_settings(tmp_path, docs_enabled=True))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        for path in _DOCS_PATHS:
+            resp = await ac.get(path)
+            assert resp.status_code == 200, path
+            assert resp.text != _INDEX_HTML, path
 
 
 def test_mount_absent_without_dist(tmp_path: Path) -> None:
