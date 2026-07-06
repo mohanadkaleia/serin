@@ -122,13 +122,12 @@ def main() -> int:
                 "127.0.0.1",
                 "--port",
                 str(PORT),
-                # Force the wsproto WS implementation: uvicorn's default
-                # ``websockets`` backend (v16) does not surface the
-                # ``Sec-WebSocket-Protocol`` subprotocols in the ASGI scope, so the
-                # server's bearer-token WS auth (scope["subprotocols"]) sees nothing
-                # and closes 4401/403. wsproto populates the scope correctly.
-                "--ws",
-                "wsproto",
+                # No ``--ws`` override: the golden path runs uvicorn with its
+                # DEFAULT/shipped ``websockets`` backend — exactly what a real
+                # self-host runs. ENG-92 made the server's bearer-subprotocol WS
+                # auth (`_bearer_token`) normalize the un-split
+                # ``["bearer, <token>"]`` the default backend surfaces, so the WS
+                # upgrade authenticates out of the box (no wsproto workaround).
                 "--log-level",
                 "info",
             ],

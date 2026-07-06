@@ -213,23 +213,23 @@ discipline: a deliberately-injected client bug must turn the suite RED.
 
 **Infra findings baked into the harness (Playwright):**
 
-1. **uvicorn WS subprotocol / `websockets` v16.** The server authenticates the WS
-   via `Sec-WebSocket-Protocol: bearer, <token>` read from
-   `scope["subprotocols"]`. uvicorn's default `websockets` (v16) backend does NOT
-   surface the offered subprotocols in the ASGI scope, so the token is invisible
-   and the server closes pre-accept (4401 → HTTP 403) even with a valid token
-   (confirmed: the same token authorizes `GET /v1/sync` 200 but the WS upgrade
-   403s). Forcing `--ws wsproto` populates the scope and the handshake succeeds.
-   This is a real server-side gap that only surfaces against a real uvicorn
-   subprocess — the ENG-68 WS tests all run in-process (ASGI transport), so they
-   never exercised it. **Flagged for the server owner**: uvicorn+websockets-v16
-   WS is broken for this app; either pin the ws backend or the websockets version
-   server-side. The e2e harness works around it with `--ws wsproto`. **Tracked by
-   ENG-92.** Consequence for the gate: the live-WS golden-path leg passes ONLY
-   under the `--ws wsproto` override; live WS on the DEFAULT self-host config is
-   NOT yet proven, so **M2 live-sync is not exit-certified for the default config
-   until ENG-92 lands and the override is removed**. (Pull-based sync + reload
-   history — the other golden-path legs — are unaffected.)
+1. **uvicorn WS subprotocol / bearer auth — RESOLVED by ENG-92.** The server
+   authenticates the WS via `Sec-WebSocket-Protocol: bearer, <token>` read from
+   `scope["subprotocols"]`. Originally, uvicorn's default `websockets` backend
+   surfaced the offered subprotocols as the raw, *un-split* header value —
+   `["bearer, <token>"]` — while `wsproto` / the in-process ASGI test transport
+   pre-split into `["bearer", "<token>"]`. The server's `_bearer_token` required
+   ≥2 elements, so under the default backend it saw one element, returned None,
+   and closed pre-accept (4401 → HTTP 403) even with a valid token (the same
+   token authorized `GET /v1/sync` 200 — only the WS handshake failed). This only
+   surfaced against a real uvicorn subprocess; the ENG-68 WS tests all run
+   in-process (ASGI transport), so they never exercised it. **ENG-92 fixed it
+   server-side**: `_bearer_token` now normalizes *both* shapes (split each
+   subprotocol element on commas + strip OWS), so the default `websockets`
+   backend authenticates the bearer subprotocol out of the box. The e2e harness
+   therefore runs the server with its **default/shipped ws backend (no `--ws`
+   override)** — the golden-path live-WS leg certifies the real default self-host
+   config, not a workaround.
 2. **Same-origin topology (no proxy).** vite's `preview` proxy does not forward
    the WS subprotocol header either, so rather than proxy, the harness serves the
    built SPA directly from msgd (`MSG_SERVE_SPA` + `MSG_WEB_DIST_DIR`) — the
