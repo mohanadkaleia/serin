@@ -102,13 +102,19 @@ async def can_write(db: AsyncSession, *, ctx: AuthContext, stream_id: str, event
     | ``channel.member_added`` / ``channel.member_removed`` | owner/admin only
       (member-initiated private-channel invites are a deferred product call) |
     | ``dm.created`` | deferred with the DM endpoint (M3); no M1 caller |
+    | ``reaction.added`` / ``reaction.removed`` | any member who can WRITE the
+      target message's stream — and a reaction is a write to the same stream the
+      message lives in (§2.4), so write access == read access, identical to
+      ``message.created`` (ENG-97, M3) |
 
-    ``message.edited`` / ``message.deleted`` / ``reaction.*`` / ``pin.*`` /
-    ``file.uploaded`` are out of ENG-65 scope — ENG-66+ defines their rules; they
-    are not in this matrix and default to not-writable here.
+    ``message.edited`` / ``message.deleted`` / ``pin.*`` / ``file.uploaded`` are
+    out of ENG-65 scope — ENG-66+ defines their rules; they are not in this
+    matrix and default to not-writable here.
     """
-    if event_type == "message.created":
-        # Write access == read access for messages in M1 — reuse the predicate.
+    if event_type in ("message.created", "reaction.added", "reaction.removed"):
+        # Write access == read access for messages AND reactions in M1/M3 — a
+        # reaction is a write to the same stream the target message lives in
+        # (§2.4), so it is gated by the identical readable-streams predicate.
         return await can_read(db, ctx=ctx, stream_id=stream_id)
     if event_type == "channel.created":
         # Any non-guest member may create a channel; guests cannot.

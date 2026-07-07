@@ -51,6 +51,10 @@ class World:
     #: filled in during settle for the permission-isolation invariant.
     adversary_visible: set[str] = field(default_factory=set)
     adversary_private_forbidden: bool = False
+    #: ENG-97 reaction isolation: True once the adversary's attempt to react to a
+    #: private-stream message it cannot read was refused (or vacuously, when the
+    #: private stream had no message to probe).
+    adversary_reaction_forbidden: bool = True
 
     @property
     def shared_streams(self) -> list[str]:

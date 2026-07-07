@@ -9,11 +9,12 @@ SQLite ``project``/``rebuild`` both calling ``_apply_message_created``).
 
 Dispatch mirrors ``reducers.REDUCERS`` and the M0 ``projection._HANDLERS``, but
 is keyed on ``(type, type_version)`` (a version bump is a new, unhandled key —
-D9-skipped, never a silent mis-apply).  In M1 exactly one handler exists:
-``("message.created", 1)``.  Everything else — meta events, unknown types, and
-``message.created`` v>=2 — has no handler and is a **no-op** (D9: skipped in the
-projection, never crashes).  ``bot.*``/reactions/edits/deletes are later
-milestones; their columns exist on ``messages_proj`` but no reducer writes them.
+D9-skipped, never a silent mis-apply).  Handlers exist for ``("message.created",
+1)`` (→ ``messages_proj``) and, since ENG-97 (M3), ``("reaction.added", 1)`` /
+``("reaction.removed", 1)`` (→ the ``reactions_proj`` set).  Everything else —
+meta events, unknown types, and any ``v>=2`` — has no handler and is a **no-op**
+(D9: skipped in the projection, never crashes).  ``bot.*``/edits/deletes are
+later milestones; their ``messages_proj`` columns exist but no reducer writes them.
 """
 
 from __future__ import annotations
@@ -21,11 +22,12 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
+from sqlalchemy import delete
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from msgd.core.payloads import MessageCreatedV1
-from msgd.db.models import MessageProj
+from msgd.core.payloads import MessageCreatedV1, ReactionAddedV1, ReactionRemovedV1
+from msgd.db.models import MessageProj, ReactionProj
 
 __all__ = ["PROJECTION_VERSION", "apply_projection"]
 
@@ -39,7 +41,12 @@ __all__ = ["PROJECTION_VERSION", "apply_projection"]
 #: sides carry: a server version bump is handled by an operator running
 #: ``msgctl rebuild-projections``.  Deferred until a bump actually needs it
 #: (ENG-69 plan Ruling / risk 5).
-PROJECTION_VERSION: Final = 1
+#:
+#: Bumped to 2 by ENG-97 (M3): the reaction handlers + the new ``reactions_proj``
+#: shape are a change to both the projection tables AND the apply logic — the
+#: exact "bump on ANY change to either" trigger above. An operator upgrading to
+#: M3 runs ``msgctl rebuild-projections`` once to materialize ``reactions_proj``.
+PROJECTION_VERSION: Final = 2
 
 _Handler = Callable[..., Awaitable[None]]
 
@@ -84,6 +91,61 @@ async def _apply_message_created(
     )
 
 
+async def _apply_reaction_added(
+    db: AsyncSession, *, body: dict[str, Any], server_sequence: int
+) -> None:
+    """Project one ``reaction.added`` v1 event: idempotent set-insert (§2.4).
+
+    Re-validates the opaque ``payload`` through :class:`ReactionAddedV1`
+    (defence-in-depth) and ``INSERT … ON CONFLICT DO NOTHING`` on the membership
+    key ``(message_id, author_user_id, emoji)``. Already-present membership is a
+    **no-op** — the count (``= |{author_user_id}|`` for a ``(message_id, emoji)``)
+    is unchanged, exactly the §2.4 idempotent-add semantics. A duplicate
+    ``reaction.added`` (same key, different ``event_id``) sequences as its own
+    event but lands zero new rows, so the projected set — hence the aggregated
+    count — is a pure function of the log. ``author_user_id`` comes from the
+    envelope (§2.4 keys the set on it, not the payload). ``emoji`` is bound as an
+    opaque parameter into the ``COLLATE "C"`` byte-exact column.
+    """
+    payload = ReactionAddedV1(**body["payload"])
+    await db.execute(
+        pg_insert(ReactionProj)
+        .values(
+            message_id=payload.message_id,
+            author_user_id=body["author_user_id"],
+            emoji=payload.emoji,
+        )
+        .on_conflict_do_nothing(
+            index_elements=[
+                ReactionProj.message_id,
+                ReactionProj.author_user_id,
+                ReactionProj.emoji,
+            ]
+        )
+    )
+
+
+async def _apply_reaction_removed(
+    db: AsyncSession, *, body: dict[str, Any], server_sequence: int
+) -> None:
+    """Project one ``reaction.removed`` v1 event: idempotent set-delete (§2.4).
+
+    ``DELETE`` the membership key ``(message_id, author_user_id, emoji)``.
+    Removing an absent reaction deletes zero rows — a **no-op**, exactly the §2.4
+    idempotent-remove semantics — so a ``reaction.removed`` for a reaction that
+    was never added (or already removed) sequences as its own event yet leaves the
+    set unchanged. ``emoji`` matches byte-exactly via the column's ``C`` collation.
+    """
+    payload = ReactionRemovedV1(**body["payload"])
+    await db.execute(
+        delete(ReactionProj).where(
+            ReactionProj.message_id == payload.message_id,
+            ReactionProj.author_user_id == body["author_user_id"],
+            ReactionProj.emoji == payload.emoji,
+        )
+    )
+
+
 #: The projection's dispatch table, keyed ``(type, type_version)`` — distinct
 #: from ``core``'s payload-validation registry and from ``reducers.REDUCERS``
 #: (which is ``type``-keyed).  In M1 exactly one handler exists; every other
@@ -91,6 +153,8 @@ async def _apply_message_created(
 #: has no handler and is uniformly skipped (D9).
 _HANDLERS: Final[dict[tuple[str, int], _Handler]] = {
     ("message.created", 1): _apply_message_created,
+    ("reaction.added", 1): _apply_reaction_added,
+    ("reaction.removed", 1): _apply_reaction_removed,
 }
 
 

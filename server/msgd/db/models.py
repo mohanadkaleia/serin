@@ -203,6 +203,45 @@ class MessageProj(Base):
     )
 
 
+class ReactionProj(Base):
+    """Server-side reaction-set projection (ENG-97, M3) — rebuildable.
+
+    Stores the reaction **set** as one row per ``(message_id, author_user_id,
+    emoji)`` membership, from which both the aggregated ``(message_id, emoji) ->
+    count`` and the who-reacted list are pure derivations (``COUNT(*)`` /
+    ``array_agg`` grouped by ``(message_id, emoji)``). Because the projection is
+    exactly the set, ``reaction.added`` is an idempotent set-insert and
+    ``reaction.removed`` an idempotent set-delete (§2.4), so the aggregated counts
+    are a **pure function of the log** and ``rebuild ≡ incremental`` holds by
+    construction (single :func:`~msgd.projections.apply.apply_projection`, one
+    deterministic per-stream replay order — all reaction events for a message are
+    homed in that message's stream, ENG-97 validation).
+
+    **EMOJI IS OPAQUE BYTES (ENG-96 security note).** The ``emoji`` domain is the
+    no-whitelist ``<= 64``-byte Unicode string — it may contain control chars and
+    is NOT assumed to be a clean grapheme. ``emoji`` is declared ``TEXT COLLATE
+    "C"`` so the uniqueness key ``(message_id, author_user_id, emoji)`` compares
+    **byte-exactly**: a deterministic ``C`` collation guarantees two distinct
+    emoji byte sequences never collide (no locale/ICU canonical-equivalence merge)
+    and the identical bytes always dedup. The value is only ever bound as a
+    parameterized column value (never interpolated). NUL (U+0000) cannot reach
+    this table: Postgres text/JSONB rejects it at the ``events`` insert, before
+    the projection runs.
+    """
+
+    __tablename__ = "reactions_proj"
+    __table_args__ = (
+        # The who-reacted / count read path filters + groups by (message_id, emoji);
+        # emoji inherits the column's C collation, so the index is byte-exact too.
+        Index("ix_reactions_proj_message_emoji", "message_id", "emoji"),
+    )
+
+    message_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    author_user_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    #: Opaque bytes — ``COLLATE "C"`` makes the uniqueness key byte-exact.
+    emoji: Mapped[str] = mapped_column(Text(collation="C"), primary_key=True)
+
+
 class ReadState(Base):
     __tablename__ = "read_state"
 

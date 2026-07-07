@@ -165,8 +165,11 @@ async def fetch_stream(db: AsyncSession, stream_id: str) -> Stream | None:
 # ENG-69: messages_proj joins the list — insert_event now materializes a
 # projection row per committed message.created, which would otherwise leak into
 # sibling tests' rolled-back sessions (committed rows are visible across txns).
+# ENG-97: reactions_proj joins for the same reason — insert_event materializes a
+# reaction membership row per committed reaction.added.
 AUTH_TABLES = (
-    "sessions, devices, invites, events, messages_proj, stream_members, streams, users, workspaces"
+    "sessions, devices, invites, events, messages_proj, reactions_proj, "
+    "stream_members, streams, users, workspaces"
 )
 
 

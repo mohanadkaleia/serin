@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from authutil import auth_header
-from eventsutil import Auth, message_body, post_batch, wire_item
+from eventsutil import Auth, message_body, post_batch, reaction_body, wire_item
 from httpx import AsyncClient
 
 #: A §3.2 upload item: ``{body, event_hash}``.
@@ -83,6 +83,39 @@ class SimClient:
         self.outbox.append(item)
         self._last_item = item
         self.intended[body["event_id"]] = stream_id
+
+    def known_message_ids(self, stream_id: str) -> list[str]:
+        """The ``message_id``s this client has PULLED in ``stream_id`` (ascending).
+
+        A reaction can only target a message the client has actually observed —
+        the same constraint the real web client has (you react to a message on
+        screen). Resolved from ``pulled`` (cursor-truth), never from an unacked
+        local send.
+        """
+        return [
+            ev["body"]["payload"]["message_id"]
+            for ev in self.pulled.get(stream_id, [])
+            if ev["body"].get("type") == "message.created"
+        ]
+
+    async def react(
+        self, stream_id: str, message_id: str, emoji: str, *, removed: bool = False
+    ) -> None:
+        """Mint a ``reaction.added``/``reaction.removed`` and enqueue it (§2.4).
+
+        Homed in ``stream_id`` (the message's stream). Rides the same dumb outbox
+        as :meth:`send`: a fresh ``event_id`` minted once, idempotent under retry.
+        Deliberately does NOT touch ``_last_item`` — ``duplicate_send`` must keep
+        replaying the last *message*, not a reaction.
+        """
+        body = reaction_body(
+            auth=self.auth,
+            stream_id=stream_id,
+            message_id=message_id,
+            emoji=emoji,
+            removed=removed,
+        )
+        self.outbox.append(wire_item(body))
 
     async def duplicate_send(self, stream_id: str) -> None:
         """Re-enqueue the last already-sent item (**same** ``event_id``), forcing a
