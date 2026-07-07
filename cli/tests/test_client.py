@@ -156,6 +156,111 @@ def test_get_events_sends_query_params() -> None:
     assert seen == {"stream_id": "s_abc", "after": "7", "limit": "500"}
 
 
+# --- 422 field-error surfacing (ENG-107) ------------------------------------
+
+
+def _raise_422(errors: object) -> str:
+    """Drive a 422 with the given ``errors`` body and return the error message."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            422, json={"detail": "one or more fields are invalid", "errors": errors}
+        )
+
+    with _client(httpx.MockTransport(handler)) as c:
+        with pytest.raises(RemoteError) as exc_info:
+            c.get_sync()
+    return str(exc_info.value)
+
+
+def test_422_surfaces_single_field_error() -> None:
+    msg = _raise_422(
+        [
+            {
+                "loc": ["body", "password"],
+                "msg": "String should have at least 12 characters",
+                "type": "string_too_short",
+            }
+        ]
+    )
+    assert msg == (
+        "HTTP 422 on /v1/sync: one or more fields are invalid "
+        "(password: String should have at least 12 characters)"
+    )
+
+
+def test_422_surfaces_multiple_field_errors_joined() -> None:
+    msg = _raise_422(
+        [
+            {"loc": ["body", "password"], "msg": "too short", "type": "string_too_short"},
+            {
+                "loc": ["body", "email"],
+                "msg": "must be a valid email address",
+                "type": "value_error",
+            },
+        ]
+    )
+    assert "(password: too short; email: must be a valid email address)" in msg
+
+
+def test_422_without_errors_array_unchanged() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "one or more fields are invalid"})
+
+    with _client(httpx.MockTransport(handler)) as c:
+        with pytest.raises(RemoteError) as exc_info:
+            c.get_sync()
+    assert str(exc_info.value) == "HTTP 422 on /v1/sync: one or more fields are invalid"
+
+
+def test_422_malformed_errors_entries_do_not_raise() -> None:
+    # A grab-bag of malformed shapes: non-dict item, missing loc, empty loc,
+    # missing msg, non-list loc. None must raise; usable ones still summarize.
+    msg = _raise_422(
+        [
+            "not-a-dict",
+            {"msg": "no loc here"},
+            {"loc": [], "msg": "empty loc"},
+            {"loc": ["body", "password"]},  # no msg -> skipped
+            {"loc": "not-a-list", "msg": "weird loc"},
+            {"loc": ["body", "workspace_name"], "msg": "usable"},
+        ]
+    )
+    # It formed a valid message and surfaced the usable + best-effort entries.
+    assert msg.startswith("HTTP 422 on /v1/sync: one or more fields are invalid (")
+    assert "workspace_name: usable" in msg
+    assert "?: no loc here" in msg  # missing loc -> "?" field name
+
+
+def test_422_errors_are_capped_and_truncated() -> None:
+    long_msg = "x" * 500
+    msg = _raise_422([{"loc": ["body", f"f{i}"], "msg": long_msg, "type": "t"} for i in range(20)])
+    # At most 5 field errors surfaced (defensive cap).
+    assert msg.count("; ") == 4
+    # Each long msg is truncated (the 500-char blob does not appear verbatim).
+    assert long_msg not in msg
+    assert "…" in msg
+
+
+def test_422_field_errors_never_leak_submitted_value() -> None:
+    # Even if a (non-conforming) server reintroduced input/ctx, the summary reads
+    # only loc + msg, so the submitted secret never reaches the operator message.
+    secret = "hunter2-super-secret"
+    msg = _raise_422(
+        [
+            {
+                "loc": ["body", "password"],
+                "msg": "String should have at least 12 characters",
+                "type": "string_too_short",
+                "input": secret,
+                "ctx": {"min_length": 12},
+            }
+        ]
+    )
+    assert secret not in msg
+    assert "12 characters" in msg
+
+
 # --- security: cleartext-http bearer-token warning --------------------------
 
 

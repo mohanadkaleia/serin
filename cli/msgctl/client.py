@@ -103,11 +103,51 @@ class ProtocolError(RemoteError):
     """
 
 
+#: Defensive caps on the per-field 422 summary so a hostile/buggy server cannot
+#: inflate an error message: surface at most this many field errors, each ``msg``
+#: truncated to this many characters.
+_MAX_FIELD_ERRORS: Final = 5
+_MAX_FIELD_MSG_LEN: Final = 200
+
+
+def _summarize_field_errors(errors: object) -> str:
+    """Compact ``(field: msg; field2: msg2)`` from a problem+json ``errors`` list.
+
+    Consumes the server's sanitized ``errors`` extension member — a list of
+    ``{loc, msg, type}`` items with ``input``/``ctx`` already dropped server-side.
+    Only ``loc`` (last element → field name) and ``msg`` are surfaced; no submitted
+    value is ever read (there is none in the item to begin with). Returns ``""``
+    when there is nothing usable. Never raises — malformed items are skipped.
+    """
+    if not isinstance(errors, list):
+        return ""
+    parts: list[str] = []
+    for err in errors:
+        if len(parts) >= _MAX_FIELD_ERRORS:
+            break
+        if not isinstance(err, dict):
+            continue
+        loc = err.get("loc")
+        field = str(loc[-1]) if isinstance(loc, list) and loc else "?"
+        msg = str(err.get("msg", "")).strip()
+        if not msg:
+            continue
+        if len(msg) > _MAX_FIELD_MSG_LEN:
+            msg = msg[:_MAX_FIELD_MSG_LEN] + "…"
+        parts.append(f"{field}: {msg}")
+    if not parts:
+        return ""
+    return " (" + "; ".join(parts) + ")"
+
+
 def _problem_fields(resp: httpx.Response) -> tuple[str | None, str]:
     """Best-effort ``(type, detail)`` from a problem+json body; never raises.
 
     Falls back to the reason phrase when the body is not JSON. The token is not
-    in the response body, so this is safe to surface.
+    in the response body, so this is safe to surface. When the body carries a
+    validation ``errors`` list (422s), a compact per-field summary is appended to
+    ``detail`` so the operator sees *which* field failed and why (e.g. a too-short
+    password) instead of the generic "one or more fields are invalid".
     """
     try:
         data = resp.json()
@@ -116,7 +156,8 @@ def _problem_fields(resp: httpx.Response) -> tuple[str | None, str]:
     if isinstance(data, dict):
         detail = data.get("detail") or data.get("title") or resp.reason_phrase
         type_ = data.get("type")
-        return (type_ if isinstance(type_, str) else None), str(detail)
+        summary = _summarize_field_errors(data.get("errors"))
+        return (type_ if isinstance(type_, str) else None), f"{detail}{summary}"
     return None, resp.reason_phrase or f"HTTP {resp.status_code}"
 
 
