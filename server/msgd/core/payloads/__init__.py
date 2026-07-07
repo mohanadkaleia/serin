@@ -36,6 +36,7 @@ from msgd.core.payloads.meta import (
     UserProfileUpdatedV1,
     WorkspaceCreatedV1,
     build_channel_created_body,
+    build_channel_member_added_body,
     build_dm_created_body,
     build_user_joined_body,
     build_workspace_created_body,
@@ -69,6 +70,7 @@ __all__ = [
     "build_workspace_created_body",
     "build_user_joined_body",
     "build_channel_created_body",
+    "build_channel_member_added_body",
     "build_dm_created_body",
 ]
 
