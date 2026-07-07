@@ -52,6 +52,13 @@ def get_event_limiters(request: Request) -> tuple[RateLimiter, RateLimiter]:
     return minute, burst
 
 
+def get_file_limiters(request: Request) -> tuple[RateLimiter, RateLimiter]:
+    """Return the (write, download) per-user file limiters (app.state, ENG-116)."""
+    write: RateLimiter = request.app.state.file_limiter_minute
+    download: RateLimiter = request.app.state.file_download_limiter_minute
+    return write, download
+
+
 def get_blob_store(request: Request) -> BlobStore:
     """Return the process-wide content-addressed :class:`BlobStore` (app.state, ENG-116).
 
@@ -192,6 +199,34 @@ async def event_rate_limit(ctx: CurrentAuth, request: Request) -> None:
         result = limiter.check(key)
         if not result.allowed:
             raise problems.rate_limited(result.retry_after)
+
+
+async def file_rate_limit(ctx: CurrentAuth, request: Request) -> None:
+    """File WRITE rate limit (ENG-116): ``file_rate_limit_per_minute`` per user.
+
+    Mounted on the DB-mutating / disk-touching endpoints
+    (``POST /v1/files/initiate`` and ``PUT /v1/files/{file_id}/blob``). Modelled on
+    :func:`event_rate_limit`: it depends on :data:`CurrentAuth` so the bucket is
+    keyed by the authenticated user and the limit runs before any body read. The
+    first exceeded bucket raises 429 ``/problems/rate-limited`` with ``Retry-After``.
+    """
+    write_limiter, _download_limiter = get_file_limiters(request)
+    result = write_limiter.check(f"user:{ctx.user_id}")
+    if not result.allowed:
+        raise problems.rate_limited(result.retry_after)
+
+
+async def file_download_rate_limit(ctx: CurrentAuth, request: Request) -> None:
+    """File DOWNLOAD rate limit (ENG-116): ``file_download_rate_limit_per_minute`` per user.
+
+    A separate, more generous budget than :func:`file_rate_limit` because a client
+    legitimately fetches many attachments to render a channel. Same per-user key +
+    429 ``/problems/rate-limited`` shape.
+    """
+    _write_limiter, download_limiter = get_file_limiters(request)
+    result = download_limiter.check(f"user:{ctx.user_id}")
+    if not result.allowed:
+        raise problems.rate_limited(result.retry_after)
 
 
 def require_role(*roles: str) -> Callable[[AuthContext], Awaitable[AuthContext]]:

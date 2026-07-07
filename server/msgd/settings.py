@@ -74,6 +74,14 @@ class Settings(BaseSettings):
     # fill the disk. The 10 GiB PER-WORKSPACE quota is NOT here: it lives on the
     # ``workspaces.file_quota_bytes`` row (per-workspace, DB-authoritative).
     file_max_size_bytes: int = 52428800  # 50 MiB
+    # Per-user file rate limits (availability, ENG-116 security review). Keyed
+    # ``user:{user_id}`` exactly like the event limiters. Two budgets: the
+    # DB-mutating/disk-touching writes (``initiate`` + ``blob``) share the tighter
+    # ``file_rate_limit_per_minute``; the read-only ``download`` gets the more
+    # generous ``file_download_rate_limit_per_minute`` (a client legitimately
+    # fetches many attachments to render a channel).
+    file_rate_limit_per_minute: int = 60
+    file_download_rate_limit_per_minute: int = 120
 
     # --- First-run defaults (ENG-109) ----------------------------------------
     # Name of the default public channel /v1/setup auto-creates so a fresh

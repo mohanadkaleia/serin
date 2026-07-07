@@ -13,9 +13,10 @@ safe and buys strict wire validation:
   is otherwise arbitrary bytes — quotes, control chars, newlines are all allowed
   here and neutralized only when echoed into the ``Content-Disposition`` header on
   download (never interpolated raw — header-injection guard).
-* ``size_bytes`` is a non-negative int; the per-file cap is enforced in the
-  handler against ``settings.file_max_size_bytes`` (it is config, not a wire
-  constant) AFTER the authz gate, so it is never a stream-existence oracle.
+* ``size_bytes`` is a POSITIVE int (empty files disallowed — see the field note);
+  the per-file cap is enforced in the handler against
+  ``settings.file_max_size_bytes`` (it is config, not a wire constant) AFTER the
+  authz gate, so it is never a stream-existence oracle.
 """
 
 from __future__ import annotations
@@ -46,7 +47,10 @@ class FileInitiateRequest(BaseModel):
     #: Client-declared MIME type — stored, but NEVER echoed as a response type.
     mime_type: str = Field(min_length=1, max_length=MAX_MIME_TYPE_LEN)
     #: Declared content length; the real length is enforced to equal it at upload.
-    size_bytes: int = Field(ge=0)
+    #: Minimum 1 — empty files are disallowed, so a ``size_bytes=0`` initiate can
+    #: never reserve zero quota and let an attacker insert unbounded ``files`` rows
+    #: under distinct fake shas (unbounded-row DoS, ENG-116 security review).
+    size_bytes: int = Field(ge=1)
     #: The stream the file is attached to; authorized as write==read (§2.4).
     stream_id: str = Field(min_length=1)
 

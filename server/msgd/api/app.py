@@ -68,6 +68,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Content-addressed blob store for file attachments (ENG-116, D8). One shared
     # instance rooted under the configured data dir; ``get_blob_store`` reads it.
     app.state.blob_store = LocalDiskBlobStore(root=settings.data_dir / "blobs")
+    # File limiters (ENG-116, per user): a tighter budget for the mutating/disk
+    # writes (initiate + blob) and a more generous one for read-only downloads.
+    app.state.file_limiter_minute = RateLimiter(settings.file_rate_limit_per_minute, 60)
+    app.state.file_download_limiter_minute = RateLimiter(
+        settings.file_download_rate_limit_per_minute, 60
+    )
 
     # RFC 9457 problem+json — the app-wide error convention every router inherits.
     register_problem_handlers(app)

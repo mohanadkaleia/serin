@@ -28,11 +28,13 @@ Invariants this module upholds (each mapped to code below):
 * **Download by id, never by hash (D8):** there is no route that accepts a
   ``sha256``. A caller can only ever fetch bytes through a ``file_id`` it is
   authorized for; content-addressing is a storage detail, not an access key.
-* **No cross-workspace existence oracle:** ``upload_needed`` and every read gate
-  are scoped to the caller's workspace. A workspace initiating a ``sha256`` that a
-  DIFFERENT workspace already stored is told ``upload_needed: true`` and cannot
-  reach the other workspace's bytes. (Global storage-layer dedup still happens
-  transparently when the PUT lands on already-present bytes — safe and invisible.)
+* **No existence oracle — cross-workspace OR cross-stream:** ``upload_needed`` is
+  ``False`` only when a PRESENT copy of the ``sha256`` exists in a stream the caller
+  can READ (held to the same ``can_read`` bar as download, F3). So a member cannot
+  probe ``upload_needed`` to confirm bytes exist in a private channel/DM they are
+  not in, and a different workspace's copy is never revealed either. (Global
+  storage-layer dedup still happens transparently when the PUT lands on
+  already-present bytes — safe and invisible.)
 * **Authz precedes dedup + quota:** the stream write==read gate runs FIRST, so a
   caller learns nothing (not even "this sha exists here") about a stream it cannot
   read.
@@ -50,7 +52,13 @@ from sqlalchemy import func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msgd.api import problems
-from msgd.api.deps import AppSettings, CurrentAuth, get_blob_store
+from msgd.api.deps import (
+    AppSettings,
+    CurrentAuth,
+    file_download_rate_limit,
+    file_rate_limit,
+    get_blob_store,
+)
 from msgd.api.schemas.files import (
     FileBlobResponse,
     FileInitiateRequest,
@@ -59,8 +67,8 @@ from msgd.api.schemas.files import (
 from msgd.blobs.store import BlobHashMismatchError, BlobStore
 from msgd.core import ids
 from msgd.db.engine import get_session
-from msgd.db.models import File, Workspace
-from msgd.events.permissions import can_read, can_write
+from msgd.db.models import File, Stream, Workspace
+from msgd.events.permissions import can_read, can_write, readable_streams_predicate
 
 __all__ = ["router"]
 
@@ -124,7 +132,11 @@ def _content_disposition(name: str) -> str:
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
 
 
-@router.post("/files/initiate", response_model=FileInitiateResponse)
+@router.post(
+    "/files/initiate",
+    response_model=FileInitiateResponse,
+    dependencies=[Depends(file_rate_limit)],
+)
 async def initiate_file(
     req: FileInitiateRequest,
     ctx: CurrentAuth,
@@ -148,11 +160,17 @@ async def initiate_file(
        already reserved here adds ZERO new bytes and is always allowed). Holding the
        lock across read-decide-insert means two racing initiates cannot both slip
        past the cap.
-    4. **Dedup, workspace-scoped, AFTER authz + quota.** If this workspace already
-       has a PRESENT row for this ``sha256``, the new row is created present and
-       ``upload_needed`` is ``False``; otherwise it is created not-present and
-       ``upload_needed`` is ``True``. The decision never consults the global
-       ``BlobStore.exists`` — that would reveal another workspace holds those bytes.
+    4. **Dedup, scoped to READABLE streams, AFTER authz + quota.** ``upload_needed``
+       is ``False`` only when this workspace already has a PRESENT row for this
+       ``sha256`` **whose stream the caller can read** — so a member cannot probe
+       ``upload_needed`` to learn that specific bytes exist in a private channel/DM
+       they are not in (F3: the dedup answer is held to the SAME ``can_read`` bar as
+       the download gate). When present-but-only-in-an-unreadable-stream, the answer
+       is ``upload_needed: true`` and the copy is re-uploaded (the content-addressed
+       store dedups it on disk anyway — no extra disk, no leak). The decision never
+       consults the global ``BlobStore.exists`` (no cross-workspace oracle either),
+       and the dedup-present row's ``size_bytes`` is COPIED from the already-present
+       row (never the client's claim), keeping every present row's size truthful.
     """
     # 1. Authz FIRST — write(file.uploaded) == read(stream). Uniform 404.
     if not await can_write(db, ctx=ctx, stream_id=req.stream_id, event_type="file.uploaded"):
@@ -170,18 +188,27 @@ async def initiate_file(
         )
     ).scalar_one()
 
-    # Workspace-scoped dedup facts (both indexed by ix_files_workspace_id_sha256):
-    #   * present_exists → the bytes are already downloadable in THIS workspace, so
-    #     the new row is born present (no upload needed);
-    #   * any_exists → this sha is already reserved here (present OR pending), so
-    #     adding another row for it consumes ZERO additional quota.
-    present_exists = await db.scalar(
-        select(literal(1))
+    # Dedup facts (both indexed by ix_files_workspace_id_sha256):
+    #   * present_row_size → the TRUE size of an already-present copy of this sha in
+    #     a stream the caller CAN READ. Its presence is the ONLY thing that flips
+    #     upload_needed to false, and its size is what the new row copies — both held
+    #     to the download gate's can_read bar (F3, no cross-stream existence oracle).
+    #     The join + readable_streams_predicate reuse the ONE shared access check.
+    #   * any_exists → this sha is already reserved anywhere in the workspace
+    #     (present or pending, readable or not). This is disk reality, NOT client-
+    #     observable, and only governs whether the reservation adds bytes to quota.
+    readable = readable_streams_predicate(
+        user_id=ctx.user_id, role=ctx.role, workspace_id=ctx.workspace_id
+    )
+    present_row_size = await db.scalar(
+        select(File.size_bytes)
         .select_from(File)
+        .join(Stream, Stream.stream_id == File.stream_id)
         .where(
             File.workspace_id == ctx.workspace_id,
             File.sha256 == req.sha256,
             File.present.is_(True),
+            readable,
         )
         .limit(1)
     )
@@ -192,12 +219,17 @@ async def initiate_file(
         .limit(1)
     )
 
-    # Only a genuinely NEW sha adds bytes. Usage = SUM of size over DISTINCT sha in
-    # the workspace; a re-used sha (present or a pending initiate) reserves nothing
-    # more. Counting pending (not-yet-present) rows too is deliberately CONSERVATIVE
-    # — it makes the FOR UPDATE lock actually bite (a second racing initiate sees
-    # the first's just-inserted reservation) and blocks a many-pending-initiates
-    # quota-bypass. See the PR body's quota-model note.
+    # Only a genuinely NEW sha adds bytes. Usage = SUM over DISTINCT sha in the
+    # workspace (present OR pending); a re-used sha reserves nothing more.
+    #
+    # NOTE (F1, deliberate): counting PENDING (not-yet-uploaded) reservations is a
+    # conservative DISK guard — it reserves the declared bytes at initiate time so a
+    # burst of initiates cannot over-commit disk before their PUTs land. Its flip
+    # side is that ABANDONED reservations (initiate, never PUT) keep consuming quota
+    # until reclaimed. The MVP has no blob GC (D8), so there is no sweep yet; the
+    # per-user file rate limit (ENG-116) caps the exploitation RATE, and a
+    # pending-reservation TTL/sweep is the permanent fix.
+    # TODO(ENG-follow-up): pending-reservation GC to reclaim abandoned initiates.
     if any_exists is None:
         distinct_by_sha = (
             select(func.max(File.size_bytes).label("sz"))
@@ -210,8 +242,11 @@ async def initiate_file(
         if current_usage + req.size_bytes > workspace.file_quota_bytes:
             raise problems.quota_exceeded()
 
-    # 4. Insert the row. Present iff the bytes are already present in THIS workspace.
-    present = present_exists is not None
+    # 4. Insert the row. Present iff the bytes are already present in a stream the
+    #    caller can read; its size is COPIED from that present row (never trusted
+    #    from the client — a re-initiate cannot inflate a known sha's stored size).
+    present = present_row_size is not None
+    size_bytes = present_row_size if present_row_size is not None else req.size_bytes
     file_id = ids.new_file_id()
     db.add(
         File(
@@ -220,7 +255,7 @@ async def initiate_file(
             sha256=req.sha256,
             name=req.name,
             mime_type=req.mime_type,
-            size_bytes=req.size_bytes,
+            size_bytes=size_bytes,
             uploaded_by=ctx.user_id,
             stream_id=req.stream_id,
             present=present,
@@ -233,7 +268,11 @@ async def initiate_file(
     return FileInitiateResponse(file_id=file_id, upload_needed=not present)
 
 
-@router.put("/files/{file_id}/blob", response_model=FileBlobResponse)
+@router.put(
+    "/files/{file_id}/blob",
+    response_model=FileBlobResponse,
+    dependencies=[Depends(file_rate_limit)],
+)
 async def upload_blob(
     file_id: str,
     request: Request,
@@ -313,7 +352,7 @@ async def upload_blob(
     return FileBlobResponse(file_id=file.file_id, present=True)
 
 
-@router.get("/files/{file_id}")
+@router.get("/files/{file_id}", dependencies=[Depends(file_download_rate_limit)])
 async def download_file(
     file_id: str,
     ctx: CurrentAuth,

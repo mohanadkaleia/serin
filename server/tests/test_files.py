@@ -49,7 +49,7 @@ from authutil import (
     make_client,
     truncate_auth_tables,
 )
-from eventsutil import bootstrap_channel
+from eventsutil import bootstrap_channel, lifecycle_body, post_batch, wire_item
 from httpx import AsyncClient, Response
 from msgd.auth.sessions import utcnow
 from msgd.auth.tokens import hash_token
@@ -190,6 +190,32 @@ async def _seed_workspace(db: Any, *, name: str) -> dict[str, str]:
         "token": raw_token,
         "public_stream": public_id,
     }
+
+
+async def _join_workspace(
+    client: AsyncClient, owner: dict[str, Any], *, email: str, role: str = "member"
+) -> dict[str, Any]:
+    """Invite + accept a second same-workspace user; return their auth dict."""
+    invite = await create_invite(client, owner["token"], role=role)
+    assert invite.status_code == 201, invite.text
+    accepted = await accept_invite(client, join_token(invite.json()["url"]), email=email)
+    assert accepted.status_code == 200, accepted.text
+    body: dict[str, Any] = accepted.json()
+    return body
+
+
+async def _add_channel_member(
+    client: AsyncClient, owner: dict[str, Any], *, channel_stream_id: str, user_id: str
+) -> None:
+    """Owner adds ``user_id`` to a channel via a ``channel.member_added`` event."""
+    body = lifecycle_body(
+        auth=owner,
+        home_stream_id=channel_stream_id,
+        type="channel.member_added",
+        payload={"channel_stream_id": channel_stream_id, "user_id": user_id},
+    )
+    resp = await post_batch(client, owner["token"], [wire_item(body)])
+    assert resp.status_code == 200 and len(resp.json()["accepted"]) == 1, resp.text
 
 
 # --- happy path --------------------------------------------------------------
@@ -671,3 +697,192 @@ async def test_endpoints_require_auth(client: AsyncClient) -> None:
     assert put.status_code == 401
     get = await client.get(f"/v1/files/{ids.new_file_id()}")
     assert get.status_code == 401
+
+
+# --- review round: integrity, availability, oracle hardening -----------------
+
+
+async def test_dedup_present_ignores_inflated_client_size(
+    client: AsyncClient, db_session: Any
+) -> None:
+    """Re-initiating a known sha with an inflated size stores the TRUE size, not the claim.
+
+    Fix 1: the dedup-present branch must COPY the already-present row's size rather
+    than trust the client — otherwise a member could over-count workspace usage and
+    grief others toward quota_exceeded, and the "size_bytes is truthful" guarantee
+    would be false.
+    """
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    data = b"x" * 100  # a real 100-byte blob
+    sha = _sha(data)
+    await _upload(client, owner["token"], stream_id=channel, data=data)
+
+    # Re-initiate the SAME sha declaring a 50 MiB size (a lie).
+    inflated = await _initiate(
+        client, owner["token"], sha256=sha, stream_id=channel, size_bytes=52428800
+    )
+    assert inflated.status_code == 200, inflated.text
+    assert inflated.json()["upload_needed"] is False  # deduped
+    new_file_id = inflated.json()["file_id"]
+
+    # The stored size is the TRUE 100 bytes, not the inflated claim.
+    stored_size = await db_session.scalar(
+        select(File.size_bytes).where(File.file_id == new_file_id)
+    )
+    assert stored_size == 100
+
+    # Workspace usage did not jump: distinct-sha usage is still 100, so a second
+    # distinct file just under the (default huge) quota is unaffected — assert the
+    # concrete stored sizes are all the true value.
+    all_sizes = (
+        (
+            await db_session.execute(
+                select(File.size_bytes).where(
+                    File.workspace_id == owner["workspace_id"], File.sha256 == sha
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert set(all_sizes) == {100}  # every row for this sha carries the true size
+
+
+async def test_size_zero_rejected(client: AsyncClient, db_session: Any) -> None:
+    """Fix 4: size_bytes=0 is a 422 (empty files disallowed — unbounded-row DoS guard)."""
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    resp = await _initiate(
+        client, owner["token"], sha256=_sha(b""), stream_id=channel, size_bytes=0
+    )
+    assert resp.status_code == 422  # request validation (ge=1)
+
+
+async def test_write_rate_limit_trips(settings: Settings, db_session: Any) -> None:
+    """Fix 2: the per-user write limiter trips on the 2nd initiate when the budget is 1."""
+    capped = settings.model_copy(update={"file_rate_limit_per_minute": 1})
+    app = make_app(capped, db_session)
+    async with make_client(app) as client:
+        owner = await do_setup(client)
+        channel = await bootstrap_channel(client, db_session, owner)
+
+        first = await _initiate(
+            client, owner["token"], sha256=_sha(b"rl-1" * 8), stream_id=channel, size_bytes=32
+        )
+        assert first.status_code == 200, first.text
+        second = await _initiate(
+            client, owner["token"], sha256=_sha(b"rl-2" * 8), stream_id=channel, size_bytes=32
+        )
+        assert second.status_code == 429
+        assert second.json()["type"] == "/problems/rate-limited"
+        assert int(second.headers["retry-after"]) > 0
+
+
+async def test_download_rate_limit_is_separate_budget(settings: Settings, db_session: Any) -> None:
+    """Downloads have their OWN limiter, distinct from writes, and it trips on its budget."""
+    # Generous write budget (so initiate + PUT succeed) but a tiny download budget.
+    capped = settings.model_copy(
+        update={"file_rate_limit_per_minute": 60, "file_download_rate_limit_per_minute": 2}
+    )
+    app = make_app(capped, db_session)
+    async with make_client(app) as client:
+        owner = await do_setup(client)
+        channel = await bootstrap_channel(client, db_session, owner)
+        data = b"separate-budget unique-RL" * 3
+        file_id = await _upload(client, owner["token"], stream_id=channel, data=data)
+
+        # The 2/min download budget allows two reads; the third trips 429 — proving
+        # downloads are gated by a limiter separate from the (untouched) write budget.
+        assert (await _download(client, owner["token"], file_id)).status_code == 200
+        assert (await _download(client, owner["token"], file_id)).status_code == 200
+        third = await _download(client, owner["token"], file_id)
+        assert third.status_code == 429
+        assert third.json()["type"] == "/problems/rate-limited"
+
+
+async def test_within_workspace_cross_stream_no_oracle(
+    client: AsyncClient, db_session: Any
+) -> None:
+    """Fix 5 (F3): a sha present ONLY in an unreadable stream → upload_needed=true.
+
+    A member who holds a file's bytes must not be able to confirm those bytes exist
+    in a private channel they are not in by reading ``upload_needed:false``.
+    """
+    owner = await do_setup(client)
+    private = await bootstrap_channel(client, db_session, owner, visibility="private")
+    data = b"cross-stream-secret unique-L" * 3
+    sha = _sha(data)
+    owner_file_id = await _upload(client, owner["token"], stream_id=private, data=data)
+
+    # A second member NOT in the private channel, with their own readable channel.
+    member = await _join_workspace(client, owner, email="cross-stream@example.com")
+    member_channel = await bootstrap_channel(client, db_session, member, name="member-chan")
+
+    # The member initiates the SAME sha into a stream THEY can read. The only present
+    # copy lives in the private channel they cannot read → they must still upload.
+    init = await _initiate(
+        client, member["token"], sha256=sha, stream_id=member_channel, size_bytes=len(data)
+    )
+    assert init.status_code == 200, init.text
+    assert init.json()["upload_needed"] is True  # no cross-stream existence leak
+
+    # And they still cannot download the owner's private file by its id.
+    resp = await _download(client, member["token"], owner_file_id)
+    assert resp.status_code == 404
+
+
+async def test_exactly_at_cap_initiate_and_put_succeed(settings: Settings, db_session: Any) -> None:
+    """Edge: a file exactly AT the per-file cap initiates, uploads, and downloads."""
+    cap = 2048
+    capped = settings.model_copy(update={"file_max_size_bytes": cap})
+    app = make_app(capped, db_session)
+    async with make_client(app) as client:
+        owner = await do_setup(client)
+        channel = await bootstrap_channel(client, db_session, owner)
+        data = b"C" * cap  # exactly at the cap
+        sha = _sha(data)
+
+        init = await _initiate(
+            client, owner["token"], sha256=sha, stream_id=channel, size_bytes=cap
+        )
+        assert init.status_code == 200, init.text  # == cap is allowed (only > cap fails)
+        file_id = init.json()["file_id"]
+        put = await _put_blob(client, owner["token"], file_id, data)
+        assert put.status_code == 200, put.text  # streamed exactly to the cap, not over
+
+        resp = await _download(client, owner["token"], file_id)
+        assert resp.status_code == 200
+        assert resp.content == data
+
+
+async def test_guest_member_can_use_files_and_is_isolated(
+    client: AsyncClient, db_session: Any
+) -> None:
+    """A guest can round-trip a file in a channel they're an explicit member of; 404 otherwise."""
+    owner = await do_setup(client)
+    allowed = await bootstrap_channel(client, db_session, owner, visibility="private", name="allow")
+    denied = await bootstrap_channel(client, db_session, owner, visibility="private", name="deny")
+
+    guest = await _join_workspace(client, owner, email="guest@example.com", role="guest")
+    await _add_channel_member(client, owner, channel_stream_id=allowed, user_id=guest["user_id"])
+
+    # In the channel they were added to: full round-trip works.
+    data = b"guest-allowed unique-G2" * 3
+    file_id = await _upload(client, guest["token"], stream_id=allowed, data=data)
+    got = await _download(client, guest["token"], file_id)
+    assert got.status_code == 200 and got.content == data
+
+    # A channel they are NOT a member of: initiate → uniform 404 (authz first).
+    denied_init = await _initiate(
+        client, guest["token"], sha256=_sha(b"nope unique-G3"), stream_id=denied, size_bytes=14
+    )
+    assert denied_init.status_code == 404
+    assert denied_init.json()["type"] == "/problems/not-found"
+
+    # A file living in that channel: the guest cannot download it by id either.
+    owner_file = await _upload(
+        client, owner["token"], stream_id=denied, data=b"owner-only unique-G4" * 3
+    )
+    denied_dl = await _download(client, guest["token"], owner_file)
+    assert denied_dl.status_code == 404
