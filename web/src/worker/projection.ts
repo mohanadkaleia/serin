@@ -248,14 +248,21 @@ export async function recomputeThreadRoot(db: MsgDb, rootMessageId: string): Pro
   )
   const root = await db.getMessage(rootMessageId)
   if (root !== undefined) {
-    const replyCount = replies.length
-    const updated: MessageRow = { ...root, reply_count: replyCount }
-    if (replies.length > 0) {
-      updated.last_reply_seq = Math.max(...replies.map((r) => r.created_seq))
-    } else {
-      delete updated.last_reply_seq
+    // Only STAMP the counter when the message actually is a thread root: it has
+    // replies now, OR it already carries a `reply_count` (so a decrement to 0 after
+    // a reply delete still writes). A plain (never-a-root) message is left with an
+    // absent `reply_count` (⇒ 0 in the dump) — this is what makes an unconditional
+    // recompute-self on EVERY message.created cheap AND non-shape-changing, while
+    // still converging (0 stored vs absent both dump 0).
+    if (replies.length > 0 || root.reply_count !== undefined) {
+      const updated: MessageRow = { ...root, reply_count: replies.length }
+      if (replies.length > 0) {
+        updated.last_reply_seq = Math.max(...replies.map((r) => r.created_seq))
+      } else {
+        delete updated.last_reply_seq
+      }
+      await db.putMessages([updated])
     }
-    await db.putMessages([updated])
   }
   // Rebuild the participant set for this root from the current non-deleted replies.
   await db.deleteThreadParticipantsForRoot(rootMessageId)
@@ -268,21 +275,54 @@ export async function recomputeThreadRoot(db: MsgDb, rootMessageId: string): Pro
 }
 
 /**
+ * Reconcile a just-created message with edit/delete events for it that arrived
+ * EARLIER (ENG-100 out-of-order fix). The client does NOT receive events in
+ * server order: cold-start pulls the newest window first, then backfills older
+ * pages (sync.ts §7/§10, both call the projection seam). So a recent edit/delete
+ * of an OLD message — or a recent reply to an OLD root — is applied BEFORE its
+ * target's `message.created`, where it is a no-op (no row yet). When the target
+ * finally backfills, we replay its already-cached `message.edited`/`message.deleted`
+ * events (ascending seq) onto the fresh row. LWW + terminal-delete make the replay
+ * idempotent and order-independent, so incremental (any delivery order) ≡ the
+ * in-order rebuild. Reactions need no replay (membership is keyed by message_id,
+ * independent of the row); replies are handled by the recompute-self below.
+ */
+async function replayCachedMutations(
+  db: MsgDb,
+  streamId: string,
+  messageId: string,
+): Promise<void> {
+  const events = await db.getEventsForStream(streamId) // ascending server_sequence
+  for (const event of events) {
+    const body = event.envelope?.body
+    if (body === undefined) continue
+    if (strField(body.payload, 'message_id') !== messageId) continue
+    if (event.type === 'message.edited' && body.type_version === 1) {
+      await applyMessageEdited(db, event, body)
+    } else if (event.type === 'message.deleted' && body.type_version === 1) {
+      await applyMessageDeleted(db, body)
+    }
+  }
+}
+
+/**
  * `message.created` v1 apply (via the monkeypatchable {@link HANDLERS} registry,
  * so the ENG-61 teeth pattern still bites). Builds the row, then:
  *   • upserts it UNLESS an already-MUTATED row exists (edited or deleted) — the
  *     client analogue of the server `ON CONFLICT DO NOTHING`: a duplicate delivery
  *     must not clobber a later edit/delete. A pending optimistic row is never
  *     mutated, so it still settles in place (created_seq: sentinel → server_seq);
- *   • if it is a REPLY, recomputes its ROOT's thread state (the reply must land
- *     first so it is included in the count) — mirroring `_apply_message_created`.
+ *   • REPLAYS any of this message's edit/delete events already cached (they arrived
+ *     BEFORE this create under the client's newest-window-then-backfill delivery —
+ *     see {@link replayCachedMutations}); and
+ *   • RECOMPUTES this message AS A ROOT (recompute-self) so a reply that arrived
+ *     before its root is picked up when the root finally backfills, AND — if this
+ *     message is itself a reply — recomputes its ROOT.
  *
- * Like the server, a NON-reply message gets no thread recompute: a valid reply is
- * always in the same stream as its root (cross-stream/reply-of-reply are server-
- * rejected — the client only sees valid replies), so the root's `message.created`
- * always applies before its replies' and no "reply before root" recompute is
- * needed. `reply_count`/`last_reply_seq` therefore exist only on a root that has
- * received a reply (absent ⇒ 0 in the dump).
+ * Unlike the server (which applies in strict server order and needs no reconcile),
+ * the client receives events OUT OF ORDER, so the recompute-self + replay make
+ * every cross-message reference (reply/edit/delete) order-independent: incremental
+ * under ANY delivery order ≡ the in-order rebuild.
  */
 async function applyMessageCreated(db: MsgDb, event: EventRow, body: EventBody): Promise<void> {
   const handler = HANDLERS['message.created@1']
@@ -291,7 +331,16 @@ async function applyMessageCreated(db: MsgDb, event: EventRow, body: EventBody):
   const existing = await db.getMessage(row.message_id)
   const mutated =
     existing !== undefined && (existing.deleted === true || existing.edited_seq !== undefined)
-  if (!mutated) await db.putMessages([row])
+  if (!mutated) {
+    await db.putMessages([row])
+    // Out-of-order reconcile: fold in edits/deletes for this message that landed
+    // before its create (a recent edit/delete of an OLD message, backfilled create).
+    await replayCachedMutations(db, row.stream_id, row.message_id)
+  }
+  // recompute-self: a reply that arrived before this (now-backfilled) root is
+  // counted once the root exists. Cheap + order-independent.
+  await recomputeThreadRoot(db, row.message_id)
+  // If this message is itself a reply, (re)compute its root too.
   if (row.thread_root_id !== undefined) await recomputeThreadRoot(db, row.thread_root_id)
 }
 

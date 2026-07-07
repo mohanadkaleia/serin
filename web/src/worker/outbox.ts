@@ -391,7 +391,25 @@ export class Outbox {
     await this.db.putEvents([eventRow])
     await applyEventsToProjection(this.db, row.stream_id, [eventRow])
     await this.db.deleteOutbox(row.event_id)
+    // De-flicker (ENG-100 nit): settling a `message.created` re-writes the base
+    // message row, which can transiently clobber a STILL-PENDING edit/delete overlay
+    // on the same message (e.g. an optimistic edit sent before its create acked, then
+    // the create settles earlier in the same drain). Re-derive the remaining overlay
+    // for this message so the pending effect is restored WITHIN the settle, removing
+    // the sub-drain flicker. Idempotent; a no-op when no other overlay targets it.
+    await this.reapplyOverlaysFor(row.message_id)
     this.publishStream(row.stream_id)
+  }
+
+  /** Re-apply the still-pending outbox overlays targeting `messageId` (created_at order). */
+  private async reapplyOverlaysFor(messageId: string): Promise<void> {
+    const remaining = (await this.db.listOutbox())
+      .filter((o) => o.message_id === messageId)
+      .sort((a, b) => a.created_at - b.created_at)
+    for (const o of remaining) {
+      if (await this.db.hasEvent(o.event_id)) continue // already settled
+      await applyPendingOutboxRow(this.db, o)
+    }
   }
 
   /**

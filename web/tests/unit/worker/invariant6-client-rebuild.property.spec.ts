@@ -465,15 +465,46 @@ function materialize(draw: { events: EventChoice[]; outbox: OutboxChoice[] }): H
 }
 
 /**
- * Reproduce the INCREMENTAL state: settled events applied per stream via the real
- * apply, THEN the outbox overlay applied (created_at order) exactly as the live
- * send path would — the settled base first, the pending overlay on top.
+ * Split a stream's ascending events into contiguous WINDOWS of size `w` delivered
+ * NEWEST-FIRST — the real client shape (cold-start pulls the newest page, then
+ * `sync.backfill` walks older pages backward, each calling the projection seam).
+ * Each window is applied ascending (in-order within a page) but the newest window
+ * lands before the older backfill pages, so a recent reply/edit/delete of an OLD
+ * message is applied BEFORE its target's backfilled `message.created`.
  */
-async function buildIncremental(db: MsgDb, h: History): Promise<void> {
+function windowsNewestFirst(events: readonly EventRow[], w: number): EventRow[][] {
+  const asc = [...events].sort((a, b) => a.server_sequence - b.server_sequence)
+  const chunks: EventRow[][] = []
+  for (let i = 0; i < asc.length; i += w) chunks.push(asc.slice(i, i + w))
+  return chunks.reverse() // newest window first, then older backfill pages
+}
+
+/**
+ * Reproduce the INCREMENTAL state. `order`:
+ *   • 'sorted'   — one ascending batch per stream (the in-order live/catch-up path);
+ *   • 'windowed' — newest-window-first-then-backfill (the REAL cold-start + backfill
+ *     ordering, exercising out-of-order cross-message references).
+ * Then the outbox overlay is applied on top (created_at order), settled base first.
+ */
+async function buildIncremental(
+  db: MsgDb,
+  h: History,
+  order: 'sorted' | 'windowed' = 'sorted',
+): Promise<void> {
   for (const [streamId, events] of h.byStream) {
     if (events.length === 0) continue
-    await db.putEvents(events)
-    await applyEventsToProjection(db, streamId, events)
+    if (order === 'sorted') {
+      await db.putEvents(events)
+      await applyEventsToProjection(db, streamId, events)
+    } else {
+      // Persist each window to the `events` cache BEFORE applying it, so the
+      // out-of-order reconcile (which scans the cache) sees earlier-delivered
+      // edits/deletes exactly as the real backfill path leaves them.
+      for (const window of windowsNewestFirst(events, 3)) {
+        await db.putEvents(window)
+        await applyEventsToProjection(db, streamId, window)
+      }
+    }
   }
   if (h.outbox.length > 0) await db.putOutbox(h.outbox)
   const ordered = [...h.outbox].sort((a, b) => a.created_at - b.created_at)
@@ -567,6 +598,94 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
       }),
       { numRuns: 20 },
     )
+  })
+
+  // ------------------------------------------------------------------------
+  // Property 2b — REALISTIC OUT-OF-ORDER DELIVERY. The client does NOT receive
+  // events in server order: cold-start pulls the newest window first, then
+  // backfills older pages (sync.ts §7/§10). This gate applies each stream's events
+  // NEWEST-WINDOW-FIRST-THEN-BACKFILL and asserts the resulting projection STILL
+  // equals the in-order rebuild — the permanent protection against a divergence
+  // that appears only under the real ordering (a recent reply/edit/delete of an old
+  // message applied before its backfilled create). Both MemoryDb + real DexieDb.
+  // ------------------------------------------------------------------------
+  it('windowed (newest-first + backfill) delivery still equals the in-order rebuild', async () => {
+    await fc.assert(
+      fc.asyncProperty(historyArb, fc.boolean(), async (draw, useDexie) => {
+        const db: MsgDb = useDexie ? await openDb(fakeIdbOptions()) : new MemoryDb()
+        const h = materialize(draw)
+        await buildIncremental(db, h, 'windowed') // OUT-OF-ORDER delivery
+        const outOfOrder = await dumpProjection(db)
+
+        await db.clearDerivedTables()
+        await rebuildProjections(db) // in-order replay of the cached events
+        const rebuilt = await dumpProjection(db)
+
+        // Out-of-order incremental converges to the same projection as the
+        // in-order rebuild — the whole point of the recompute-self + replay fix.
+        expect(rebuilt).toBe(outOfOrder)
+        await db.close()
+      }),
+      { numRuns: 120 },
+    )
+  })
+
+  // ------------------------------------------------------------------------
+  // Property 2c — DETERMINISTIC out-of-order TEETH. Proves the windowed gate above
+  // has real teeth for the reply-before-root class: a reply is delivered BEFORE its
+  // root; recompute-self on the root's (backfilled) create is what makes reply_count
+  // converge. Defeating it (listRepliesByRoot → [] during the out-of-order pass, so
+  // the root's create cannot find its already-applied reply) makes the out-of-order
+  // projection diverge from the in-order rebuild → RED. The clean pass is GREEN.
+  // ------------------------------------------------------------------------
+  it('TEETH: reply-before-root without a working recompute-self → out-of-order gate RED', async () => {
+    // Root at the OLDEST seq (backfilled last), its reply at a NEWER seq (window 1).
+    const events: EventRow[] = [
+      messageCreatedEvent({ streamId: 's_0', seq: 1, messageId: 'm_root', text: 'root' }),
+      messageCreatedEvent({
+        streamId: 's_0',
+        seq: 2,
+        messageId: 'm_r1',
+        text: 'reply',
+        threadRootId: 'm_root',
+        authorUserId: 'u_a',
+      }),
+    ]
+    // Deliver newest-first: [reply(seq2)] then [root(seq1)] → reply-before-root.
+    const deliver = async (db: MsgDb, defeatRecomputeSelf: boolean): Promise<string> => {
+      for (const window of [[events[1]!], [events[0]!]]) {
+        await db.putEvents(window)
+        if (defeatRecomputeSelf) {
+          const real = db.listRepliesByRoot.bind(db)
+          db.listRepliesByRoot = (): Promise<MessageRow[]> => Promise.resolve([])
+          await applyEventsToProjection(db, 's_0', window)
+          db.listRepliesByRoot = real
+        } else {
+          await applyEventsToProjection(db, 's_0', window)
+        }
+      }
+      return dumpProjection(db)
+    }
+
+    // The in-order rebuild truth: reply_count = 1 on m_root.
+    const truthDb = new MemoryDb()
+    await truthDb.putEvents(events)
+    await applyEventsToProjection(truthDb, 's_0', events)
+    const inOrder = await dumpProjection(truthDb)
+    expect(inOrder).toContain('"reply_count":1')
+    await truthDb.close()
+
+    // Positive control: clean windowed delivery converges to the in-order truth.
+    const cleanDb = new MemoryDb()
+    expect(await deliver(cleanDb, false)).toBe(inOrder)
+    await cleanDb.close()
+
+    // TOOTH: defeat recompute-self on the out-of-order pass → reply_count stays 0.
+    const toothDb = new MemoryDb()
+    const skewed = await deliver(toothDb, true)
+    expect(skewed).not.toBe(inOrder) // reply-before-root did NOT converge → RED
+    expect(skewed).toContain('"reply_count":0')
+    await toothDb.close()
   })
 
   // ------------------------------------------------------------------------
