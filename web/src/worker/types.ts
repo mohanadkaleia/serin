@@ -26,7 +26,12 @@ import type { ApiError } from './http'
 // the server (its `PROJECTION_VERSION` is 4 after ENG-97/98/99), a shape/handler
 // change bumps this so shape-skew clients drop + rebuild the derived tables from
 // the raw `events` cache (+ re-derive pending overlay from `outbox`) on boot.
-export const PROJECTION_VERSION = 3
+// ENG-100 bumped 3 → 4 (out-of-order fix): the `reactions` row shape changed from
+// a bare membership to seq-aware LWW (`last_event_seq` + `present`, keeping
+// tombstone rows) so reactions converge under the client's out-of-order
+// (cold-window + backfill) delivery. A row-shape change → drop + rebuild reactions
+// from `events` on boot (no Dexie index change — the new fields are unindexed).
+export const PROJECTION_VERSION = 4
 
 /** `meta` key under which the current `PROJECTION_VERSION` is stored. */
 export const META_PROJECTION_VERSION = 'projection_version'
@@ -186,18 +191,29 @@ export interface MessageRow {
 }
 
 /**
- * Reaction membership row (ENG-100, M3) — the client mirror of the server
- * `reactions_proj` SET. One row per `(message_id, author_user_id, emoji)`; the
- * presence of the row IS the reaction. Counts / who-reacted are DERIVED from the
- * set at read/dump time, never stored. `author_user_id` is the reactor (from the
- * event envelope, not the payload). `emoji` is treated as OPAQUE bytes — an
- * exact-match key, no grapheme normalization (the emoji domain allows control
- * chars). Derived table: dropped + rebuilt from `events` on a version bump.
+ * Reaction row (ENG-100, M3) — the client mirror of the server `reactions_proj`,
+ * made SEQ-AWARE (LWW) so it converges under the client's OUT-OF-ORDER delivery
+ * (cold-window + backfill; a lower-seq event can arrive after a higher-seq one).
+ *
+ * One row per key `(message_id, author_user_id, emoji)`, carrying the LAST-event
+ * `server_sequence` and its disposition `present` (add ⇒ true, remove ⇒ false —
+ * a TOMBSTONE row, kept so a late LOWER-seq add cannot resurrect a removed
+ * reaction). A reaction is OBSERVABLE iff its highest-seq event is an add
+ * (`present === true`); counts / who-reacted / the dump derive from `present`
+ * rows only. This "present iff highest-seq event is add" is order-independent, so
+ * client rebuild ≡ incremental under any delivery order AND matches the server's
+ * in-order final state. `author_user_id` is the reactor (envelope, not payload);
+ * `emoji` is OPAQUE bytes — an exact-match key, no grapheme normalization.
+ * Derived table: dropped + rebuilt from `events` on a version bump.
  */
 export interface ReactionRow {
   message_id: string
   author_user_id: string
   emoji: string
+  /** `server_sequence` of the highest-seq reaction event applied for this key (LWW stamp). */
+  last_event_seq: number
+  /** Disposition of that event: `true` = added (observable), `false` = removed (tombstone). */
+  present: boolean
 }
 
 /**
@@ -332,14 +348,20 @@ export interface MsgDb {
   putMessages(rows: readonly MessageRow[]): Promise<void>
   /** Remove a projected message by id (outbox.delete of an unsettled row). */
   deleteMessage(messageId: string): Promise<void>
-  // -- ENG-100 reactions (derived set; mirror of `reactions_proj`) ----------
-  /** Idempotent set-insert of reaction memberships (exact-byte emoji key). */
+  // -- ENG-100 reactions (seq-aware LWW; mirror of `reactions_proj`) ---------
+  /** Upsert reaction rows by their `(message_id, author_user_id, emoji)` key. */
   putReactions(rows: readonly ReactionRow[]): Promise<void>
-  /** Delete one reaction membership (idempotent — absent membership is a no-op). */
-  deleteReaction(messageId: string, authorUserId: string, emoji: string): Promise<void>
-  /** All reaction memberships for a message (counts / who-reacted / dump). */
+  /** The single reaction row for a key (the LWW seq/disposition), or undefined. */
+  getReaction(
+    messageId: string,
+    authorUserId: string,
+    emoji: string,
+  ): Promise<ReactionRow | undefined>
+  /** The OBSERVABLE (`present === true`) reactions for a message (counts / who-reacted). */
   getReactionsForMessage(messageId: string): Promise<ReactionRow[]>
-  /** Every reaction membership — the reactions dump source (sorted in JS). */
+  /** Delete every reaction row (present + tombstone) for a message (revert wipe). */
+  deleteReactionsForMessage(messageId: string): Promise<void>
+  /** Every reaction row incl. tombstones — the dump source (dump filters `present`). */
   getAllReactions(): Promise<ReactionRow[]>
   // -- ENG-100 thread participants (derived set; recompute-from-state) -------
   /** Replace a root's participant set (delete-all-then-insert recompute). */

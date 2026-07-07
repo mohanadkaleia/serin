@@ -535,10 +535,15 @@ describe('M3 optimistic react/edit/delete: overlay renders instantly then settle
       message_id: mId,
       emoji: '👍',
     })
-    // Overlay: membership present before any ack.
-    expect(await db.getReactionsForMessage(mId)).toEqual([
-      { message_id: mId, author_user_id: 'u_me', emoji: '👍' },
-    ])
+    // Overlay: membership present (observable) before any ack.
+    const before = await db.getReactionsForMessage(mId)
+    expect(before).toHaveLength(1)
+    expect(before[0]).toMatchObject({
+      message_id: mId,
+      author_user_id: 'u_me',
+      emoji: '👍',
+      present: true,
+    })
 
     server.resumeBatch()
     await untilAsync(async () => (await db.getOutbox(res.event_id)) === undefined)

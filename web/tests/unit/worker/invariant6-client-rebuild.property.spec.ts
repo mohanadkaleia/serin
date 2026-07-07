@@ -114,7 +114,10 @@ async function dumpProjection(db: MsgDb): Promise<string> {
     }),
   )
 
-  const reactions = await db.getAllReactions()
+  // OBSERVABLE reactions only: `present` keys (a tombstone `present:false` is a
+  // removed reaction, not shown). The present set is order-independent (present iff
+  // highest-seq event is an add), so this stays byte-stable across delivery orders.
+  const reactions = (await db.getAllReactions()).filter((r) => r.present)
   reactions.sort(compareReaction)
   const reactionLines = reactions.map((r) =>
     JSON.stringify({ message_id: r.message_id, emoji: r.emoji, author_user_id: r.author_user_id }),
@@ -540,10 +543,12 @@ async function rebuildMaybeSkewed(db: MsgDb): Promise<void> {
       real(rows.map((r) => ({ ...r, deleted: false })))
     restore.push(() => (db.putMessages = real))
   } else if (MUTATION === 'inv6-reaction-skew') {
-    // Rebuild ignores reaction removes (blind add): deleteReaction is a no-op.
-    const real = db.deleteReaction.bind(db)
-    db.deleteReaction = (): Promise<void> => Promise.resolve()
-    restore.push(() => (db.deleteReaction = real))
+    // Rebuild ignores reaction REMOVES (drops the tombstone write), so a removed
+    // reaction wrongly stays present — the out-of-order LWW divergence class.
+    const real = db.putReactions.bind(db)
+    db.putReactions = (rows: readonly ReactionRow[]): Promise<void> =>
+      real(rows.filter((r) => r.present))
+    restore.push(() => (db.putReactions = real))
   }
   try {
     await rebuildProjections(db)
@@ -626,7 +631,7 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
         expect(rebuilt).toBe(outOfOrder)
         await db.close()
       }),
-      { numRuns: 120 },
+      { numRuns: 300 },
     )
   })
 
@@ -685,6 +690,115 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
     const skewed = await deliver(toothDb, true)
     expect(skewed).not.toBe(inOrder) // reply-before-root did NOT converge → RED
     expect(skewed).toContain('"reply_count":0')
+    await toothDb.close()
+  })
+
+  // ------------------------------------------------------------------------
+  // Property 2d — DETERMINISTIC reaction-out-of-order TEETH. A reaction removed@lo
+  // then added@hi delivered NEWEST-FIRST (add applied before the lower-seq remove).
+  // With seq-aware LWW the lower-seq remove is skipped → present (== in-order). The
+  // OLD bare-membership behaviour (last-APPLIED wins) is modelled by defeating the
+  // LWW lookup (getReaction → undefined) so the lower-seq remove wrongly wins →
+  // ABSENT → diverges from the in-order rebuild → RED.
+  // ------------------------------------------------------------------------
+  it('TEETH: reaction removed@lo + added@hi without seq-aware LWW → out-of-order gate RED', async () => {
+    // In-order truth: added@4 is the highest-seq event → the reaction is PRESENT.
+    const events: EventRow[] = [
+      messageCreatedEvent({ streamId: 's_0', seq: 1, messageId: 'm_1', text: 'hi' }),
+      reactionRemovedEvent({
+        streamId: 's_0',
+        seq: 3,
+        messageId: 'm_1',
+        emoji: '👍',
+        authorUserId: 'u_a',
+      }),
+      reactionAddedEvent({
+        streamId: 's_0',
+        seq: 4,
+        messageId: 'm_1',
+        emoji: '👍',
+        authorUserId: 'u_a',
+      }),
+    ]
+    const truth = new MemoryDb()
+    await truth.putEvents(events)
+    await applyEventsToProjection(truth, 's_0', events)
+    const inOrder = await dumpProjection(truth)
+    expect(inOrder).toContain('👍') // present (highest-seq event is the add)
+    await truth.close()
+
+    // Deliver NEWEST-FIRST: [added@4] then [removed@3, create@1] (add before remove).
+    const deliver = async (db: MsgDb, defeatLww: boolean): Promise<string> => {
+      for (const window of [[events[2]!], [events[1]!, events[0]!]]) {
+        await db.putEvents(window)
+        if (defeatLww) {
+          const real = db.getReaction.bind(db)
+          db.getReaction = (): Promise<undefined> => Promise.resolve(undefined) // no LWW guard
+          await applyEventsToProjection(db, 's_0', window)
+          db.getReaction = real
+        } else {
+          await applyEventsToProjection(db, 's_0', window)
+        }
+      }
+      return dumpProjection(db)
+    }
+
+    // Positive control: seq-aware LWW converges to the in-order truth (👍 present).
+    const cleanDb = new MemoryDb()
+    expect(await deliver(cleanDb, false)).toBe(inOrder)
+    await cleanDb.close()
+
+    // TOOTH: bare last-applied-wins → the lower-seq remove wins → 👍 wrongly ABSENT.
+    const toothDb = new MemoryDb()
+    const skewed = await deliver(toothDb, true)
+    expect(skewed).not.toBe(inOrder) // reaction did NOT converge → RED
+    expect(skewed).not.toContain('👍')
+    await toothDb.close()
+  })
+
+  // ------------------------------------------------------------------------
+  // Property 2e — DETERMINISTIC edit-before-create TEETH (matches the thread tooth
+  // for the replayCachedMutations path). A recent edit of an OLD message: the edit
+  // (window 1) lands before its backfilled create (window 2). With replayCachedMutations
+  // the create folds in the cached edit → edited text (== in-order). Defeating the
+  // cache scan (getEventsForStream → []) loses the edit → original text → RED.
+  // ------------------------------------------------------------------------
+  it('TEETH: edit-before-create without replayCachedMutations → out-of-order gate RED', async () => {
+    const events: EventRow[] = [
+      messageCreatedEvent({ streamId: 's_0', seq: 1, messageId: 'm_1', text: 'original' }),
+      messageEditedEvent({ streamId: 's_0', seq: 2, messageId: 'm_1', text: 'EDITED' }),
+    ]
+    const truth = new MemoryDb()
+    await truth.putEvents(events)
+    await applyEventsToProjection(truth, 's_0', events)
+    const inOrder = await dumpProjection(truth)
+    expect(inOrder).toContain('EDITED')
+    await truth.close()
+
+    // Deliver NEWEST-FIRST: [edit@2] then [create@1] — edit before backfilled create.
+    const deliver = async (db: MsgDb, defeatReplay: boolean): Promise<string> => {
+      for (const window of [[events[1]!], [events[0]!]]) {
+        await db.putEvents(window)
+        if (defeatReplay) {
+          const real = db.getEventsForStream.bind(db)
+          db.getEventsForStream = (): Promise<EventRow[]> => Promise.resolve([]) // no cache scan
+          await applyEventsToProjection(db, 's_0', window)
+          db.getEventsForStream = real
+        } else {
+          await applyEventsToProjection(db, 's_0', window)
+        }
+      }
+      return dumpProjection(db)
+    }
+
+    const cleanDb = new MemoryDb()
+    expect(await deliver(cleanDb, false)).toBe(inOrder) // replay folds in the edit
+    await cleanDb.close()
+
+    const toothDb = new MemoryDb()
+    const skewed = await deliver(toothDb, true)
+    expect(skewed).not.toBe(inOrder) // edit lost → original text → RED
+    expect(skewed).toContain('original')
     await toothDb.close()
   })
 
@@ -764,15 +878,17 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
     expect(await dumpProjection(clean)).toBe(incremental)
     await clean.close()
 
-    // TOOTH 1 — rebuild IGNORES reaction removes (blind add): deleteReaction no-op.
+    // TOOTH 1 — rebuild IGNORES reaction removes (drops the tombstone write), so
+    // the removed 👍 wrongly stays present.
     const t1 = new MemoryDb()
     await build(t1)
     await t1.clearDerivedTables()
-    const realDelReaction = t1.deleteReaction.bind(t1)
-    t1.deleteReaction = (): Promise<void> => Promise.resolve()
+    const realPutReactions = t1.putReactions.bind(t1)
+    t1.putReactions = (rows: readonly ReactionRow[]): Promise<void> =>
+      realPutReactions(rows.filter((r) => r.present))
     await rebuildProjections(t1)
-    t1.deleteReaction = realDelReaction
-    expect(await dumpProjection(t1)).not.toBe(incremental) // stale 👍 membership survives
+    t1.putReactions = realPutReactions
+    expect(await dumpProjection(t1)).not.toBe(incremental) // stale 👍 survives
     await t1.close()
 
     // TOOTH 2 — rebuild SKIPS the delete tombstone: strip `deleted` on write.

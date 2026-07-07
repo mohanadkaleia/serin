@@ -101,6 +101,52 @@ describe.each([
     await db.close()
   })
 
+  it('is seq-aware LWW: present iff the HIGHEST-seq event is an add (out-of-order safe)', async () => {
+    const db = await make()
+    await apply(db, [messageCreatedEvent({ streamId: S, seq: 1, messageId: 'm_1', text: 'hi' })])
+    // Apply removed@3 THEN added@4 out of order (added first) — the client backfill
+    // shape. LWW keeps the highest-seq disposition (add@4) → PRESENT either order.
+    await apply(db, [
+      reactionAddedEvent({
+        streamId: S,
+        seq: 4,
+        messageId: 'm_1',
+        emoji: '👍',
+        authorUserId: 'u_a',
+      }),
+    ])
+    await apply(db, [
+      reactionRemovedEvent({
+        streamId: S,
+        seq: 3,
+        messageId: 'm_1',
+        emoji: '👍',
+        authorUserId: 'u_a',
+      }),
+    ])
+    // The lower-seq remove@3 must NOT win over the higher-seq add@4.
+    expect(await db.getReactionsForMessage('m_1')).toHaveLength(1)
+    const raw = (await db.getAllReactions()).find((r) => r.emoji === '👍')
+    expect(raw?.present).toBe(true)
+    expect(raw?.last_event_seq).toBe(4)
+
+    // A NEWER remove@6 wins → tombstone (not observable) but kept so a late add can't lose.
+    await apply(db, [
+      reactionRemovedEvent({
+        streamId: S,
+        seq: 6,
+        messageId: 'm_1',
+        emoji: '👍',
+        authorUserId: 'u_a',
+      }),
+    ])
+    expect(await db.getReactionsForMessage('m_1')).toEqual([])
+    const tomb = (await db.getAllReactions()).find((r) => r.emoji === '👍')
+    expect(tomb?.present).toBe(false) // tombstone retained
+    expect(tomb?.last_event_seq).toBe(6)
+    await db.close()
+  })
+
   it('treats emoji as opaque exact-byte bytes (control chars distinct)', async () => {
     const db = await make()
     await apply(db, [

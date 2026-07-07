@@ -165,12 +165,21 @@ export class DexieDb implements MsgDb {
     await this.db.reactions.bulkPut([...rows])
   }
 
-  async deleteReaction(messageId: string, authorUserId: string, emoji: string): Promise<void> {
-    await this.db.reactions.delete([messageId, authorUserId, emoji])
+  async getReaction(
+    messageId: string,
+    authorUserId: string,
+    emoji: string,
+  ): Promise<ReactionRow | undefined> {
+    return this.db.reactions.get([messageId, authorUserId, emoji])
   }
 
   async getReactionsForMessage(messageId: string): Promise<ReactionRow[]> {
-    return this.db.reactions.where('message_id').equals(messageId).toArray()
+    const rows = await this.db.reactions.where('message_id').equals(messageId).toArray()
+    return rows.filter((r) => r.present) // observable = present only
+  }
+
+  async deleteReactionsForMessage(messageId: string): Promise<void> {
+    await this.db.reactions.where('message_id').equals(messageId).delete()
   }
 
   async getAllReactions(): Promise<ReactionRow[]> {
@@ -450,15 +459,27 @@ export class MemoryDb implements MsgDb {
     return Promise.resolve()
   }
 
-  deleteReaction(messageId: string, authorUserId: string, emoji: string): Promise<void> {
-    this.reactionsMap.delete(MemoryDb.reactionKey(messageId, authorUserId, emoji))
-    return Promise.resolve()
+  getReaction(
+    messageId: string,
+    authorUserId: string,
+    emoji: string,
+  ): Promise<ReactionRow | undefined> {
+    return Promise.resolve(
+      this.reactionsMap.get(MemoryDb.reactionKey(messageId, authorUserId, emoji)),
+    )
   }
 
   getReactionsForMessage(messageId: string): Promise<ReactionRow[]> {
     return Promise.resolve(
-      [...this.reactionsMap.values()].filter((r) => r.message_id === messageId),
+      [...this.reactionsMap.values()].filter((r) => r.message_id === messageId && r.present),
     )
+  }
+
+  deleteReactionsForMessage(messageId: string): Promise<void> {
+    for (const [key, r] of this.reactionsMap) {
+      if (r.message_id === messageId) this.reactionsMap.delete(key)
+    }
+    return Promise.resolve()
   }
 
   getAllReactions(): Promise<ReactionRow[]> {

@@ -33,8 +33,7 @@ import {
   applyMessageCreatedV1,
   applyMessageDeleted,
   applyPendingEdit,
-  applyReactionAdded,
-  applyReactionRemoved,
+  applyPendingReaction,
   recomputeThreadRoot,
 } from './projection'
 import type { TimerId } from './sync'
@@ -479,8 +478,8 @@ export function buildPendingMessageRow(row: OutboxRow): MessageRow | null {
  * Apply ONE outbox row's optimistic PENDING OVERLAY (ENG-100 generalization of
  * ENG-81's `buildPendingMessageRow`). Dispatched on the event `type`:
  *   • `message.created`  → the pending/failed `MessageRow` echo (renders instantly);
- *   • `reaction.added/removed` → the membership set-insert/-delete (IDENTICAL to the
- *     settled handler — a reaction has no seq/LWW, so settle is a pure no-op);
+ *   • `reaction.added/removed` → force the `present` disposition, LEAVING the stored
+ *     `last_event_seq` so the settled reaction's real seq wins the LWW on settle;
  *   • `message.edited`   → force `text`/`format` (leaving `edited_seq` so the settled
  *     edit's real seq wins the LWW cleanly on settle);
  *   • `message.deleted`  → tombstone + redact + delete-aware thread recompute.
@@ -499,10 +498,10 @@ export async function applyPendingOutboxRow(db: MsgDb, row: OutboxRow): Promise<
       return
     }
     case 'reaction.added':
-      await applyReactionAdded(db, body)
+      await applyPendingReaction(db, body, true)
       return
     case 'reaction.removed':
-      await applyReactionRemoved(db, body)
+      await applyPendingReaction(db, body, false)
       return
     case 'message.edited':
       await applyPendingEdit(db, body)
@@ -549,9 +548,7 @@ export async function recomputeMessageProjection(
   const old = await db.getMessage(messageId)
   // Wipe the target's derived state (row + its reactions).
   await db.deleteMessage(messageId)
-  for (const r of await db.getReactionsForMessage(messageId)) {
-    await db.deleteReaction(r.message_id, r.author_user_id, r.emoji)
-  }
+  await db.deleteReactionsForMessage(messageId)
   // Replay the settled events that reference this message, in server order.
   const events = await db.getEventsForStream(streamId)
   const relevant = events.filter((e) => {

@@ -123,32 +123,76 @@ function strField(payload: unknown, key: string): string | undefined {
 }
 
 /**
- * `reaction.added` v1 — idempotent set-insert of the membership
- * `(message_id, author_user_id, emoji)` (mirrors `_apply_reaction_added`). The
- * reactor is the ENVELOPE `author_user_id` (not the payload); `emoji` is an
- * exact-byte key (opaque — no grapheme normalization). Already-present membership
- * is a no-op, so the derived count is a pure function of the log.
+ * Seq-aware LWW core for a reaction event (ENG-100 out-of-order fix). For the key
+ * `(message_id, author_user_id, emoji)`, apply the event ONLY if its
+ * `server_sequence` OUT-RANKS the stored last-event seq — `seq > last_event_seq`
+ * (or no row yet) — then stamp `{ last_event_seq: seq, present }`. A `remove`
+ * writes a TOMBSTONE (`present:false`) rather than deleting the row, so a later
+ * LOWER-seq add cannot resurrect it. This mirrors the edit LWW and makes a
+ * reaction "present iff its highest-seq event is an add" — order-independent, so
+ * client rebuild ≡ incremental under any (out-of-order) delivery.
  */
-export async function applyReactionAdded(db: MsgDb, body: EventBody): Promise<void> {
+async function applyReactionLww(
+  db: MsgDb,
+  body: EventBody,
+  seq: number,
+  present: boolean,
+): Promise<void> {
   const messageId = strField(body.payload, 'message_id')
   const emoji = strField(body.payload, 'emoji')
   const author = typeof body.author_user_id === 'string' ? body.author_user_id : ''
   if (messageId === undefined || emoji === undefined || author === '') return // D9 skip
-  await db.putReactions([{ message_id: messageId, author_user_id: author, emoji }])
+  const existing = await db.getReaction(messageId, author, emoji)
+  if (existing !== undefined && seq <= existing.last_event_seq) return // LWW: older/equal → skip
+  await db.putReactions([
+    { message_id: messageId, author_user_id: author, emoji, last_event_seq: seq, present },
+  ])
+}
+
+/** `reaction.added` v1 — seq-aware LWW add (mirrors `_apply_reaction_added` + out-of-order safety). */
+export async function applyReactionAdded(
+  db: MsgDb,
+  event: EventRow,
+  body: EventBody,
+): Promise<void> {
+  await applyReactionLww(db, body, event.server_sequence, true)
+}
+
+/** `reaction.removed` v1 — seq-aware LWW remove (writes a tombstone, never a bare delete). */
+export async function applyReactionRemoved(
+  db: MsgDb,
+  event: EventRow,
+  body: EventBody,
+): Promise<void> {
+  await applyReactionLww(db, body, event.server_sequence, false)
 }
 
 /**
- * `reaction.removed` v1 — idempotent set-delete of the membership (mirrors
- * `_apply_reaction_removed`). Removing an absent reaction deletes nothing. Exported
- * so the optimistic outbox overlay applies the SAME effect (a pending reaction is
- * identical to its eventual settled one — no seq/LWW — so settle is a no-op).
+ * OPTIMISTIC (pending-overlay) reaction (ENG-100). Like the pending EDIT, this has
+ * NO `server_sequence`: it force-sets `present` (renders instantly) but LEAVES the
+ * stored `last_event_seq` untouched (0 for a fresh key), so the eventual settled
+ * reaction event's real seq wins the LWW cleanly on settle and stamps the real seq.
+ * Applied identically on the incremental send path AND the rebuild-step-2 overlay.
  */
-export async function applyReactionRemoved(db: MsgDb, body: EventBody): Promise<void> {
+export async function applyPendingReaction(
+  db: MsgDb,
+  body: EventBody,
+  present: boolean,
+): Promise<void> {
   const messageId = strField(body.payload, 'message_id')
   const emoji = strField(body.payload, 'emoji')
   const author = typeof body.author_user_id === 'string' ? body.author_user_id : ''
-  if (messageId === undefined || emoji === undefined || author === '') return // D9 skip
-  await db.deleteReaction(messageId, author, emoji)
+  if (messageId === undefined || emoji === undefined || author === '') return
+  const existing = await db.getReaction(messageId, author, emoji)
+  await db.putReactions([
+    {
+      message_id: messageId,
+      author_user_id: author,
+      emoji,
+      last_event_seq: existing?.last_event_seq ?? 0,
+      present,
+    },
+  ])
 }
 
 /**
@@ -284,8 +328,10 @@ export async function recomputeThreadRoot(db: MsgDb, rootMessageId: string): Pro
  * finally backfills, we replay its already-cached `message.edited`/`message.deleted`
  * events (ascending seq) onto the fresh row. LWW + terminal-delete make the replay
  * idempotent and order-independent, so incremental (any delivery order) ≡ the
- * in-order rebuild. Reactions need no replay (membership is keyed by message_id,
- * independent of the row); replies are handled by the recompute-self below.
+ * in-order rebuild. Reactions need no replay here: they are keyed on
+ * `(message_id, author, emoji)` INDEPENDENT of the message row and are themselves
+ * seq-aware LWW (see {@link applyReactionLww}), so they converge out-of-order on
+ * their own; replies are handled by the recompute-self on the root's create.
  */
 async function replayCachedMutations(
   db: MsgDb,
@@ -374,10 +420,10 @@ export async function applyEventsToProjection(
         await applyMessageCreated(db, event, body)
         break
       case 'reaction.added@1':
-        await applyReactionAdded(db, body)
+        await applyReactionAdded(db, event, body)
         break
       case 'reaction.removed@1':
-        await applyReactionRemoved(db, body)
+        await applyReactionRemoved(db, event, body)
         break
       case 'message.edited@1':
         await applyMessageEdited(db, event, body)
