@@ -196,14 +196,18 @@ jobs:
         working-directory: web
         run: pnpm build
 
-  # ENG-83 Playwright golden path (TDD §12 smoke): login → send → reload →
-  # history intact → a SECOND browser context sees the message live (real WS
-  # fanout). Drives the REAL production stack — a real msgd server (Postgres
-  # testcontainer + subprocess uvicorn) serving the built SPA + /v1 + /v1/ws from
-  # one origin. Its OWN job because it is heavier (browsers + a live server +
-  # Docker) than the unit signal; keeping it separate preserves fast red/green on
-  # the unit + python jobs. Needs BOTH toolchains: uv (msgd/msgctl/testcontainers)
-  # and Node/pnpm (build + Playwright).
+  # Playwright golden paths (TDD §12/§13): the ENG-83 smoke (login → send → reload
+  # → history intact → a SECOND browser sees the message live via WS fanout) AND
+  # the ENG-105 messaging-core golden path (react → edit → delete → thread reply →
+  # @mention → create channel → start DM, with a second browser seeing message +
+  # reaction + thread reply live). `pnpm e2e` runs every tests/e2e/*.spec.ts, so
+  # both are covered by this one job. Drives the REAL production stack — a real
+  # msgd server (Postgres testcontainer + subprocess uvicorn) serving the built SPA
+  # + /v1 + /v1/ws from one origin, on uvicorn's DEFAULT ws backend (ENG-92). Its
+  # OWN job because it is heavier (browsers + a live server + Docker) than the unit
+  # signal; keeping it separate preserves fast red/green on the unit + python jobs.
+  # Needs BOTH toolchains: uv (msgd/msgctl/testcontainers) and Node/pnpm (build +
+  # Playwright).
   e2e:
     name: e2e · golden path (§12 smoke)
     runs-on: ubuntu-latest
@@ -253,9 +257,10 @@ jobs:
         working-directory: web
         run: pnpm exec playwright install --with-deps chromium
 
-      # global-setup builds the SPA + boots the real server harness; the spec runs
-      # the golden path. CI=true is set by GitHub Actions automatically.
-      - name: Golden path
+      # global-setup builds the SPA + boots the real server harness (owner +
+      # #general + an invited second member); the specs run the ENG-83 smoke + the
+      # ENG-105 messaging-core golden path. CI=true is set by GitHub Actions.
+      - name: Golden paths (smoke + messaging core)
         working-directory: web
         run: pnpm e2e
 
