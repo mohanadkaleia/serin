@@ -129,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     login_parser.add_argument("dir", help="workspace directory (created if absent)")
     login_parser.add_argument(
-        "--server-url", default=None, help="server base URL (e.g. http://localhost:8000)"
+        "--server-url", default=None, help="server base URL (e.g. http://localhost:8080)"
     )
     login_parser.add_argument(
         "--setup", action="store_true", help="first-run: create workspace+owner"
