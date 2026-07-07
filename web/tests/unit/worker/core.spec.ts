@@ -221,7 +221,12 @@ describe.each([
     // outbox is a different table with no handle in evictStream — untouched
     expect(await db.count('outbox')).toBe(2)
     await db.close()
-  }, 30000)
+    // Generous timeout: this DexieDb variant bulk-loads MAX+500 events into
+    // fake-indexeddb then evicts — an O(n) fake-IDB workload that is fast on real
+    // IndexedDB but slow and highly variable under CI load (it spikes past a 30s
+    // cap intermittently). 120s removes the flake without masking a regression
+    // (a real eviction bug fails the assertions, not the clock).
+  }, 120000)
 
   it('is a no-op below the cap', async () => {
     const db = new MemoryDb()
