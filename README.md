@@ -75,9 +75,11 @@ The server binds to **`127.0.0.1:8080`** (loopback only, deliberately — Docker
 uv sync
 uv run msgctl login ./acme --setup \
   --server-url http://localhost:8080 \
-  --email owner@example.com --password '…' \
+  --email owner@example.com --password 'correct-horse-battery-staple' \
   --workspace-name Acme --display-name Owner
 ```
+
+Passwords must be **at least 12 characters** (that demo passphrase clears the bar). For real use, omit `--password` to be prompted, or set `MSGCTL_PASSWORD` — either keeps the secret out of your shell history and the process list.
 
 **3. Open the web client** at **http://localhost:8080** and log in as `owner@example.com`. You land in `#general`; send a message — it renders **optimistically** the instant you hit send and settles once the server sequences it. Reads are instant (served from the local projection, not a round-trip). Press <kbd>Cmd</kbd>/<kbd>Ctrl</kbd>+<kbd>K</kbd> to fuzzy-jump between channels.
 
@@ -101,11 +103,13 @@ Open that **join URL** in another browser (or an incognito window) — it loads 
 ```bash
 uv run msgctl login ./bob --invite-token <token-from-the-join-url> \
   --server-url http://localhost:8080 \
-  --email bob@example.com --password '…' --display-name Bob
+  --email bob@example.com --password 'correct-horse-battery-staple' --display-name Bob
 uv run msgctl send ./bob --stream general --text "hi, owner"
 uv run msgctl push ./bob      # upload queued events to the server
 uv run msgctl pull ./bob      # mirror the server's streams locally
 ```
+
+Passwords must be **12+ characters**. Omit `--password` to be prompted, or set `MSGCTL_PASSWORD`, to keep it out of your shell history.
 
 **Offline / local** — no server. A workspace is just a folder (`workspace.json` + `streams/<stream_id>/<YYYY-MM>.ndjson`, the same tree the M4 export format uses):
 
