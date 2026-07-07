@@ -20,7 +20,18 @@ import type { ApiError } from './http'
 // ENG-81 bumped 1 → 2: `MessageRow` gained the `state`/`error_code` lifecycle
 // fields and rebuild now re-derives pending rows from `outbox`, so shape-change
 // clients rebuild the derived tables on boot.
-export const PROJECTION_VERSION = 2
+// ENG-100 bumped 2 → 3 (M3 client projections): `MessageRow` gained the
+// `edited_seq` / `deleted` / `reply_count` / `last_reply_seq` columns, and the
+// derived set gained the `reactions` + `thread_participants` tables. Mirroring
+// the server (its `PROJECTION_VERSION` is 4 after ENG-97/98/99), a shape/handler
+// change bumps this so shape-skew clients drop + rebuild the derived tables from
+// the raw `events` cache (+ re-derive pending overlay from `outbox`) on boot.
+// ENG-100 bumped 3 → 4 (out-of-order fix): the `reactions` row shape changed from
+// a bare membership to seq-aware LWW (`last_event_seq` + `present`, keeping
+// tombstone rows) so reactions converge under the client's out-of-order
+// (cold-window + backfill) delivery. A row-shape change → drop + rebuild reactions
+// from `events` on boot (no Dexie index change — the new fields are unindexed).
+export const PROJECTION_VERSION = 4
 
 /** `meta` key under which the current `PROJECTION_VERSION` is stored. */
 export const META_PROJECTION_VERSION = 'projection_version'
@@ -141,6 +152,33 @@ export interface MessageRow {
   thread_root_id?: string
   mention_user_ids: string[]
   /**
+   * LWW edit stamp (ENG-100, M3). ABSENT = never edited. When present it is the
+   * `server_sequence` of the winning `message.edited` event; a later edit applies
+   * only if its `server_sequence > coalesce(edited_seq, created_seq)` AND the row
+   * is not `deleted` (mirrors the server LWW guard). Unlike the server — which
+   * drops `format` — the CLIENT also updates `text`/`format` on edit (§ the payload
+   * carries format), so client + server converge on text/edited_seq and the client
+   * additionally tracks format.
+   */
+  edited_seq?: number
+  /**
+   * Tombstone flag (ENG-100, M3). `true` once a `message.deleted` for this message
+   * is applied. Terminal: a later `message.edited` (any order) is guarded off, so
+   * it never un-deletes. On delete the projected `text` is REDACTED to `''` (the
+   * client must not store or render deleted content); the raw event survives in the
+   * `events` cache (event-sourcing reality — that is the ENG-111 redaction follow-up).
+   */
+  deleted?: boolean
+  /**
+   * Thread reply counter (ENG-100, M3) — only meaningful on a thread ROOT. The
+   * count of NON-DELETED, SETTLED replies whose `thread_root_id` is this message.
+   * RECOMPUTED-from-state (delete-aware) on every reply create/delete, so it is a
+   * pure function of the `messages` table and rebuild ≡ incremental holds.
+   */
+  reply_count?: number
+  /** Max `created_seq` among this root's non-deleted settled replies (null when none). */
+  last_reply_seq?: number
+  /**
    * Optimistic-send lifecycle marker (ENG-81). ABSENT = settled/normal (the
    * steady state). `'pending'` = local send not yet acked (`created_seq` is the
    * `created_at` sentinel, greyed/provisional tab-side). `'failed'` = the server
@@ -150,6 +188,44 @@ export interface MessageRow {
   state?: 'pending' | 'failed'
   /** Rejection code (ENG-66) when `state === 'failed'`. */
   error_code?: string
+}
+
+/**
+ * Reaction row (ENG-100, M3) — the client mirror of the server `reactions_proj`,
+ * made SEQ-AWARE (LWW) so it converges under the client's OUT-OF-ORDER delivery
+ * (cold-window + backfill; a lower-seq event can arrive after a higher-seq one).
+ *
+ * One row per key `(message_id, author_user_id, emoji)`, carrying the LAST-event
+ * `server_sequence` and its disposition `present` (add ⇒ true, remove ⇒ false —
+ * a TOMBSTONE row, kept so a late LOWER-seq add cannot resurrect a removed
+ * reaction). A reaction is OBSERVABLE iff its highest-seq event is an add
+ * (`present === true`); counts / who-reacted / the dump derive from `present`
+ * rows only. This "present iff highest-seq event is add" is order-independent, so
+ * client rebuild ≡ incremental under any delivery order AND matches the server's
+ * in-order final state. `author_user_id` is the reactor (envelope, not payload);
+ * `emoji` is OPAQUE bytes — an exact-match key, no grapheme normalization.
+ * Derived table: dropped + rebuilt from `events` on a version bump.
+ */
+export interface ReactionRow {
+  message_id: string
+  author_user_id: string
+  emoji: string
+  /** `server_sequence` of the highest-seq reaction event applied for this key (LWW stamp). */
+  last_event_seq: number
+  /** Disposition of that event: `true` = added (observable), `false` = removed (tombstone). */
+  present: boolean
+}
+
+/**
+ * Thread-participant row (ENG-100, M3) — the client mirror of the server
+ * `thread_participants_proj` SET. One row per `(root_message_id, user_id)`, the
+ * DISTINCT authors of a root's non-deleted settled replies. Fully RECOMPUTED for
+ * a root whenever its reply set changes (delete-aware), so it is a pure function
+ * of the `messages` table. Derived table.
+ */
+export interface ThreadParticipantRow {
+  root_message_id: string
+  user_id: string
 }
 
 /** Projected stream row (derived). */
@@ -207,12 +283,27 @@ export interface MetaRow {
   value: unknown
 }
 
-/** The seven tables of the §5.2 schema. */
+/** The tables of the §5.2 schema (+ ENG-100's `reactions` / `thread_participants`). */
 export type TableName =
-  'events' | 'messages' | 'streams' | 'cursors' | 'outbox' | 'read_state' | 'meta'
+  | 'events'
+  | 'messages'
+  | 'reactions'
+  | 'thread_participants'
+  | 'streams'
+  | 'cursors'
+  | 'outbox'
+  | 'read_state'
+  | 'meta'
 
 /** Derived tables — safe to drop + rebuild from `events` + server pulls. */
-export const DERIVED_TABLES = ['messages', 'streams', 'cursors', 'read_state'] as const
+export const DERIVED_TABLES = [
+  'messages',
+  'reactions',
+  'thread_participants',
+  'streams',
+  'cursors',
+  'read_state',
+] as const
 export type DerivedTable = (typeof DERIVED_TABLES)[number]
 
 // ---------------------------------------------------------------------------
@@ -257,6 +348,30 @@ export interface MsgDb {
   putMessages(rows: readonly MessageRow[]): Promise<void>
   /** Remove a projected message by id (outbox.delete of an unsettled row). */
   deleteMessage(messageId: string): Promise<void>
+  // -- ENG-100 reactions (seq-aware LWW; mirror of `reactions_proj`) ---------
+  /** Upsert reaction rows by their `(message_id, author_user_id, emoji)` key. */
+  putReactions(rows: readonly ReactionRow[]): Promise<void>
+  /** The single reaction row for a key (the LWW seq/disposition), or undefined. */
+  getReaction(
+    messageId: string,
+    authorUserId: string,
+    emoji: string,
+  ): Promise<ReactionRow | undefined>
+  /** The OBSERVABLE (`present === true`) reactions for a message (counts / who-reacted). */
+  getReactionsForMessage(messageId: string): Promise<ReactionRow[]>
+  /** Delete every reaction row (present + tombstone) for a message (revert wipe). */
+  deleteReactionsForMessage(messageId: string): Promise<void>
+  /** Every reaction row incl. tombstones — the dump source (dump filters `present`). */
+  getAllReactions(): Promise<ReactionRow[]>
+  // -- ENG-100 thread participants (derived set; recompute-from-state) -------
+  /** Replace a root's participant set (delete-all-then-insert recompute). */
+  putThreadParticipants(rows: readonly ThreadParticipantRow[]): Promise<void>
+  /** Drop every participant row for a root (first half of the recompute). */
+  deleteThreadParticipantsForRoot(rootMessageId: string): Promise<void>
+  /** Every thread-participant row — the participants dump source. */
+  getAllThreadParticipants(): Promise<ThreadParticipantRow[]>
+  /** A root's replies (by `thread_root_id` index) — the recompute input. */
+  listRepliesByRoot(rootMessageId: string): Promise<MessageRow[]>
   putStreams(rows: readonly StreamRow[]): Promise<void>
   putCursors(rows: readonly CursorRow[]): Promise<void>
   putReadState(rows: readonly ReadStateRow[]): Promise<void>
@@ -341,6 +456,28 @@ export type MutateParams =
       mentions?: string[]
       file_ids?: string[]
     }
+  // ENG-100 (M3) optimistic ops — routed through the SAME outbox as `outbox.send`
+  // (build+hash in worker, client-minted event_id, pending overlay applied
+  // instantly, settle-on-ack / park-on-reject under the hash-bound stream_id):
+  //   • `outbox.react`   — add/remove a reaction membership on a message.
+  //   • `outbox.edit`    — replace a message's text/format (LWW on settle).
+  //   • `outbox.remove`  — delete (tombstone + redact) a message.
+  | {
+      m: 'outbox.react'
+      stream_id: string
+      message_id: string
+      emoji: string
+      /** `true` → `reaction.removed`; default/false → `reaction.added`. */
+      remove?: boolean
+    }
+  | {
+      m: 'outbox.edit'
+      stream_id: string
+      message_id: string
+      text: string
+      format?: 'markdown' | 'plain'
+    }
+  | { m: 'outbox.remove'; stream_id: string; message_id: string }
   | { m: 'outbox.retry'; event_id: string }
   | { m: 'outbox.delete'; event_id: string }
 
@@ -414,7 +551,9 @@ export type QueryResult<Q extends QueryParams> = Q extends { q: 'messages.list' 
       : Q extends { q: 'directory.list' }
         ? DirectoryListResult
         : never
-export type MutateResult<M extends MutateParams> = M extends { m: 'outbox.send' }
+export type MutateResult<M extends MutateParams> = M extends {
+  m: 'outbox.send' | 'outbox.react' | 'outbox.edit' | 'outbox.remove'
+}
   ? SendResult
   : M extends { m: 'outbox.retry' | 'outbox.delete' }
     ? OutboxActionResult
