@@ -15,12 +15,15 @@ msg is a local-first, file-based team messaging app for 5–50-person technical 
 
 **M2 — Web client + sync proof: complete** (tagged `m2`). There is now a browser client: a Vue shell (sidebar, virtualized message list, plain-textarea composer, Cmd+K workspace switcher) backed by a SharedWorker that owns the session token, the authed HTTP client, the sync engine, the Dexie projection cache, and an optimistic-send outbox that drains on reconnect. Reads are instant and local (the projection); sends render optimistically and settle under their hash-bound `stream_id`. The Docker image now **bakes the built SPA** and serves it single-origin from the same origin as `/v1` — `docker compose up -d --build` yields a working web client at `http://localhost:8080`. The M2 exit gate is **all six §12 invariants green in CI** (Python sim owns 1–4 + server rebuild-equivalence; a TS `fast-check` suite owns pending-settling + client Dexie rebuild-equivalence, driving the real worker) plus a Playwright golden path — login → send → reload → history intact → a second browser sees the message live via WS fanout — on uvicorn's **default** WebSocket backend (ENG-92).
 
+**M3 — Messaging core: complete** (tagged `m3`). The chat surface is now real: **reactions** (emoji chips with an idempotent optimistic toggle), **edit** and **delete** on your own messages (an `(edited)` marker; a soft-delete tombstone), **threads** (a right-hand reply pane rooted on any message), **@mentions** with `@`/`#` autocomplete from a zero-network directory projection, and **channel & DM management** (create a public/private channel, browse channels, start a 1:1 DM) — all authored worker-side and fanned out live over WS. The composer is now TipTap (markdown shortcuts, mention chips) at the same seam, still sending markdown SOURCE text (never HTML). The six §12 invariants now exercise the M3 event types end to end — the Python simulation folds reactions/edits/deletes/threads/`dm.created` into convergence + permission-isolation, and the TS `fast-check` client-rebuild gate proves out-of-order (windowed newest-first + backfill) delivery still converges — and the Playwright **`e2e`** job drives the whole messaging-core golden path (react → edit → delete → thread reply → @mention → create channel → start DM) with a second browser seeing message + reaction + thread-reply live, on the default WS backend.
+
 | Milestone | Scope | Status |
 |---|---|---|
 | **M0 — Protocol spike** | `core/` envelope + JCS + hashing; `msgctl` append → project → rebuild → verify | ✅ Done |
 | **M1 — Sync server** | Auth, streams, batch upload, sync, WebSocket fanout, Postgres | ✅ Done |
 | **M2 — Web client + sync proof** | Vue shell, SharedWorker + Dexie, six invariants green in CI | ✅ Done |
-| M3 — Messaging core | Threads, reactions, mentions, files, search, presence | Next |
+| **M3 — Messaging core** | Reactions, edit/delete, threads, @mentions, channel & DM management | ✅ Done |
+| M3.5 — Files, search, presence | Attachments + thumbnails, server search, presence/typing, notifications, pins (fast-follow) | Next |
 | M4 — Portability | `export` / `import` / `verify` round-trip | — |
 | M5 — Plugins | Industry-standard incoming webhooks, bot tokens | — |
 | M6 — Desktop (Tauri) | True offline; "workspace is a folder" | — |
@@ -38,7 +41,7 @@ msg/
   server/
     msgd/
       core/           # event envelope, JCS canonicalization, hashing, payload schemas
-        testdata/     # frozen cross-language hash vectors (47 cases)
+        testdata/     # frozen cross-language hash vectors (55 cases: + reactions, edits, deletes)
       api/            # FastAPI app: auth, /v1/events(/batch), /v1/sync, /v1/ws
       db/             # SQLAlchemy models + Alembic migrations (Postgres)
       ws/             # WebSocket hub — permission-scoped fanout, heartbeat
@@ -93,6 +96,19 @@ uv run msgctl invite ./acme --role member
 Open that **join URL** in another browser (or an incognito window) — it loads the accept-invite page, where the teammate sets a display name, email, and password to register and join. (The bare `http://localhost:8080` just redirects to login; a brand-new teammate has no account yet, so the `/join/<token>` link is what registers them.) Now post from either side and the other browser receives it **live via WebSocket fanout**, no reload. Drop the network mid-send and the outbox holds the message as pending; restore it and it flushes — reads stay instant and local throughout.
 
 > msg is **online-first** in the browser (full browser offline is desktop, M6). "Offline-ish" means the outbox survives a transient disconnect and drains on reconnect, and every read is served from the local projection — not that the app runs fully offline.
+
+## What you can do (M3 — messaging core)
+
+Once you're in, the chat surface is a real one. Everything below authors an event in the worker (the token never leaves it), renders **optimistically**, settles when the server sequences it, and fans out **live** to everyone else over WebSocket:
+
+- **React** — hover a message for the quick 👍 ❤️ 😂 bar or the emoji picker; chips aggregate with a who-reacted tooltip, and clicking your own chip removes it. Reactions are an idempotent toggle, so a double-tap or a racing duplicate can never double-count.
+- **Edit** — edit your own message inline (ArrowUp on an empty composer jumps to your last one); an `(edited)` marker appears. Concurrent edits converge to the last writer by server sequence.
+- **Delete** — soft-delete your own message: it's replaced by a muted "message deleted" tombstone for everyone, and its text is redacted from the read model. This **removes it from view**; it is *not* a cryptographic erasure — the append-only log still holds the original, and true redaction is a tracked follow-up (ENG-111). The confirm dialog says so honestly.
+- **Threads** — "Reply in thread" opens a right-hand pane rooted on any message; the root shows a live reply count + participant avatars. Threads are flat (one level), and the count is delete-aware (deleting a reply decrements it).
+- **@mentions** — type `@` for people or `#` for channels; the autocomplete is served instantly from a local directory projection (no round-trip per keystroke). Mentioned users get a badge on the channel.
+- **Channels & DMs** — create a public or private channel, browse and open public channels, and start a 1:1 direct message with any teammate — all from the sidebar. Invited teammates auto-join `#general`, so nobody lands in an empty workspace.
+
+Every hostile input path — message text, author and reactor and participant display names, opaque reaction bytes — is rendered through escaping-only bindings (no `v-html`), so a `<img onerror>` display name is inert.
 
 ## The `msgctl` CLI
 
@@ -149,7 +165,9 @@ M2's exit criterion (TDD §13) is that **all six §12 invariants** are asserted 
 | 6 | Rebuild equivalence — client (Dexie) | `web · lint · type · test · build` · **Invariant suite (§12)** |
 | 6 | Rebuild equivalence — server (`messages_proj`) | `lint · type · test` · **Equivalence gate** |
 
-Invariants 5 and client-6 are [`fast-check`](https://github.com/dubzzz/fast-check) property suites that drive the **real** worker engine (`web/tests/unit/worker/invariant{5,6}-*.property.spec.ts`). The `e2e · golden path` job additionally runs a Playwright smoke over the real production stack (login → send → reload → history intact → a second browser sees the message live via WS fanout). The suites have **teeth**: `MSG_MUTATE=inv5-drop-ack` and `MSG_MUTATE=inv6-rebuild-skew` flip in a client bug that turns the respective suite red (green by default).
+Invariants 5 and client-6 are [`fast-check`](https://github.com/dubzzz/fast-check) property suites that drive the **real** worker engine (`web/tests/unit/worker/invariant{5,6}-*.property.spec.ts`). The `e2e · golden path` job additionally runs Playwright over the real production stack — the ENG-83 smoke (login → send → reload → history intact → a second browser sees the message live via WS fanout) **and** the ENG-105 messaging-core golden path (react → edit → delete → thread reply → @mention → create channel → start DM, second browser sees message + reaction + thread reply live). The suites have **teeth**: `MSG_MUTATE=inv5-drop-ack` and `MSG_MUTATE=inv6-rebuild-skew` flip in a client bug that turns the respective suite red (green by default).
+
+> **The six invariants exercise the M3 event types (M3).** The gate steps and their names are unchanged, but their coverage now spans the M3 surface: the Python **Simulation suite** interleaves reactions, edits, deletes, threaded replies and `dm.created` and folds them into convergence + a permission-isolation adversary that also cannot react into, edit in, reply into, or read a stream/DM it may not; the server **Equivalence gate** replays reactions/edits/deletes/threads through `messages_proj` + `reactions_proj` + `thread_participants_proj`; and the client **Invariant suite (§12)** exercises the M3 optimistic ops and proves `rebuild ≡ incremental` under **out-of-order windowed** (newest-first + backfill) delivery, with deterministic teeth for reply-before-root, reaction `removed@lo`+`added@hi`, and edit-before-create. The frozen cross-language vectors grew 47→55 (adding `reaction.added/removed` + `message.edited/deleted`, byte-identical in Python and TS); `channel.created`/`dm.created` vectors are deferred to ENG-110.
 
 > **Live WS on the default self-host config (ENG-92, resolved).** The "second browser sees the message live via WS fanout" leg runs against uvicorn's **default/shipped `websockets` backend** — exactly what a real self-host runs — with **no `--ws` override**. ENG-92 fixed the server's bearer-subprotocol WS auth to normalize the un-split `["bearer, <token>"]` that the default backend surfaces in the ASGI scope, so the WS upgrade authenticates out of the box. Live sync is therefore certified on the default config, not a workaround.
 

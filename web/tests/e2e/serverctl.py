@@ -15,6 +15,9 @@ on the real app. Kept in web/ so the golden-path harness is self-contained.
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import shutil
 import signal
@@ -37,6 +40,14 @@ BASE_URL = f"http://127.0.0.1:{PORT}"
 OWNER_EMAIL = "owner@example.com"
 OWNER_PASSWORD = "correct-horse-battery-staple"
 
+# ENG-105 messaging-core golden path: a SECOND, invited member. Registering via a
+# real invite exercises the ENG-112 server-side auto-join of #general, so this user
+# lands in #general (a live WS participant) and in the workspace directory (a
+# resolvable @mention + DM target) the moment the owner's browser pulls meta.
+SECOND_EMAIL = "second@example.com"
+SECOND_PASSWORD = "correct-horse-battery-staple-2"
+SECOND_DISPLAY_NAME = "Second"
+
 
 def _bootstrap() -> None:
     """Create the owner + seed one message in the default ``general`` channel.
@@ -53,11 +64,22 @@ def _bootstrap() -> None:
     ws = HERE / ".bootstrap-ws"
     if ws.exists():
         shutil.rmtree(ws)
+    ws2 = HERE / ".bootstrap-ws2"
+    if ws2.exists():
+        shutil.rmtree(ws2)
 
     def run(*args: str) -> None:
         rc = msgctl_main(list(args))
         if rc != 0:
             raise RuntimeError(f"msgctl {' '.join(args)} exited {rc}")
+
+    def run_capture(*args: str) -> str:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = msgctl_main(list(args))
+        if rc != 0:
+            raise RuntimeError(f"msgctl {' '.join(args)} exited {rc}")
+        return buf.getvalue()
 
     run(
         "login", str(ws), "--setup",
@@ -69,6 +91,23 @@ def _bootstrap() -> None:
     )  # fmt: skip
     run("send", str(ws), "--stream", "general", "--text", "welcome to general")
     run("push", str(ws))
+
+    # Mint a single-use invite as the owner, then register a SECOND member with it.
+    # The server-side accept (ENG-112) auto-joins them to #general and emits their
+    # ``user.joined`` into workspace-meta — both server-authored, so no push by the
+    # new user is needed. When the owner's browser pulls meta on load it learns the
+    # second user (directory → @mention + DM target), and both browsers share
+    # #general as live WS participants.
+    invite_out = run_capture("invite", str(ws), "--role", "member")
+    token = json.loads(invite_out)["url"].rsplit("/join/", 1)[1]
+    run(
+        "login", str(ws2),
+        "--invite-token", token,
+        "--server-url", BASE_URL,
+        "--email", SECOND_EMAIL,
+        "--password", SECOND_PASSWORD,
+        "--display-name", SECOND_DISPLAY_NAME,
+    )  # fmt: skip
 
 
 def _wait_healthy(timeout: float = 60.0) -> None:

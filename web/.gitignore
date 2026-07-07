@@ -17,6 +17,7 @@ tests/e2e/.server-pgid
 tests/e2e/.server.log
 tests/e2e/.server-data/
 tests/e2e/.bootstrap-ws/
+tests/e2e/.bootstrap-ws2/
 
 # Editor / OS
 *.local
