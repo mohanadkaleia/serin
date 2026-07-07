@@ -115,6 +115,37 @@ def lifecycle_body(
     }
 
 
+def reaction_body(
+    *,
+    auth: Auth,
+    stream_id: str,
+    message_id: str,
+    emoji: str,
+    removed: bool = False,
+    type_version: int = 1,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """A ``reaction.added`` (or ``reaction.removed``) body authored by ``auth``.
+
+    §2.4 homes a reaction in the stream the target message lives in, so the caller
+    passes that stream as ``stream_id``. ``overrides`` are applied onto the raw
+    dict (after assembly) so tests can build deliberately nonconforming bodies.
+    """
+    body: dict[str, Any] = {
+        "event_id": ids.new_event_id(),
+        "workspace_id": auth["workspace_id"],
+        "stream_id": stream_id,
+        "type": "reaction.removed" if removed else "reaction.added",
+        "type_version": type_version,
+        "author_user_id": auth["user_id"],
+        "author_device_id": auth["device_id"],
+        "client_created_at": now_rfc3339(),
+        "payload": {"message_id": message_id, "emoji": emoji},
+    }
+    body.update(overrides)
+    return body
+
+
 def custom_body(
     *,
     auth: Auth,

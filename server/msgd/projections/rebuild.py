@@ -50,11 +50,12 @@ __all__ = ["RebuildResult", "rebuild_projections"]
 class RebuildResult:
     """Outcome of a :func:`rebuild_projections` run (mirrors M0 ``ProjectResult``).
 
-    ``applied`` counts events **dispatched to a handler** (``message.created`` v1);
-    ``skipped`` counts events replayed but with no handler (meta / unknown types /
-    unhandled versions — D9). ``applied`` is a dispatch count, NOT a rows-inserted
-    count: ``ON CONFLICT (message_id) DO NOTHING`` means a re-seen ``message_id``
-    is counted as applied while inserting zero rows.
+    ``applied`` counts events **dispatched to a handler** (``message.created`` v1
+    and, since ENG-97, ``reaction.added`` / ``reaction.removed`` v1); ``skipped``
+    counts events replayed but with no handler (meta / unknown types / unhandled
+    versions — D9). ``applied`` is a dispatch count, NOT a rows-changed count: a
+    no-op idempotent add (``ON CONFLICT DO NOTHING``) or an absent-reaction remove
+    (zero rows deleted) still counts as applied.
     """
 
     applied: int = 0
@@ -83,8 +84,12 @@ async def rebuild_projections(session: AsyncSession) -> RebuildResult:
     (MVCC atomicity).  A raise before the commit rolls everything back, leaving
     the prior projection intact (interrupt safety).  Returns a
     :class:`RebuildResult` for the CLI summary.
+
+    BOTH projection tables are truncated + replayed together (ENG-97): a rebuild
+    that dropped only ``messages_proj`` would leave stale ``reactions_proj`` rows
+    and break ``rebuild ≡ incremental`` for reactions.
     """
-    await session.execute(text("TRUNCATE messages_proj"))
+    await session.execute(text("TRUNCATE messages_proj, reactions_proj"))
     result = RebuildResult()
     async for body, server_sequence in _iter_events(session):
         if await apply_projection(session, body=body, server_sequence=server_sequence):

@@ -8,15 +8,21 @@ M1 exit gate (TDD §5) and gets its own named CI step; keep both.
 Three parts, mirroring ENG-61:
 
 1. **Property test — rebuild ≡ incremental + D9 skip.** A hypothesis plan of
-   interleaved ``message.created`` v1 (~90%) and unknown-type (~10%) events is
-   driven **through** ``insert_event`` directly (the exact accept-path hook,
-   without the per-example auth/stream-bootstrap overhead of the HTTP path — the
-   ENG-61 in-process discipline). Incremental dump == rebuilt dump, byte for
-   byte; the row count equals the number of ``message.created`` actions (unknown
-   types leave zero rows); a second rebuild is idempotent.
+   interleaved ``message.created`` v1 (~50%), unknown-type (~10%), and
+   ``reaction.added``/``reaction.removed`` v1 (~40%) events is driven **through**
+   ``insert_event`` directly (the exact accept-path hook, without the per-example
+   auth/stream-bootstrap overhead of the HTTP path — the ENG-61 in-process
+   discipline). Incremental dumps == rebuilt dumps, byte for byte, for BOTH
+   first-class projections (``messages_proj`` AND ``reactions_proj``, ENG-97); the
+   message row count equals the number of ``message.created`` actions (unknown
+   types + reactions leave zero ``messages_proj`` rows); a second rebuild is
+   idempotent. Reactions target real prior messages with a small emoji/msg pool,
+   so duplicate adds + absent removes exercise the idempotent set semantics.
 2. **Mutation / teeth test.** A positive control (unpatched rebuild matches),
    then a one-sided corruption of the rebuild pass only, asserting the dumps now
-   differ — proving the gate's ``==`` has teeth.
+   differ — proving the gate's ``==`` has teeth. One for ``messages_proj`` (corrupt
+   a row) and one for ``reactions_proj`` (skip a ``reaction.removed``), both via
+   the same ``monkeypatch.setitem(apply_mod._HANDLERS, …)`` mechanism.
 3. **Real-upload smoke.** A true ``POST /v1/events/batch`` batch through the
    ``client`` fixture, proving the ``insert.py`` hook fires on the real accept
    path end to end.
@@ -52,7 +58,7 @@ from msgd.core.time import now_rfc3339
 from msgd.db.models import MessageProj, Stream, Workspace
 from msgd.events.insert import insert_event
 from msgd.projections import apply as apply_mod
-from msgd.projections.dump import dump_messages_proj
+from msgd.projections.dump import dump_messages_proj, dump_reactions_proj
 from msgd.projections.rebuild import rebuild_projections
 from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -72,7 +78,16 @@ _GATE_SETTINGS = (
     else settings(max_examples=60, deadline=None)
 )
 
-_RESET = "TRUNCATE messages_proj, events, stream_members, streams, workspaces CASCADE"
+_RESET = (
+    "TRUNCATE messages_proj, reactions_proj, events, stream_members, streams, workspaces CASCADE"
+)
+
+#: Reaction emoji domain for the gate — exercises the OPAQUE-BYTES contract (a base
+#: emoji, that emoji WITH a skin-tone modifier — a distinct byte sequence that must
+#: NOT merge under the C-collation uniqueness key — an ASCII string, and a C1
+#: control char). Small on purpose so duplicate adds on the same (message, emoji)
+#: are likely.
+_GATE_EMOJIS = ("\U0001f44d", "\U0001f44d\U0001f3fd", "x", "\u0001")
 
 
 # --- send-plan strategy (ENG-61 shape) --------------------------------------
@@ -80,18 +95,27 @@ _RESET = "TRUNCATE messages_proj, events, stream_members, streams, workspaces CA
 
 @dataclass(frozen=True)
 class _Action:
-    """One randomized event: a ``message.created`` or an unknown-type injection."""
+    """One randomized event: a message, an unknown-type injection, or a reaction.
 
-    kind: str  # "created" | "unknown"
+    ``react_add`` / ``react_remove`` target a message previously created in the
+    same stream (resolved modulo ``msg`` at apply time; a no-op if the stream has
+    no message yet), so the reaction log builds and tears down the ``reactions_proj``
+    set with duplicate adds + absent removes — the idempotent set semantics the
+    permanent gate must keep proving rebuild-equivalent (ENG-97).
+    """
+
+    kind: str  # "created" | "unknown" | "react_add" | "react_remove"
     stream: str
     text: str = ""
     format: str = "markdown"
     thread_root_id: str | None = None
+    emoji: str = ""
+    msg: int = 0
 
 
 @st.composite
 def _send_plan(draw: st.DrawFn) -> list[_Action]:
-    """1–4 streams, 0–30 interleaved actions, ~90% created / ~10% unknown.
+    """1–4 streams, 0–30 interleaved actions: ~50% created, ~10% unknown, ~40% reactions.
 
     ``st.characters(codec="utf-8")`` excludes lone surrogates (which JCS/asyncpg
     reject upstream). ``exclude_characters="\\x00"`` drops U+0000: Postgres text /
@@ -116,7 +140,29 @@ def _send_plan(draw: st.DrawFn) -> list[_Action]:
         thread_root_id=st.none() | st.builds(ids.new_message_id),
     )
     unknown = st.builds(_Action, kind=st.just("unknown"), stream=st.sampled_from(streams))
-    action = st.integers(min_value=0, max_value=9).flatmap(lambda n: unknown if n == 0 else created)
+    emoji = st.sampled_from(_GATE_EMOJIS)
+    msg = st.integers(min_value=0, max_value=3)
+    react_add = st.builds(
+        _Action, kind=st.just("react_add"), stream=st.sampled_from(streams), emoji=emoji, msg=msg
+    )
+    react_remove = st.builds(
+        _Action, kind=st.just("react_remove"), stream=st.sampled_from(streams), emoji=emoji, msg=msg
+    )
+
+    def _pick(n: int) -> st.SearchStrategy[_Action]:
+        # ~10% unknown, ~20% react_add, ~20% react_remove, ~50% created — created
+        # stays the majority (messages_proj coverage intact) while reactions build
+        # and tear down the set, with a small emoji/msg pool forcing duplicate adds
+        # and absent removes (the idempotency the rebuild must reproduce).
+        if n == 0:
+            return unknown
+        if n in (1, 2):
+            return react_add
+        if n in (3, 4):
+            return react_remove
+        return created
+
+    action = st.integers(min_value=0, max_value=9).flatmap(_pick)
     return draw(st.lists(action, min_size=0, max_size=30))
 
 
@@ -149,6 +195,30 @@ def _unknown_body(*, workspace_id: str, stream_id: str, author: str, device: str
         author_device_id=device,
         client_created_at=now_rfc3339(),
         payload={"blast_radius": 3},
+    ).model_dump(mode="json")
+
+
+def _reaction_body(
+    *,
+    workspace_id: str,
+    stream_id: str,
+    author: str,
+    device: str,
+    message_id: str,
+    emoji: str,
+    removed: bool,
+) -> dict[str, Any]:
+    """A ``reaction.added``/``reaction.removed`` v1 body (server-trusted, ENG-97)."""
+    return Body(
+        event_id=ids.new_event_id(),
+        workspace_id=workspace_id,
+        stream_id=stream_id,
+        type="reaction.removed" if removed else "reaction.added",
+        type_version=1,
+        author_user_id=author,
+        author_device_id=device,
+        client_created_at=now_rfc3339(),
+        payload={"message_id": message_id, "emoji": emoji},
     ).model_dump(mode="json")
 
 
@@ -185,6 +255,9 @@ async def _one_example(database_url: str, plan: list[_Action]) -> None:
                 await session.flush()
 
                 n_created = 0
+                # message ids created per stream label, so reactions target a real
+                # message in the same stream (resolved modulo, or a no-op if none).
+                created_by_stream: dict[str, list[str]] = {}
                 for action in plan:
                     sid = stream_ids[action.stream]
                     if action.kind == "created":
@@ -195,27 +268,48 @@ async def _one_example(database_url: str, plan: list[_Action]) -> None:
                             device=device,
                             action=action,
                         )
+                        created_by_stream.setdefault(action.stream, []).append(
+                            body["payload"]["message_id"]
+                        )
                         n_created += 1
-                    else:
+                    elif action.kind == "unknown":
                         body = _unknown_body(
                             workspace_id=ws, stream_id=sid, author=author, device=device
+                        )
+                    else:  # react_add / react_remove
+                        known = created_by_stream.get(action.stream, [])
+                        if not known:
+                            continue  # no message to react to yet → the action is a no-op
+                        body = _reaction_body(
+                            workspace_id=ws,
+                            stream_id=sid,
+                            author=author,
+                            device=device,
+                            message_id=known[action.msg % len(known)],
+                            emoji=action.emoji,
+                            removed=action.kind == "react_remove",
                         )
                     await insert_event(session, stream_id=sid, body=body)
 
                 dump_incremental = await dump_messages_proj(session)
+                dump_incremental_reactions = await dump_reactions_proj(session)
 
                 # D9: one row per created action, none for unknown-type events.
                 row_count = await session.scalar(select(func.count()).select_from(MessageProj))
                 assert row_count == n_created
 
-                # The permanent invariant: rebuild ≡ incremental, byte for byte.
+                # The permanent invariant: rebuild ≡ incremental, byte for byte —
+                # for BOTH first-class projections (ENG-97 adds reactions_proj).
                 await rebuild_projections(session)
                 dump_rebuilt = await dump_messages_proj(session)
+                dump_rebuilt_reactions = await dump_reactions_proj(session)
                 assert dump_rebuilt == dump_incremental
+                assert dump_rebuilt_reactions == dump_incremental_reactions
 
-                # Rebuild is idempotent.
+                # Rebuild is idempotent (both projections).
                 await rebuild_projections(session)
                 assert await dump_messages_proj(session) == dump_rebuilt
+                assert await dump_reactions_proj(session) == dump_rebuilt_reactions
         finally:
             # Defensive end-of-example cleanup so committed rows never leak to
             # sibling tests (rebuild_projections commits).
@@ -307,6 +401,67 @@ async def test_gate_detects_single_row_divergence(
     monkeypatch.undo()
 
     assert await dump_messages_proj(db_session) != dump_incremental
+
+
+async def test_gate_detects_reaction_divergence(db_session: AsyncSession, monkeypatch: Any) -> None:
+    """Teeth for the reaction side: a rebuild that SKIPS ``reaction.removed`` must
+    turn the ``reactions_proj`` rebuild-equivalence assertion RED (green by default).
+
+    Same one-sided mechanism as the messages teeth above — ``monkeypatch.setitem``
+    on ``apply_mod._HANDLERS`` for the REBUILD pass ONLY (patching one side is
+    essential; a global patch would mutate both sides identically and prove
+    nothing). The injected bug makes ``reaction.removed`` a no-op, so a reaction
+    that was added-then-removed (net absent incrementally) wrongly SURVIVES the
+    rebuild — the reaction dump diverges.
+    """
+    ws, stream = ids.new_workspace_id(), ids.new_stream_id()
+    await _seed_stream(db_session, workspace_id=ws, stream_id=stream)
+    author, device = ids.new_user_id(), ids.new_device_id()
+    message_id = ids.new_message_id()
+    await insert_event(
+        db_session,
+        stream_id=stream,
+        body=build_message_created_body(
+            workspace_id=ws,
+            stream_id=stream,
+            author_user_id=author,
+            author_device_id=device,
+            client_created_at=now_rfc3339(),
+            text="hi",
+            message_id=message_id,
+        ).model_dump(mode="json"),
+    )
+
+    def _react(emoji: str, *, removed: bool) -> dict[str, Any]:
+        return _reaction_body(
+            workspace_id=ws,
+            stream_id=stream,
+            author=author,
+            device=device,
+            message_id=message_id,
+            emoji=emoji,
+            removed=removed,
+        )
+
+    # 👍 stays; 🎉 is added then removed → net-absent in the incremental set.
+    await insert_event(db_session, stream_id=stream, body=_react("\U0001f44d", removed=False))
+    await insert_event(db_session, stream_id=stream, body=_react("\U0001f389", removed=False))
+    await insert_event(db_session, stream_id=stream, body=_react("\U0001f389", removed=True))
+    dump_incremental = await dump_reactions_proj(db_session)
+
+    # Positive control: unpatched rebuild reproduces the set exactly.
+    await rebuild_projections(db_session)
+    assert await dump_reactions_proj(db_session) == dump_incremental
+
+    # Buggy rebuild: reaction.removed does nothing → the removed 🎉 wrongly survives.
+    async def _skip_remove(db: AsyncSession, *, body: dict[str, Any], server_sequence: int) -> None:
+        return None
+
+    monkeypatch.setitem(apply_mod._HANDLERS, ("reaction.removed", 1), _skip_remove)
+    await rebuild_projections(db_session)
+    monkeypatch.undo()
+
+    assert await dump_reactions_proj(db_session) != dump_incremental
 
 
 # --- honest end-to-end wiring: real upload smoke -----------------------------

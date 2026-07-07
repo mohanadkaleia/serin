@@ -214,3 +214,19 @@ async def test_can_write_matrix(db_session: AsyncSession) -> None:
 
     # dm.created — deferred (M3); no M1 caller.
     assert not await can_write(db_session, ctx=owner, stream_id=w.dm, event_type="dm.created")
+
+    # reaction.added / reaction.removed (ENG-97) — write access == read access,
+    # identical to message.created (a reaction is a write to the message's stream).
+    for reaction_type in ("reaction.added", "reaction.removed"):
+        assert await can_write(
+            db_session, ctx=member, stream_id=w.pub, event_type=reaction_type
+        )  # public read
+        assert not await can_write(
+            db_session, ctx=guest, stream_id=w.pub, event_type=reaction_type
+        )  # guest cannot read public
+        assert await can_write(
+            db_session, ctx=member, stream_id=w.priv, event_type=reaction_type
+        )  # member of priv
+        assert not await can_write(
+            db_session, ctx=owner, stream_id=w.priv, event_type=reaction_type
+        )  # owner not a member of priv

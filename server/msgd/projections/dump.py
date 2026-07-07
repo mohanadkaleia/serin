@@ -18,9 +18,9 @@ from typing import Final
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from msgd.db.models import MessageProj
+from msgd.db.models import MessageProj, ReactionProj
 
-__all__ = ["dump_messages_proj"]
+__all__ = ["dump_messages_proj", "dump_reactions_proj"]
 
 #: The dumped columns, in fixed order (never ``SELECT *``).  The M1-relevant
 #: subset the apply actually writes.
@@ -66,6 +66,44 @@ async def dump_messages_proj(session: AsyncSession) -> str:
     return "\n".join(
         json.dumps(
             dict(zip(_DUMP_COLUMNS, row, strict=True)),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        for row in rows.all()
+    )
+
+
+#: The dumped ``reactions_proj`` columns, in fixed order — the full membership key
+#: (the table IS the reaction set, ENG-97). No later-milestone or derived columns
+#: to exclude.
+_REACTION_DUMP_COLUMNS: Final = (
+    "message_id",
+    "author_user_id",
+    "emoji",
+)
+
+
+async def dump_reactions_proj(session: AsyncSession) -> str:
+    """Return the normalized, deterministic ``reactions_proj`` dump (ENG-97).
+
+    Same discipline as :func:`dump_messages_proj`: a fixed column list, one
+    compact JSON object per row, ``\\n``-joined, under a total ``ORDER BY``. The
+    order is the membership key ``(message_id, author_user_id, emoji)`` — unique
+    (it is the primary key), so the order is total and stable. ``emoji`` orders
+    under the column's ``C`` collation (byte order), so the dump is byte-exact and
+    two equal reaction sets yield byte-identical dumps (the ``rebuild ≡
+    incremental`` equivalence surface for reactions, TDD §5 / §12 invariant 6).
+    """
+    rows = await session.execute(
+        select(
+            ReactionProj.message_id,
+            ReactionProj.author_user_id,
+            ReactionProj.emoji,
+        ).order_by(ReactionProj.message_id, ReactionProj.author_user_id, ReactionProj.emoji)
+    )
+    return "\n".join(
+        json.dumps(
+            dict(zip(_REACTION_DUMP_COLUMNS, row, strict=True)),
             ensure_ascii=False,
             separators=(",", ":"),
         )

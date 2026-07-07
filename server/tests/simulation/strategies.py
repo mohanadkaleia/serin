@@ -70,7 +70,74 @@ class ConcurrentSendBurst:
     count: int
 
 
-Op = Send | DuplicateSend | DisconnectMidFlush | ReconnectCatchup | ConcurrentSendBurst
+@dataclass(frozen=True)
+class React:
+    """``actor`` reacts with ``emoji`` to an existing message in ``stream``.
+
+    ``msg`` selects among the messages the actor knows in that stream (resolved,
+    modulo, at apply time); a no-op if the stream has no message yet. Repeated
+    ``React`` ops with the same resolved ``(message, actor, emoji)`` exercise the
+    idempotent-add / duplicate-add path (§2.4).
+    """
+
+    actor: int
+    stream: int
+    msg: int
+    emoji: int
+
+
+@dataclass(frozen=True)
+class Unreact:
+    """``actor`` removes its ``emoji`` reaction from a message in ``stream``.
+
+    Also covers the absent-remove no-op (§2.4): if the actor never added that
+    ``(message, emoji)``, the ``reaction.removed`` is still a VALID event that
+    sequences normally and leaves the set unchanged.
+    """
+
+    actor: int
+    stream: int
+    msg: int
+    emoji: int
+
+
+@dataclass(frozen=True)
+class ConcurrentReactBurst:
+    """K writers react to the **same** message with the **same** ``emoji`` via
+    ``asyncio.gather`` (true race) — the concurrent duplicate-add probe (§2.4).
+    """
+
+    stream: int
+    msg: int
+    emoji: int
+    count: int
+
+
+Op = (
+    Send
+    | DuplicateSend
+    | DisconnectMidFlush
+    | ReconnectCatchup
+    | ConcurrentSendBurst
+    | React
+    | Unreact
+    | ConcurrentReactBurst
+)
+
+#: Reaction emoji domain sampled by the strategy. Deliberately exercises the
+#: OPAQUE-BYTES contract (ENG-96 / ENG-97): a plain emoji, a base emoji and its
+#: skin-tone-modified form (distinct byte sequences that must NOT collide under
+#: the C-collation uniqueness key), a ZWJ family sequence, an ASCII string, and a
+#: C1 control character (U+0001 — a legal <=64-byte non-NUL reaction the byte-exact
+#: column must store and dedup faithfully). NUL is excluded: Postgres text/JSONB
+#: rejects it before the projection, so it can never reach reactions_proj.
+REACT_EMOJIS = (
+    "\U0001f44d",  # thumbs up
+    "\U0001f44d\U0001f3fd",  # thumbs up + skin tone (distinct bytes, must not merge)
+    "\U0001f469\u200d\U0001f467",  # ZWJ family sequence
+    "x",  # ASCII
+    "\u0001",  # C1 control char - opaque bytes, not a grapheme
+)
 
 
 @dataclass(frozen=True)
@@ -84,8 +151,13 @@ class Plan:
 # --- bounds (tuned for the <2 min CI budget, R3) ------------------------------
 
 MIN_MEMBERS, MAX_MEMBERS = 2, 4
-MAX_OPS = 10
+MAX_OPS = 12
 MAX_BURST = 3
+#: How many distinct messages a reaction op may reference (resolved modulo the
+#: messages actually present in the stream at apply time — a small pool keeps
+#: duplicate reactions on the SAME message likely, so the idempotent-add /
+#: absent-remove set semantics are exercised, not just distinct singletons).
+MAX_MSG_REF = 3
 _TEXTS = ("a", "hi", "msg", "z9", "hello")
 
 
@@ -94,6 +166,8 @@ def _op(n: int) -> st.SearchStrategy[Op]:
     actor = st.integers(min_value=0, max_value=n - 1)
     stream = st.integers(min_value=0, max_value=1)
     text = st.sampled_from(_TEXTS)
+    msg = st.integers(min_value=0, max_value=MAX_MSG_REF - 1)
+    emoji = st.integers(min_value=0, max_value=len(REACT_EMOJIS) - 1)
     return st.one_of(
         st.builds(Send, actor=actor, stream=stream, text=text),
         st.builds(DuplicateSend, actor=actor, stream=stream),
@@ -102,6 +176,15 @@ def _op(n: int) -> st.SearchStrategy[Op]:
         st.builds(
             ConcurrentSendBurst,
             stream=stream,
+            count=st.integers(min_value=2, max_value=MAX_BURST),
+        ),
+        st.builds(React, actor=actor, stream=stream, msg=msg, emoji=emoji),
+        st.builds(Unreact, actor=actor, stream=stream, msg=msg, emoji=emoji),
+        st.builds(
+            ConcurrentReactBurst,
+            stream=stream,
+            msg=msg,
+            emoji=emoji,
             count=st.integers(min_value=2, max_value=MAX_BURST),
         ),
     )

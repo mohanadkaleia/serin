@@ -55,7 +55,7 @@ from msgd.core.envelope import MAX_EVENT_SIZE_BYTES, Body
 from msgd.core.hashing import hash_event
 from msgd.core.jcs import JCSError
 from msgd.core.payloads import get_payload_model
-from msgd.db.models import Stream
+from msgd.db.models import MessageProj, Stream
 from msgd.events.permissions import can_read, can_write
 
 __all__ = ["Accepted", "Rejected", "validate_event"]
@@ -66,6 +66,8 @@ __all__ = ["Accepted", "Rejected", "validate_event"]
 _WRITE_MATRIX_TYPES = frozenset(
     {
         "message.created",
+        "reaction.added",
+        "reaction.removed",
         "channel.created",
         "channel.renamed",
         "channel.archived",
@@ -74,6 +76,10 @@ _WRITE_MATRIX_TYPES = frozenset(
         "dm.created",
     }
 )
+
+#: ``reaction.*`` types — gated by ``can_write`` (== read access, ENG-97) at step
+#: iii and by the §3.2 message-referential check at step vi (:func:`_check_referential`).
+_REACTION_TYPES = frozenset({"reaction.added", "reaction.removed"})
 
 #: Lifecycle events whose ``payload.channel_stream_id`` must reference an existing
 #: stream — the one non-confidential ``unknown_stream`` producer (D5 vi / D13-safe:
@@ -92,6 +98,13 @@ _LIFECYCLE_TYPES = frozenset(
 #: code+detail for a forbidden existing stream vs. a non-existent one, so this
 #: string must NOT vary with which case occurred.
 _STREAM_DENIED_DETAIL = "not permitted to write to this stream"
+
+#: Uniform detail for a reaction whose target message is absent OR lives in a
+#: different (possibly unreadable) stream than the reaction is homed in. Like
+#: ``_STREAM_DENIED_DETAIL`` it must NOT vary with which case occurred, so a
+#: never-existed message and a message in a stream the author cannot see collapse
+#: to the identical outcome (D13 non-disclosure — no cross-stream existence oracle).
+_UNKNOWN_MESSAGE_DETAIL = "no such message in this stream"
 
 
 @dataclass
@@ -167,6 +180,23 @@ async def _resolve_channel_in_workspace(
     if row is None:
         return None
     return row[0], row[1]
+
+
+async def _resolve_message_stream(db: AsyncSession, message_id: str) -> str | None:
+    """The ``messages_proj.stream_id`` a message lives in, or ``None`` if unknown.
+
+    Reads the committed message projection (populated in the same transaction as
+    the ``message.created`` accept, ENG-69) — the authoritative "does this message
+    exist, and where does it live" oracle for the reaction referential check. A
+    message that never existed and one in another workspace both resolve to a
+    stream id the reaction's home cannot equal (or to ``None``), so both collapse
+    to the identical ``unknown_message`` — no cross-tenant/cross-stream existence
+    oracle (D13).
+    """
+    stream_id: str | None = await db.scalar(
+        select(MessageProj.stream_id).where(MessageProj.message_id == message_id)
+    )
+    return stream_id
 
 
 async def validate_event(db: AsyncSession, *, ctx: AuthContext, item: Any) -> Accepted | Rejected:
@@ -354,11 +384,13 @@ async def _check_referential(
     body_model: Body,
     raw_body: dict[str, Any],
 ) -> Rejected | None:
-    """Step vi: genesis-collision / §2.2 homing / lifecycle-existence (M1-minimal).
+    """Step vi: genesis-collision / §2.2 homing / lifecycle- + reaction-existence.
 
     Returns a :class:`Rejected` (its ``event_id`` filled in by the caller) or
-    ``None`` to pass. ``thread_root_id`` / ``file_ids`` / ``mentions`` existence
-    are M3 features with no M1 table — deliberately skipped (D8d).
+    ``None`` to pass. ``reaction.*`` adds a message-referential branch (ENG-97):
+    the target ``message_id`` must exist in the stream the reaction is homed in.
+    ``thread_root_id`` / ``file_ids`` / ``mentions`` existence are still deferred
+    (D8d).
 
     TOTALITY (security round 2): every ``return None`` accept path leaves the
     effective home stream id (``body.stream_id``, which reaches ``insert_event``'s
@@ -551,6 +583,39 @@ async def _check_referential(
                     code="invalid_schema",
                     detail="public channel lifecycle event must be homed in workspace-meta",
                 )
+        return None
+
+    if event_type in _REACTION_TYPES:
+        # §3.2 reaction referential check (ENG-97): the target message must EXIST
+        # in the stream the reaction is homed in. Home totality: an accept here is
+        # only reachable when the message resolves to body.stream_id, and step iii
+        # already gated can_write(body.stream_id) == can_read (workspace-scoped
+        # readable_streams_predicate), so the only accepted home is a stream in
+        # ctx.workspace_id — cross-tenant home injection is dead upstream.
+        #
+        # message_id shape guard (500-proof + D9): for the known v1 the step-iv
+        # payload model already forced a valid m_ id, but an unknown reaction
+        # version (get_payload_model("reaction.added", 2) -> None) SKIPS it, so a
+        # garbage/absent message_id must be handled here. A reference to something
+        # that is not even a message id references no real message -> the same
+        # non-disclosing unknown_message as a well-formed-but-absent reference.
+        message_id = payload.get("message_id")
+        if not isinstance(message_id, str) or not ids.is_valid_typed_id(
+            message_id, ids.IdKind.MESSAGE
+        ):
+            return Rejected(event_id="", code="unknown_message", detail=_UNKNOWN_MESSAGE_DETAIL)
+
+        # Referential existence + §2.4 homing in ONE check: the message must live
+        # in the exact stream the reaction is homed in. A message that never
+        # existed (None) and one in a DIFFERENT stream — including a private stream
+        # the author cannot read, or another workspace — both fail this equality
+        # and collapse to the identical unknown_message (no existence oracle).
+        # Duplicate reaction.added and reaction.removed of an absent reaction are
+        # NOT rejected here: idempotency/no-op is a projection concern (ENG-97),
+        # so both sequence normally as valid events.
+        home_message_stream = await _resolve_message_stream(db, message_id)
+        if home_message_stream is None or home_message_stream != body_model.stream_id:
+            return Rejected(event_id="", code="unknown_message", detail=_UNKNOWN_MESSAGE_DETAIL)
         return None
 
     # message.created and unknown D9 types: no referential branch. Home totality is

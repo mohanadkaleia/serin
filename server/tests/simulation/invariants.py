@@ -12,7 +12,8 @@ snapshot; :func:`assert_all` runs all four after every hypothesis example.
 
 from __future__ import annotations
 
-from typing import Any
+from collections import Counter
+from typing import Any, cast
 
 from msgd.core.hashing import hash_event
 
@@ -23,6 +24,8 @@ from simulation.setup import World
 TruthEvent = dict[str, Any]
 #: stream_id -> ascending list of stored events.
 Truth = dict[str, list[TruthEvent]]
+#: A ``reactions_proj`` snapshot: ``(message_id, author_user_id, emoji)`` rows.
+ReactionRows = list[tuple[str, str, str]]
 
 
 def assert_idempotency(world: World, truth: Truth) -> None:
@@ -114,7 +117,69 @@ def assert_cursor_integrity(world: World, truth: Truth) -> None:
             )
 
 
-def assert_permission_isolation(world: World) -> None:
+def _expected_reaction_set(world: World, truth: Truth) -> set[tuple[str, str, str]]:
+    """Replay the log's ``reaction.*`` events → the expected membership set.
+
+    A pure fold over server truth in ``server_sequence`` order per stream:
+    ``reaction.added`` is a set-add, ``reaction.removed`` a set-discard (§2.4).
+    All reactions for a given message are homed in that message's stream (ENG-97
+    validation), so a single-stream ordered replay is exact and order-independent
+    across streams. The result is what a correct ``reactions_proj`` MUST equal.
+    """
+    membership: set[tuple[str, str, str]] = set()
+    for stream in world.shared_streams:
+        for event in truth[stream]:  # ascending server_sequence
+            body = event["body"]
+            event_type = body.get("type")
+            if event_type not in ("reaction.added", "reaction.removed"):
+                continue
+            payload = body.get("payload") or {}
+            key = cast(
+                "tuple[str, str, str]",
+                (payload.get("message_id"), body.get("author_user_id"), payload.get("emoji")),
+            )
+            if event_type == "reaction.added":
+                membership.add(key)  # idempotent add: duplicate = no-op
+            else:
+                membership.discard(key)  # idempotent remove: absent = no-op
+    return membership
+
+
+def assert_reaction_convergence(world: World, truth: Truth, reactions: ReactionRows) -> None:
+    """§12.2/§2.4 (reactions) — ``reactions_proj`` == the set folded from the log.
+
+    Proves three things at once:
+
+    * **convergence** — the incremental projection equals the deterministic replay
+      of the same log (and every client already converged on that log via
+      :func:`assert_convergence`, which compares the full pulled event stream);
+    * **idempotency** — duplicate ``reaction.added`` and absent ``reaction.removed``
+      collapse to the set, so a byte-noisy log yields the exact membership set;
+    * **counts are a pure function of the log** — the ``(message_id, emoji) → count``
+      aggregate derived from the projection equals the one derived from the replay.
+    """
+    # The projection is a genuine set — no duplicate membership row (PK-enforced,
+    # asserted directly so a regression that drops the PK would bite here too).
+    assert len(reactions) == len(set(reactions)), (
+        f"reactions: duplicate membership row in reactions_proj: {reactions}"
+    )
+    projected = set(reactions)
+    expected = _expected_reaction_set(world, truth)
+    assert projected == expected, (
+        f"reactions: reactions_proj set != log replay; "
+        f"projected={projected!r} expected={expected!r}"
+    )
+
+    # Aggregated counts (the read-model derivation) match the log's, both ways.
+    projected_counts = Counter((mid, emoji) for (mid, _user, emoji) in projected)
+    expected_counts = Counter((mid, emoji) for (mid, _user, emoji) in expected)
+    assert projected_counts == expected_counts, (
+        f"reactions: (message,emoji) counts diverge; "
+        f"projected={projected_counts!r} expected={expected_counts!r}"
+    )
+
+
+def assert_permission_isolation(world: World, reactions: ReactionRows) -> None:
     """§12.4 — the adversary observes ZERO private-stream data (ACCEPTANCE, every run).
 
     The adversary is a workspace member but a non-member of the private channel.
@@ -122,6 +187,12 @@ def assert_permission_isolation(world: World) -> None:
     ``GET /v1/events?stream_id=<private>`` returned **404** (existence not
     disclosed, §3.6.2 — not 403); (c) its ``pulled`` contains no event whose
     ``body.stream_id`` is the private channel.  (a)/(b) are collected during settle.
+
+    ENG-97 extends the surface to reactions: (d) the adversary could NOT react to
+    a message in the private stream it cannot read (the reaction upload was
+    refused, collected during settle), and (e) it authored ZERO ``reactions_proj``
+    rows anywhere — a client cannot react to, nor leave any observable reaction on,
+    a stream it may not read.
     """
     priv = world.private_stream
     assert priv not in world.adversary_visible, (
@@ -135,10 +206,27 @@ def assert_permission_isolation(world: World) -> None:
                 "isolation: a private-stream event reached the adversary's pulled log"
             )
 
+    # (d) the adversary's react to an unreadable private message was refused.
+    assert world.adversary_reaction_forbidden, (
+        "isolation: adversary reacted to a message in the private stream it cannot read"
+    )
+    # (e) no reaction authored by the adversary landed in the projection.
+    adversary_id = world.adversary.user_id
+    assert all(author != adversary_id for (_mid, author, _emoji) in reactions), (
+        "isolation: a reaction authored by the adversary landed in reactions_proj"
+    )
 
-def assert_all(world: World, truth: Truth) -> None:
-    """Run all four skeleton invariants (called after every example)."""
+
+def assert_all(world: World, truth: Truth, reactions: ReactionRows) -> None:
+    """Run the invariants after every example (four skeleton + reaction surface).
+
+    The four §12-subset invariants plus reaction convergence/idempotency; the
+    reaction permission-isolation checks are folded into
+    :func:`assert_permission_isolation`. Rebuild ≡ incremental (invariant 6) for
+    both projections is asserted separately by the runner.
+    """
     assert_idempotency(world, truth)
     assert_convergence(world, truth)
     assert_cursor_integrity(world, truth)
-    assert_permission_isolation(world)
+    assert_reaction_convergence(world, truth, reactions)
+    assert_permission_isolation(world, reactions)

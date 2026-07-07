@@ -27,14 +27,18 @@ __all__ = [
     "BatchUploadRequest",
 ]
 
-#: The five §3.2 per-event rejection codes. Exhaustive and closed: every reject
-#: path in :mod:`msgd.events.validate` maps to exactly one of these.
+#: The §3.2 per-event rejection codes. Exhaustive and closed: every reject path
+#: in :mod:`msgd.events.validate` maps to exactly one of these. ``unknown_message``
+#: is the reaction-referential analogue of ``unknown_stream`` (ENG-97, M3): a
+#: ``reaction.*`` event whose target ``message_id`` does not exist in the stream
+#: the reaction is homed in (non-disclosing — see :mod:`msgd.events.validate`).
 RejectionCode = Literal[
     "permission_denied",
     "invalid_schema",
     "hash_mismatch",
     "payload_too_large",
     "unknown_stream",
+    "unknown_message",
 ]
 
 
