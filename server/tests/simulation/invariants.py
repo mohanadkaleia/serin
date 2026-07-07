@@ -35,6 +35,8 @@ MessageRows = list[MessageRow]
 ThreadCounterRows = list[tuple[str, int, int | None]]
 #: A ``thread_participants_proj`` snapshot: ``(root_message_id, user_id)`` rows (ENG-99).
 ThreadParticipantRows = list[tuple[str, str]]
+#: The operational ``files`` binding snapshot: ``file_id -> (stream_id, present)`` (ENG-117).
+FileBindings = dict[str, tuple[str | None, bool]]
 
 
 def assert_idempotency(world: World, truth: Truth) -> None:
@@ -373,7 +375,11 @@ def assert_thread_convergence(
 
 
 def assert_permission_isolation(
-    world: World, reactions: ReactionRows, thread_participants: ThreadParticipantRows
+    world: World,
+    truth: Truth,
+    reactions: ReactionRows,
+    thread_participants: ThreadParticipantRows,
+    files: FileBindings,
 ) -> None:
     """§12.4 — the adversary observes ZERO private-stream data (ACCEPTANCE, every run).
 
@@ -398,6 +404,15 @@ def assert_permission_isolation(
     (owner <-> actors[1]) and so cannot see it in sync, read it directly (404), nor
     write into it (refused at the stream gate) — a user cannot access, observe, or
     post to a DM they are not part of.
+
+    ENG-117 extends it to file attachments: (j) the adversary could neither attach a
+    file it uploaded INTO the private stream it cannot write (step-iii permission_denied)
+    nor BORROW the owner's private-stream file binding from a stream it CAN write
+    (unknown_file) — a writer cannot re-home another stream's file into its own message;
+    and (k) as a whole-log invariant, EVERY accepted ``message.created.file_ids`` entry
+    resolves to a PRESENT ``files`` row homed in that message's own stream (the log
+    carries only valid file bindings — the accept-time referential check, proven end to
+    end over server truth).
     """
     priv = world.private_stream
     assert priv not in world.adversary_visible, (
@@ -450,6 +465,35 @@ def assert_permission_isolation(
         "isolation: the adversary landed in thread_participants_proj"
     )
 
+    # ENG-117 (j) both adversary file-attach attempts (attach-into-private + borrow the
+    # owner's private-stream file binding) were refused.
+    assert world.adversary_file_attach_forbidden, (
+        "isolation: adversary attached a file into a stream it cannot write, "
+        "or borrowed another stream's file binding into its own message"
+    )
+    # ENG-117 (k) whole-log referential integrity: every accepted message.created.file_ids
+    # entry resolves to a PRESENT files row homed in that message's OWN stream. Rejected
+    # attaches never entered the log, so this holds over exactly the accepted bindings.
+    for stream, events in truth.items():
+        for ev in events:
+            body = ev["body"]
+            if body.get("type") != "message.created":
+                continue
+            for fid in (body.get("payload") or {}).get("file_ids") or []:
+                binding = files.get(fid)
+                assert binding is not None, (
+                    f"file binding: accepted message.created.file_ids entry {fid!r} "
+                    f"in {stream} has no files row"
+                )
+                file_stream, present = binding
+                assert present, (
+                    f"file binding: file_ids entry {fid!r} references a not-present file"
+                )
+                assert file_stream == body.get("stream_id"), (
+                    f"file binding: file_ids entry {fid!r} is homed in {file_stream!r}, "
+                    f"not the message's stream {body.get('stream_id')!r}"
+                )
+
 
 def assert_all(
     world: World,
@@ -458,13 +502,15 @@ def assert_all(
     messages: MessageRows,
     thread_counters: ThreadCounterRows,
     thread_participants: ThreadParticipantRows,
+    files: FileBindings,
 ) -> None:
     """Run the invariants after every example (four skeleton + reaction + message + thread).
 
     The four §12-subset invariants, reaction convergence/idempotency (ENG-97), message
     LWW/tombstone convergence (ENG-98), and thread reply-count/participant convergence
-    (ENG-99); the reaction + edit/delete + thread permission-isolation checks are folded
-    into :func:`assert_permission_isolation`. Rebuild ≡ incremental (invariant 6) for all
+    (ENG-99); the reaction + edit/delete + thread + file-attach permission-isolation checks
+    (and the ENG-117 whole-log file-binding referential invariant) are folded into
+    :func:`assert_permission_isolation`. Rebuild ≡ incremental (invariant 6) for all
     projections is asserted separately by the runner.
     """
     assert_idempotency(world, truth)
@@ -473,4 +519,4 @@ def assert_all(
     assert_reaction_convergence(world, truth, reactions)
     assert_message_convergence(world, truth, messages)
     assert_thread_convergence(world, truth, thread_counters, thread_participants)
-    assert_permission_isolation(world, reactions, thread_participants)
+    assert_permission_isolation(world, truth, reactions, thread_participants, files)

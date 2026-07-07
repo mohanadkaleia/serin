@@ -8,6 +8,7 @@ from eventsutil import (
     channel_created_body,
     custom_body,
     dm_created_body,
+    file_uploaded_body,
     lifecycle_body,
     message_body,
     wire_item,
@@ -17,7 +18,7 @@ from msgd.auth.sessions import utcnow
 from msgd.core import ids
 from msgd.core.envelope import Body
 from msgd.core.hashing import hash_event
-from msgd.db.models import Device, Session, Stream, StreamMember, User, Workspace
+from msgd.db.models import Device, File, Session, Stream, StreamMember, User, Workspace
 from msgd.events.validate import Accepted, Rejected, _check_referential, validate_event
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -154,11 +155,12 @@ async def test_identity_binding_mismatches(db_session: AsyncSession) -> None:
     """workspace_id / author_user_id / author_device_id ≠ session → permission_denied."""
     w = await _seed(db_session)
     auth = w.auth(w.member)
-    for override in (
+    overrides: tuple[dict[str, Any], ...] = (
         {"workspace_id": ids.new_workspace_id()},
         {"author_user_id": w.owner.user_id},
         {"author_device_id": ids.new_device_id()},
-    ):
+    )
+    for override in overrides:
         body = message_body(auth=auth, stream_id=w.pub, **override)
         out = _expect_rejected(
             await validate_event(db_session, ctx=w.member, item=wire_item(body)),
@@ -710,6 +712,233 @@ async def test_unknown_type_gated_by_read_access(db_session: AsyncSession) -> No
     body = custom_body(auth=w.auth(w.guest), stream_id=w.pub)
     _expect_rejected(
         await validate_event(db_session, ctx=w.guest, item=wire_item(body)), "permission_denied"
+    )
+
+
+# --- step vi: file-referential (ENG-117) ----------------------------------------
+#
+# ``file.uploaded`` gets NO server projection (a D9 no-op in apply_projection); its
+# ONLY server obligation is accept-time referential truth. ``files.stream_id`` is the
+# OPERATIONAL binding bound at ``POST /v1/files/initiate`` (ENG-116) — these tests seed
+# that ``files`` row directly (the accept path reads it; it is never written by a
+# projection). Every non-qualifying reference collapses to the uniform, non-disclosing
+# ``unknown_file``.
+
+_SHA_A = "a" * 64  # a valid bare-64-hex sha256 (the BlobStore key form, ENG-114/115)
+_SHA_B = "b" * 64  # a DIFFERENT valid sha — the content-identity mismatch probe
+
+
+async def _seed_file(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    stream_id: str,
+    uploaded_by: str,
+    sha256: str = _SHA_A,
+    size_bytes: int = 1024,
+    present: bool = True,
+    name: str = "diagram.png",
+    mime_type: str = "image/png",
+) -> str:
+    """Seed a ``files`` row (the operational binding, ENG-116) and return its ``file_id``.
+
+    Defaults describe the happy file: PRESENT, uploaded by ``uploaded_by``, homed in
+    ``stream_id``. Each reject test flips exactly one dimension (present / uploader /
+    workspace / stream / sha256 / size_bytes) to prove that dimension gates.
+    """
+    file_id = ids.new_file_id()
+    db.add(
+        File(
+            file_id=file_id,
+            workspace_id=workspace_id,
+            sha256=sha256,
+            name=name,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
+            uploaded_by=uploaded_by,
+            stream_id=stream_id,
+            present=present,
+        )
+    )
+    await db.flush()
+    return file_id
+
+
+async def test_file_uploaded_accepted_for_own_present_homed_file(
+    db_session: AsyncSession,
+) -> None:
+    """file.uploaded referencing the author's own PRESENT file homed in the event's
+    stream, with matching sha256 + size_bytes → Accepted."""
+    w = await _seed(db_session)
+    file_id = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+    body = file_uploaded_body(
+        auth=w.auth(w.member),
+        stream_id=w.pub,
+        file_id=file_id,
+        sha256=_SHA_A,
+        size_bytes=1024,
+    )
+    out = await validate_event(db_session, ctx=w.member, item=wire_item(body))
+    assert isinstance(out, Accepted), out
+    assert out.home_stream_id == w.pub
+
+
+async def test_file_uploaded_rejected_unknown_file_cases(db_session: AsyncSession) -> None:
+    """file.uploaded → unknown_file for every non-qualifying reference (uniform outcome).
+
+    absent · not-present · other-author · other-workspace · other-stream · sha256
+    mismatch · size_bytes mismatch — all the SAME code + detail (non-disclosing).
+    """
+    w = await _seed(db_session)
+    other_ws = ids.new_workspace_id()
+
+    # A menu of (file_id, sha256 in payload, size in payload) each isolating one fault.
+    absent_id = ids.new_file_id()
+    not_present = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id, present=False
+    )
+    other_author = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.owner.user_id
+    )
+    other_ws_file = await _seed_file(
+        db_session, workspace_id=other_ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+    # member is a private-channel member, so it CAN write priv — but a file homed in
+    # priv referenced from a file.uploaded homed in pub must still be unknown_file.
+    other_stream = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.priv, uploaded_by=w.member.user_id
+    )
+    good = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+
+    cases: list[tuple[str, str, int]] = [
+        (absent_id, _SHA_A, 1024),  # file never existed
+        (not_present, _SHA_A, 1024),  # reserved but blob never uploaded
+        (other_author, _SHA_A, 1024),  # someone else's file
+        (other_ws_file, _SHA_A, 1024),  # another workspace's file
+        (other_stream, _SHA_A, 1024),  # file homed in a DIFFERENT stream (priv, not pub)
+        (good, _SHA_B, 1024),  # content-identity: sha256 mismatch
+        (good, _SHA_A, 2048),  # content-identity: size_bytes mismatch
+    ]
+    for file_id, sha, size in cases:
+        body = file_uploaded_body(
+            auth=w.auth(w.member),
+            stream_id=w.pub,
+            file_id=file_id,
+            sha256=sha,
+            size_bytes=size,
+        )
+        out = _expect_rejected(
+            await validate_event(db_session, ctx=w.member, item=wire_item(body)), "unknown_file"
+        )
+        assert out.detail == "no such file in this stream", (file_id, out.detail)
+
+
+async def test_message_created_accepted_with_own_file_and_empty_file_ids(
+    db_session: AsyncSession,
+) -> None:
+    """message.created with file_ids=[own present file in this stream] → Accepted; and
+    accepted with empty/absent file_ids (regression guard — the common case is unperturbed)."""
+    w = await _seed(db_session)
+    file_id = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+    body = message_body(auth=w.auth(w.member), stream_id=w.pub, file_ids=[file_id])
+    out = await validate_event(db_session, ctx=w.member, item=wire_item(body))
+    assert isinstance(out, Accepted), out
+
+    # empty file_ids (explicit) → Accepted.
+    body = message_body(auth=w.auth(w.member), stream_id=w.pub, file_ids=[])
+    out = await validate_event(db_session, ctx=w.member, item=wire_item(body))
+    assert isinstance(out, Accepted), out
+
+    # absent file_ids key entirely (an unknown-version body that omits it) → Accepted.
+    body = message_body(auth=w.auth(w.member), stream_id=w.pub)
+    del body["payload"]["file_ids"]
+    body["type_version"] = 2  # unknown version skips the payload model; file_ids absent
+    out = await validate_event(db_session, ctx=w.member, item=wire_item(body))
+    assert isinstance(out, Accepted), out
+
+
+async def test_message_created_rejected_unknown_file_cases(db_session: AsyncSession) -> None:
+    """message.created.file_ids → unknown_file for every non-qualifying reference.
+
+    missing · other-author · other-workspace · OTHER-STREAM (the referential-integrity
+    case: uploaded to A, referenced from B) · not-present · one-valid-one-invalid list
+    (a single bad id rejects the WHOLE event) — all uniform unknown_file.
+    """
+    w = await _seed(db_session)
+    other_ws = ids.new_workspace_id()
+
+    missing = ids.new_file_id()
+    other_author = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.owner.user_id
+    )
+    other_ws_file = await _seed_file(
+        db_session, workspace_id=other_ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+    # Uploaded into priv (stream A) but referenced from a message homed in pub (stream B).
+    other_stream = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.priv, uploaded_by=w.member.user_id
+    )
+    not_present = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id, present=False
+    )
+    good = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+
+    bad_lists: list[list[str]] = [
+        [missing],
+        [other_author],
+        [other_ws_file],
+        [other_stream],
+        [not_present],
+        [good, missing],  # mixed: one bad id rejects the whole event
+    ]
+    for file_ids in bad_lists:
+        body = message_body(auth=w.auth(w.member), stream_id=w.pub, file_ids=file_ids)
+        out = _expect_rejected(
+            await validate_event(db_session, ctx=w.member, item=wire_item(body)), "unknown_file"
+        )
+        assert out.detail == "no such file in this stream", (file_ids, out.detail)
+
+
+async def test_message_created_file_ids_into_private_stream_denied_at_step_iii(
+    db_session: AsyncSession,
+) -> None:
+    """Private-stream attach blocked way (a): posting message.created with file_ids INTO a
+    private stream the author cannot write is stopped at step iii (permission_denied) —
+    BEFORE the file-referential check ever runs. The owner is not a priv member."""
+    w = await _seed(db_session)
+    # A file owned by the owner homed in priv would be irrelevant — the write gate fires
+    # first. Use a fresh id; the point is the step-iii refusal, not the file.
+    body = message_body(auth=w.auth(w.owner), stream_id=w.priv, file_ids=[ids.new_file_id()])
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.owner, item=wire_item(body)), "permission_denied"
+    )
+
+
+async def test_message_created_cannot_borrow_private_stream_file_binding(
+    db_session: AsyncSession,
+) -> None:
+    """Private-stream attach blocked way (b): an author who CAN write stream B but
+    references a file whose files.stream_id is a private stream A gets unknown_file —
+    proving message.created can't borrow / re-home another stream's file binding.
+
+    member can write BOTH pub (B) and priv (A). A file bound to priv, referenced from a
+    message homed in pub, still fails the same-stream homing check → unknown_file (not a
+    silent accept, and not a permission_denied — the write gate on pub passed)."""
+    w = await _seed(db_session)
+    priv_file = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.priv, uploaded_by=w.member.user_id
+    )
+    body = message_body(auth=w.auth(w.member), stream_id=w.pub, file_ids=[priv_file])
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "unknown_file"
     )
 
 

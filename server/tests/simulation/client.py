@@ -24,6 +24,8 @@ rides the same cursor-truth state model, not a rewrite).
 
 from __future__ import annotations
 
+import hashlib
+import os
 from typing import Any
 
 from authutil import auth_header
@@ -47,6 +49,9 @@ WireEvent = dict[str, Any]
 MAX_FLUSH_RETRIES = 5
 #: The biggest legal pull page (§4.3) — catch-up wants the largest page.
 PULL_LIMIT = 500
+#: Bytes per simulated upload blob — tiny (CI budget) but >=1 so ``size_bytes`` clears
+#: the ``ge=1`` initiate gate. Random content, so each upload is a genuinely new sha.
+FILE_BLOB_BYTES = 16
 
 
 class SimClient:
@@ -69,6 +74,10 @@ class SimClient:
         self.intended: dict[str, str] = {}
         #: last item enqueued by :meth:`send`, replayed by :meth:`duplicate_send`.
         self._last_item: WireItem | None = None
+        #: stream_id -> file_ids this client UPLOADED there (present, owned by it).
+        #: An :class:`~simulation.strategies.AttachToMessage` resolves against this so
+        #: an attach references a real, present, own file homed in the same stream.
+        self.uploaded_files: dict[str, list[str]] = {}
 
     @property
     def token(self) -> str:
@@ -82,15 +91,57 @@ class SimClient:
 
     # --- write path (outbox) --------------------------------------------------
 
-    async def send(self, stream_id: str, *, text: str = "hello") -> None:
+    async def send(
+        self, stream_id: str, *, text: str = "hello", file_ids: list[str] | None = None
+    ) -> None:
         """Mint a ``message.created`` and enqueue it (no network — mirrors the real
         client appending to its outbox).  The ``event_id`` is minted here, once.
+
+        ``file_ids`` (ENG-117) attaches files this client uploaded into ``stream_id``;
+        it rides straight into the message body's payload. An empty/absent ``file_ids``
+        is the unchanged common case.
         """
-        body = message_body(auth=self.auth, stream_id=stream_id, text=text)
+        body = message_body(auth=self.auth, stream_id=stream_id, text=text, file_ids=file_ids)
         item = wire_item(body)
         self.outbox.append(item)
         self._last_item = item
         self.intended[body["event_id"]] = stream_id
+
+    async def upload_file(self, stream_id: str) -> str | None:
+        """Reserve + upload a small random blob into ``stream_id`` via the REAL Files API.
+
+        A genuine ``POST /v1/files/initiate`` (random bytes → their bare-hex sha256) then
+        ``PUT /v1/files/{file_id}/blob`` (ENG-116) — NOT an event, so it bypasses the
+        outbox/cursor model. Records ``stream_id -> file_id`` on success and returns the
+        present file's id (or ``None`` if the initiate/upload was refused, e.g. an
+        adversary probing a stream it cannot write). Distinct random bytes each call, so
+        the content hash is genuinely new (``upload_needed`` is true → the PUT runs).
+        """
+        blob = os.urandom(FILE_BLOB_BYTES)
+        sha = hashlib.sha256(blob).hexdigest()
+        init = await self.http.post(
+            "/v1/files/initiate",
+            json={
+                "sha256": sha,
+                "name": "attachment.bin",
+                "mime_type": "application/octet-stream",
+                "size_bytes": len(blob),
+                "stream_id": stream_id,
+            },
+            headers=auth_header(self.token),
+        )
+        if init.status_code != 200:
+            return None
+        data = init.json()
+        file_id: str = data["file_id"]
+        if data["upload_needed"]:
+            put = await self.http.put(
+                f"/v1/files/{file_id}/blob", content=blob, headers=auth_header(self.token)
+            )
+            if put.status_code != 200:
+                return None
+        self.uploaded_files.setdefault(stream_id, []).append(file_id)
+        return file_id
 
     def known_message_ids(self, stream_id: str) -> list[str]:
         """The ``message_id``s this client has PULLED in ``stream_id`` (ascending).

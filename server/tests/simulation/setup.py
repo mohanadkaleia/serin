@@ -72,6 +72,12 @@ class World:
     #: private stream it cannot read was refused at the stream gate (or vacuously,
     #: when the private stream had no root to probe).
     adversary_thread_reply_forbidden: bool = True
+    #: ENG-117 file-attach isolation: True once BOTH adversary attach attempts were
+    #: refused — (a) attaching a file it uploaded INTO the private stream it cannot write
+    #: (step-iii permission_denied), and (b) borrowing the OWNER's private-stream file
+    #: binding from a stream it CAN write (unknown_file). Vacuously True when a probe
+    #: input was unavailable (e.g. the adversary could not upload).
+    adversary_file_attach_forbidden: bool = True
 
     @property
     def shared_streams(self) -> list[str]:

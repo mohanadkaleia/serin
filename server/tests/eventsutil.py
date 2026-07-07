@@ -35,14 +35,17 @@ def message_body(
     stream_id: str,
     text: str = "hello",
     thread_root_id: str | None = None,
+    file_ids: list[str] | None = None,
     **overrides: Any,
 ) -> dict[str, Any]:
     """A valid ``message.created`` v1 body authored by ``auth``'s principal.
 
     ``thread_root_id`` (ENG-99) makes this message a THREAD REPLY rooting on an
-    existing message id (validated m_ format). ``overrides`` are applied AFTER the
-    model dump, onto the raw dict — so tests can produce deliberately nonconforming
-    bodies (tampered scalars, bad ids) without the builder model rejecting them.
+    existing message id (validated m_ format). ``file_ids`` (ENG-117) attaches files
+    the author uploaded, each validated ``f_`` format by the payload model.
+    ``overrides`` are applied AFTER the model dump, onto the raw dict — so tests can
+    produce deliberately nonconforming bodies (tampered scalars, bad ids) without the
+    builder model rejecting them.
     """
     body = build_message_created_body(
         workspace_id=auth["workspace_id"],
@@ -52,6 +55,7 @@ def message_body(
         client_created_at=now_rfc3339(),
         text=text,
         thread_root_id=thread_root_id,
+        file_ids=file_ids,
     ).model_dump(mode="json")
     body.update(overrides)
     return body
@@ -238,6 +242,47 @@ def message_deleted_body(
         "author_device_id": auth["device_id"],
         "client_created_at": now_rfc3339(),
         "payload": {"message_id": message_id},
+    }
+    body.update(overrides)
+    return body
+
+
+def file_uploaded_body(
+    *,
+    auth: Auth,
+    stream_id: str,
+    file_id: str,
+    sha256: str,
+    name: str = "diagram.png",
+    mime_type: str = "image/png",
+    size_bytes: int = 1024,
+    type_version: int = 1,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """A ``file.uploaded`` body authored by ``auth`` (ENG-114 payload, ENG-117 accept).
+
+    §2.2 homes a ``file.uploaded`` in the stream the file is shared into, so the caller
+    passes that stream as ``stream_id`` (it must equal the operational ``files.stream_id``
+    bound at initiate for the accept-time referential check to pass). ``overrides`` are
+    applied onto the raw dict (after assembly) so tests can build deliberately
+    nonconforming bodies (mismatched sha256/size, unknown version).
+    """
+    body: dict[str, Any] = {
+        "event_id": ids.new_event_id(),
+        "workspace_id": auth["workspace_id"],
+        "stream_id": stream_id,
+        "type": "file.uploaded",
+        "type_version": type_version,
+        "author_user_id": auth["user_id"],
+        "author_device_id": auth["device_id"],
+        "client_created_at": now_rfc3339(),
+        "payload": {
+            "file_id": file_id,
+            "sha256": sha256,
+            "name": name,
+            "mime_type": mime_type,
+            "size_bytes": size_bytes,
+        },
     }
     body.update(overrides)
     return body
