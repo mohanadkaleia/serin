@@ -169,9 +169,13 @@ async def fetch_stream(db: AsyncSession, stream_id: str) -> Stream | None:
 # reaction membership row per committed reaction.added.
 # ENG-99: thread_participants_proj joins for the same reason — insert_event
 # materializes a participant row per committed threaded reply.
+# ENG-116: files joins — the file-quota concurrency test commits File rows via the
+# committing app, and files has NO FK to workspaces, so TRUNCATE ... CASCADE from
+# workspaces never reaches them; list it explicitly or committed rows leak all
+# session.
 AUTH_TABLES = (
     "sessions, devices, invites, events, messages_proj, reactions_proj, "
-    "thread_participants_proj, stream_members, streams, users, workspaces"
+    "thread_participants_proj, files, stream_members, streams, users, workspaces"
 )
 
 
