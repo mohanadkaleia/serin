@@ -150,13 +150,14 @@ uv run msgctl login ./acme --setup \
 
 **3. Open the client** at **http://localhost:8080** and log in as `owner@example.com`. You land in `#general`; send a message — it renders **optimistically** the instant you hit send (the outbox holds it as *pending*), then settles to *acked* once the server sequences it. Reads are instant because they come from the local Dexie projection, not a round-trip.
 
-**4. Prove live sync across two browsers.** Mint an invite, join as a second user, and watch the message arrive live:
+**4. Prove live sync across two browsers.** Mint an invite and hand the join URL to a second user:
 
 ```bash
-uv run msgctl invite ./acme --role member    # prints a single-use join URL; note the token
+uv run msgctl invite ./acme --role member
+# -> {"url": "http://localhost:8080/join/<token>", "expires_at": "..."}
 ```
 
-Open a second browser (or an incognito window) at http://localhost:8080, register/log in as the invited teammate, and post from either side — the other browser receives it **live via WebSocket fanout** (no reload), on uvicorn's default WS backend. Kill the network mid-send and the outbox holds your message as pending; restore it and the drain loop flushes it — reads stay instant and local throughout.
+Open the printed **join URL** (`http://localhost:8080/join/<token>`) in a second browser or an incognito window — it loads the accept-invite page, where the teammate sets a display name, email, and password to create their account and join the workspace. (Opening the bare `http://localhost:8080` would just redirect to the login page — a brand-new teammate has no account yet, so the `/join/<token>` link is what registers them.) Now post from either side — the other browser receives it **live via WebSocket fanout** (no reload), on uvicorn's default WS backend. Kill the network mid-send and the outbox holds your message as pending; restore it and the drain loop flushes it — reads stay instant and local throughout.
 
 **The Cmd+K switcher.** Press <kbd>Cmd</kbd>+<kbd>K</kbd> (<kbd>Ctrl</kbd>+<kbd>K</kbd>) to fuzzy-jump between channels/workspaces without leaving the keyboard.
 
