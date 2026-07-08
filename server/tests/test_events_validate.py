@@ -18,7 +18,16 @@ from msgd.auth.sessions import utcnow
 from msgd.core import ids
 from msgd.core.envelope import Body
 from msgd.core.hashing import hash_event
-from msgd.db.models import Device, File, Session, Stream, StreamMember, User, Workspace
+from msgd.db.models import (
+    Device,
+    File,
+    MessageProj,
+    Session,
+    Stream,
+    StreamMember,
+    User,
+    Workspace,
+)
 from msgd.events.validate import Accepted, Rejected, _check_referential, validate_event
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -905,6 +914,98 @@ async def test_message_created_rejected_unknown_file_cases(db_session: AsyncSess
             await validate_event(db_session, ctx=w.member, item=wire_item(body)), "unknown_file"
         )
         assert out.detail == "no such file in this stream", (file_ids, out.detail)
+
+
+async def test_message_created_file_ids_duplicate_same_id_accepted(
+    db_session: AsyncSession,
+) -> None:
+    """message.created whose file_ids repeats the SAME valid+own+present+same-stream id
+    several times → Accepted (dedupe collapses duplicates; a legitimate repeat is fine)."""
+    w = await _seed(db_session)
+    file_id = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+    body = message_body(
+        auth=w.auth(w.member), stream_id=w.pub, file_ids=[file_id, file_id, file_id, file_id]
+    )
+    out = await validate_event(db_session, ctx=w.member, item=wire_item(body))
+    assert isinstance(out, Accepted), out
+
+
+async def test_message_created_large_file_ids_batched_accept_and_all_or_nothing(
+    db_session: AsyncSession,
+) -> None:
+    """A LARGE file_ids list (a few hundred own present same-stream files) → Accepted via
+    the batched path; the same list with exactly ONE bad id → unknown_file (all-or-nothing
+    still holds at scale)."""
+    w = await _seed(db_session)
+    file_ids = [
+        await _seed_file(
+            db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id
+        )
+        for _ in range(300)
+    ]
+    body = message_body(auth=w.auth(w.member), stream_id=w.pub, file_ids=file_ids)
+    out = await validate_event(db_session, ctx=w.member, item=wire_item(body))
+    assert isinstance(out, Accepted), out
+
+    # One bad id (a file homed in a DIFFERENT stream) buried in the large valid list.
+    other_stream = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.priv, uploaded_by=w.member.user_id
+    )
+    poisoned = [*file_ids[:150], other_stream, *file_ids[150:]]
+    body = message_body(auth=w.auth(w.member), stream_id=w.pub, file_ids=poisoned)
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "unknown_file"
+    )
+
+    # And a large list with one ABSENT id → unknown_file too (missing id, not just mismatch).
+    poisoned_absent = [*file_ids, ids.new_file_id()]
+    body = message_body(auth=w.auth(w.member), stream_id=w.pub, file_ids=poisoned_absent)
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "unknown_file"
+    )
+
+
+async def test_thread_reply_with_file_ids(db_session: AsyncSession) -> None:
+    """A THREAD REPLY (non-null thread_root_id → a real root in the stream) that ALSO
+    carries a valid file_ids attachment → Accepted; a reply carrying a BAD file_id →
+    unknown_file (the file check runs AFTER the thread-root check passes)."""
+    w = await _seed(db_session)
+    # Seed a real root message in pub via the projection (the thread-root oracle reads it).
+    root_id = ids.new_message_id()
+    db_session.add(
+        MessageProj(
+            message_id=root_id,
+            stream_id=w.pub,
+            author_user_id=w.member.user_id,
+            text="root",
+            created_seq=1,
+            thread_root_id=None,
+        )
+    )
+    await db_session.flush()
+
+    file_id = await _seed_file(
+        db_session, workspace_id=w.ws, stream_id=w.pub, uploaded_by=w.member.user_id
+    )
+    # Reply + attachment together → Accepted.
+    body = message_body(
+        auth=w.auth(w.member), stream_id=w.pub, thread_root_id=root_id, file_ids=[file_id]
+    )
+    out = await validate_event(db_session, ctx=w.member, item=wire_item(body))
+    assert isinstance(out, Accepted), out
+
+    # Reply with a bad (absent) file_id → unknown_file (thread-root check passed first).
+    body = message_body(
+        auth=w.auth(w.member),
+        stream_id=w.pub,
+        thread_root_id=root_id,
+        file_ids=[ids.new_file_id()],
+    )
+    _expect_rejected(
+        await validate_event(db_session, ctx=w.member, item=wire_item(body)), "unknown_file"
+    )
 
 
 async def test_message_created_file_ids_into_private_stream_denied_at_step_iii(

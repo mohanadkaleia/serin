@@ -968,15 +968,46 @@ async def _check_referential(
         # content-identity (sha256/size_bytes) check lives on ``file.uploaded`` (the log
         # record of the blob); here ``file_ids`` are bare ids, so existence + ownership +
         # same-stream homing is the whole rule.
+        #
+        # DEDUPE + BATCH (review round): ``MessageCreatedV1.file_ids`` has no max length
+        # (frozen — not changed here) and the step-vii 64 KB cap is checked LATER than
+        # this branch, so a list of ~33k ids (or one id repeated ~33k times) would drive
+        # ~33k serialized PK lookups before the event is finally rejected for size. So the
+        # ids are DEDUPED and resolved in ONE batched ``IN`` query — O(1) queries
+        # regardless of list length. Semantics are byte-identical to the per-id loop:
+        # a malformed id is caught by the shape guard BEFORE any query; every DISTINCT
+        # requested id must both resolve (present + own + same workspace) AND home in
+        # ``body.stream_id``; any missing id or stream mismatch → the identical uniform
+        # ``unknown_file`` (all-or-nothing, non-disclosing). Duplicate legitimate ids are
+        # fine — dedupe collapses them, and each still resolves.
         file_ids = payload.get("file_ids")
         if isinstance(file_ids, list) and file_ids:
+            # Shape-guard every entry FIRST (500-proof + D9): a non-str / non-``f_`` id
+            # references no real file, so the same non-disclosing ``unknown_file`` as an
+            # absent reference — caught before any query touches the DB.
+            distinct_ids: set[str] = set()
             for fid in file_ids:
                 if not isinstance(fid, str) or not ids.is_valid_typed_id(fid, ids.IdKind.FILE):
                     return Rejected(event_id="", code="unknown_file", detail=_UNKNOWN_FILE_DETAIL)
-                row = await _resolve_owned_present_file(
-                    db, file_id=fid, uploaded_by=ctx.user_id, workspace_id=ctx.workspace_id
+                distinct_ids.add(fid)
+
+            # ONE batched resolution over the distinct ids (present + own + same tenant).
+            rows = (
+                await db.execute(
+                    select(File.file_id, File.stream_id).where(
+                        File.file_id.in_(distinct_ids),
+                        File.present.is_(True),
+                        File.uploaded_by == ctx.user_id,
+                        File.workspace_id == ctx.workspace_id,
+                    )
                 )
-                if row is None or row.stream_id != body_model.stream_id:
+            ).all()
+            home_by_id = {row.file_id: row.stream_id for row in rows}
+            # EVERY distinct id must resolve AND home in this event's stream. A missing id
+            # (absent / not-present / other-author / other-workspace) OR a stream mismatch
+            # (other-stream — a borrowed private binding) both fail here → unknown_file.
+            for fid in distinct_ids:
+                if home_by_id.get(fid) != body_model.stream_id:
                     return Rejected(event_id="", code="unknown_file", detail=_UNKNOWN_FILE_DETAIL)
         return None
 
