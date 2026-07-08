@@ -79,6 +79,11 @@ describe('MessageList virtualization', () => {
     // One avatar per LEADING row of a group: rows 1, 3, 4 → 3 avatars (row 2 grouped).
     expect(wrapper.findAll('[data-testid="message-avatar"]')).toHaveLength(3)
     expect(wrapper.findAll('[data-testid="message-row"]')).toHaveLength(4)
+    // EVERY row keeps the 40px avatar gutter — a grouped follow-up's text stays
+    // indented under the first message's text, never flush-left.
+    const gutters = wrapper.findAll('[data-testid="message-gutter"]')
+    expect(gutters).toHaveLength(4)
+    for (const gutter of gutters) expect(gutter.classes()).toContain('w-10')
   })
 
   it('threads the display-name map down to each row', () => {

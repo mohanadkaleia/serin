@@ -23,4 +23,16 @@ describe('WorkspaceSwitcher (ENG-136 PR-3)', () => {
     await pill.trigger('click')
     expect(wrapper.emitted('openSwitcher')).toHaveLength(1)
   })
+
+  it('renders ONLY the chevron glyph — no decorative play/forward button (user feedback)', () => {
+    const wrapper = mount(WorkspaceSwitcher, {
+      props: { workspaceName: 'Acme', workspaceInitials: 'AC' },
+    })
+    // Exactly one svg in the pill: the chevron-down. The removed no-op "play"
+    // circle (an accent-filled span with an inline svg) must not come back.
+    const svgs = wrapper.findAll('svg')
+    expect(svgs).toHaveLength(1)
+    expect(svgs[0]!.classes().join(' ')).toContain('lucide-chevron-down')
+    expect(wrapper.find('.bg-accent').exists()).toBe(false)
+  })
 })

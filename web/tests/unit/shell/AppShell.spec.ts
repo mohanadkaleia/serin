@@ -128,13 +128,13 @@ describe('AppShell (ENG-136 PR-C)', () => {
     fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
     const wrapper = await mountShell(fake, router)
 
-    await wrapper.get('[data-testid="nav-feeds"]').trigger('click')
+    await wrapper.get('[data-testid="nav-apps"]').trigger('click')
 
     // The conversation leaves are gone; the scaffold EmptyState is shown in main.
     expect(wrapper.find('[data-testid="message-list"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="composer-input"]').exists()).toBe(false)
     const main = wrapper.get('main[role="main"]')
-    expect(main.text()).toContain('Feeds')
+    expect(main.text()).toContain('Apps')
     expect(main.text()).toContain('coming soon')
   })
 

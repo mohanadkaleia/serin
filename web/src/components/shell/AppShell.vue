@@ -141,7 +141,7 @@ function onToggleDetails(): void {
             />
           </template>
 
-          <!-- Scaffold placeholder (Inbox / Feeds / Apps / Files / Admin). -->
+          <!-- Scaffold placeholder (Inbox / Apps / Files / Admin). -->
           <div v-else class="flex flex-1 items-center justify-center">
             <EmptyState v-if="scaffold" :title="scaffold.title" :description="scaffold.body" />
           </div>

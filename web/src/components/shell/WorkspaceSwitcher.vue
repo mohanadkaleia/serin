@@ -1,13 +1,10 @@
 <script setup lang="ts">
 // WorkspaceSwitcher — ENG-136 "Ranin" workspace selector pill (PR-3). A single
 // row under the sidebar header: a leading rounded workspace glyph + the REAL
-// workspace name + a `chevron-down`, and a trailing small accent circular play/
-// forward button. Clicking the pill opens the quick-switcher (Cmd+K palette),
-// preserving the `open-switcher` test-id that previously lived in the header.
-//
-// SCAFFOLD: the trailing play button is decorative (multi-workspace switching is
-// not built yet) — it is a non-interactive glyph, so the pill stays a single
-// button (no nested interactive controls).
+// workspace name + a `chevron-down`. Clicking the pill opens the quick-switcher
+// (Cmd+K palette), preserving the `open-switcher` test-id that previously lived
+// in the header. (An earlier decorative "play/forward" glyph was removed on user
+// feedback — it read as an interactive control but was a no-op.)
 import Icon from '../ui/Icon.vue'
 
 defineProps<{ workspaceName: string; workspaceInitials: string }>()
@@ -33,15 +30,6 @@ const emit = defineEmits<{ openSwitcher: [] }>()
         workspaceName
       }}</span>
       <Icon name="chevron-down" :size="16" class="shrink-0 text-muted" />
-      <!-- SCAFFOLD: decorative forward affordance (multi-workspace switch — not wired). -->
-      <span
-        aria-hidden="true"
-        class="grid h-5 w-5 shrink-0 place-items-center rounded-full bg-accent text-accent-fg"
-      >
-        <svg viewBox="0 0 12 12" class="h-2.5 w-2.5" fill="currentColor">
-          <path d="M4 2.5v7l5-3.5z" />
-        </svg>
-      </span>
     </button>
   </div>
 </template>

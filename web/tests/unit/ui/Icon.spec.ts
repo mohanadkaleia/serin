@@ -37,7 +37,6 @@ describe('ui/Icon', () => {
       ['settings', 'lucide-settings'],
       ['mail', 'lucide-mail'],
       ['users', 'lucide-users'],
-      ['rss', 'lucide-rss'],
       ['grid', 'lucide-layout-grid'],
       ['file', 'lucide-file'],
       ['shield', 'lucide-shield'],

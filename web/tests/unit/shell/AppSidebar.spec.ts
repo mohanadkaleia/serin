@@ -200,14 +200,17 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
     expect(wrapper.emitted('openSwitcher')).toHaveLength(1)
   })
 
-  it('renders the feed-first nav rows with their preserved test-ids', async () => {
+  it('renders the nav rows with their preserved test-ids (and NO Feeds section)', async () => {
     fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
     setWorkerClient(fake.client)
     const wrapper = await mountSidebar()
 
-    for (const id of ['nav-inbox', 'nav-feeds', 'nav-apps', 'nav-files', 'nav-search']) {
+    for (const id of ['nav-inbox', 'nav-apps', 'nav-files', 'nav-search']) {
       expect(wrapper.find(`[data-testid="${id}"]`).exists()).toBe(true)
     }
+    // IA (user decision): Inbox is the single triage surface — no Feeds section.
+    expect(wrapper.find('[data-testid="nav-feeds"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('Feeds')
     // A real channel row carries a leading hash icon (lucide-hash svg).
     const channel = wrapper.get('[data-testid="sidebar-channel"]')
     expect(channel.find('svg.lucide-hash').exists()).toBe(true)
@@ -220,18 +223,6 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
     const wrapper = await mountSidebar()
 
     expect(wrapper.get('[data-testid="inbox-unread"]').text()).toBe('5')
-  })
-
-  it('emits selectView("feeds") from a feed sub-item and shows its scaffold count', async () => {
-    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
-    setWorkerClient(fake.client)
-    const wrapper = await mountSidebar()
-
-    // Expand the feeds section, then click a sub-item.
-    await wrapper.get('[data-testid="nav-feeds-toggle"]').trigger('click')
-    const sub = wrapper.get('[data-testid="feed-subitem"]')
-    await sub.trigger('click')
-    expect(wrapper.emitted('selectView')?.some((e) => e[0] === 'feeds')).toBe(true)
   })
 
   it('opens the palette from the Search row (openSwitcher)', async () => {
