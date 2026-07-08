@@ -233,4 +233,62 @@ describe('MessageItem', () => {
     expect(wrapper.find('img').exists()).toBe(false)
     expect(wrapper.get('[data-testid="thread-participant"]').attributes('title')).toBe(payload)
   })
+
+  // -- ENG-136 grouping + display-name resolution ---------------------------
+
+  it('resolves the author name + avatar initial from the names map', () => {
+    const names = new Map([['u_other', 'Octavia']])
+    const wrapper = mount(MessageItem, {
+      props: { message: makeMessage({ author_user_id: 'u_other' }), names },
+    })
+    expect(wrapper.get('[data-testid="message-author"]').text()).toBe('Octavia')
+    expect(wrapper.get('[data-testid="message-avatar"]').text()).toBe('O')
+  })
+
+  it('falls back to the raw author id when the name is absent', () => {
+    const wrapper = mount(MessageItem, {
+      props: { message: makeMessage({ author_user_id: 'u_other' }) },
+    })
+    expect(wrapper.get('[data-testid="message-author"]').text()).toBe('u_other')
+    expect(wrapper.get('[data-testid="message-avatar"]').text()).toBe('U')
+  })
+
+  it('shows the avatar + header line by default (leading row)', () => {
+    const wrapper = mount(MessageItem, { props: { message: makeMessage() } })
+    expect(wrapper.find('[data-testid="message-avatar"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="message-author"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="message-time"]').exists()).toBe(true)
+  })
+
+  it('hides the avatar + name + time on a GROUPED follow-up but keeps the text', () => {
+    const wrapper = mount(MessageItem, {
+      props: { message: makeMessage({ text: 'grouped' }), showHeader: false },
+    })
+    expect(wrapper.find('[data-testid="message-avatar"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="message-author"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="message-time"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="message-text"]').text()).toBe('grouped')
+  })
+
+  // -- ENG-136 add-reaction ghost pill --------------------------------------
+
+  it('opens the shared EmojiPicker from the add-reaction ghost pill and adds a reaction', async () => {
+    const wrapper = mount(MessageItem, {
+      props: {
+        message: makeMessage({
+          reactions: [
+            { emoji: '👍', count: 1, user_ids: ['u_x'], display_names: ['X'], mine: false },
+          ],
+        }),
+      },
+    })
+    // No picker until the ghost pill is clicked.
+    expect(wrapper.find('[data-testid="reaction-picker-menu"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="add-reaction"]').trigger('click')
+    expect(wrapper.find('[data-testid="reaction-picker-menu"]').exists()).toBe(true)
+    // Picking an option emits a react (add — the picked emoji is not yet mine).
+    const options = wrapper.findAll('[data-testid="reaction-option"]')
+    await options[3]!.trigger('click')
+    expect(wrapper.emitted('react')?.[0]?.[2]).toBe(false)
+  })
 })

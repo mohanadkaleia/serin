@@ -48,7 +48,8 @@ export function useShellController() {
   const sync = useSyncStore()
 
   const { myUserId, role } = storeToRefs(auth)
-  const { selectedStream, selectedStreamId, channels, dms, mentionItems } = storeToRefs(workspace)
+  const { selectedStream, selectedStreamId, channels, dms, mentionItems, directory } =
+    storeToRefs(workspace)
   const { displayMessages, hasMore } = storeToRefs(messages)
   const { isOpen: threadOpen } = storeToRefs(thread)
 
@@ -77,6 +78,27 @@ export function useShellController() {
     if (activeView.value === 'conversation') return headerLabel.value || 'No channel selected'
     return SCAFFOLD_COPY[activeView.value].title
   })
+
+  /**
+   * Directory-backed `user_id → display_name` map (ENG-136) — threaded to the
+   * message list for author names + avatar initials. Rebuilt when the workspace
+   * directory refreshes; the raw id is the fallback in the view.
+   */
+  const names = computed<ReadonlyMap<string, string>>(() => {
+    const map = new Map<string, string>()
+    for (const u of directory.value.users) map.set(u.user_id, u.display_name)
+    return map
+  })
+
+  /**
+   * SCAFFOLD member count for the channel header (ENG-136) — a stand-in using the
+   * workspace directory user count. A per-channel roster query is a later follow-up;
+   * the header labels this honestly as an approximation.
+   */
+  const memberCount = computed(() => directory.value.users.length)
+
+  /** INTERIM unread count for the "New" divider (see MessageList's `unreadCount`). */
+  const unreadCount = computed(() => selectedStream.value?.unread ?? 0)
 
   /** Copy for the scaffold EmptyState (null when a conversation is shown). */
   const scaffold = computed(() =>
@@ -231,6 +253,9 @@ export function useShellController() {
     // computed view state
     headerLabel,
     mainTitle,
+    names,
+    memberCount,
+    unreadCount,
     scaffold,
     composerPlaceholder,
     quickItems,

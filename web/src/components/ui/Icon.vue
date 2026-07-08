@@ -17,12 +17,16 @@ import {
   ChevronDown,
   Hash,
   Mic,
+  MoreHorizontal,
   Paperclip,
+  Pin,
   Plus,
   Search,
   Send,
   Smile,
+  Star,
   Type,
+  UserPlus,
   X,
   type LucideIcon,
 } from 'lucide-vue-next'
@@ -43,6 +47,10 @@ const ICONS = {
   'chevron-down': ChevronDown,
   hash: Hash,
   search: Search,
+  star: Star,
+  'user-plus': UserPlus,
+  pin: Pin,
+  'more-horizontal': MoreHorizontal,
 } satisfies Record<string, LucideIcon>
 
 export type IconName = keyof typeof ICONS

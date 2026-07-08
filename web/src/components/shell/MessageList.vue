@@ -32,6 +32,18 @@ const props = withDefaults(
     loadOlder?: () => Promise<number>
     /** The message currently in inline-edit (ENG-102); null = none. */
     editingMessageId?: string | null
+    /**
+     * Directory `user_id → display_name` map, threaded to each row for the author
+     * name + avatar initial. Falls back to the raw id when a name is absent.
+     */
+    names?: ReadonlyMap<string, string> | undefined
+    /**
+     * INTERIM unread count for the "New" divider (ENG-136). There is no
+     * `readState.get` RPC exposed to the tab yet, so the divider is placed before
+     * the last `unreadCount` messages — a VISUAL APPROXIMATION. Exact placement
+     * needs a real read-state query (a later follow-up).
+     */
+    unreadCount?: number
   }>(),
   {
     hasMore: false,
@@ -40,6 +52,8 @@ const props = withDefaults(
     streamKey: null,
     loadOlder: () => Promise.resolve(0),
     editingMessageId: null,
+    names: undefined,
+    unreadCount: 0,
   },
 )
 
@@ -54,10 +68,14 @@ const emit = defineEmits<{
   'open-thread': [rootMessageId: string]
 }>()
 
-/** A flat render item: a day divider or a message. */
+/** Consecutive messages from the same author within this window are grouped. */
+const GROUP_WINDOW_MS = 5 * 60 * 1000
+
+/** A flat render item: a day divider, the "New" unread divider, or a message. */
 type RenderItem =
   | { type: 'divider'; key: string; label: string }
-  | { type: 'message'; key: string; message: DisplayMessage }
+  | { type: 'new'; key: string }
+  | { type: 'message'; key: string; message: DisplayMessage; showHeader: boolean }
 
 const scroller = ref<HTMLElement | null>(null)
 const scrollTop = ref(0)
@@ -66,18 +84,38 @@ let atBottom = true
 let prepending = false
 let loadingOlder = false
 
-/** Interleave day dividers between messages that cross a calendar-day boundary. */
+/**
+ * Interleave day dividers (calendar-day boundaries), the "New" unread divider, and
+ * messages — computing `showHeader` per message so consecutive messages from the
+ * same author within GROUP_WINDOW_MS render grouped (avatar/name/time hidden).
+ */
 const items = computed<RenderItem[]>(() => {
   const out: RenderItem[] = []
   let lastDay: string | null = null
-  for (const message of props.messages) {
+  let prev: DisplayMessage | null = null
+  const total = props.messages.length
+  // INTERIM: place the divider before the last `unreadCount` messages (clamped).
+  const unread = Math.min(Math.max(props.unreadCount, 0), total)
+  const firstUnreadIndex = unread > 0 ? total - unread : -1
+  props.messages.forEach((message, index) => {
     const key = dayKey(message.ts)
-    if (key !== lastDay) {
+    const dayBoundary = key !== lastDay
+    if (dayBoundary) {
       out.push({ type: 'divider', key: `d:${key}`, label: formatDayDivider(message.ts) })
       lastDay = key
     }
-    out.push({ type: 'message', key: message.message_id, message })
-  }
+    const isFirstUnread = index === firstUnreadIndex
+    if (isFirstUnread) out.push({ type: 'new', key: `new:${message.message_id}` })
+    // A day boundary or the "New" divider always starts a fresh group.
+    const showHeader =
+      dayBoundary ||
+      isFirstUnread ||
+      prev === null ||
+      prev.author_user_id !== message.author_user_id ||
+      message.ts - prev.ts > GROUP_WINDOW_MS
+    out.push({ type: 'message', key: message.message_id, message, showHeader })
+    prev = message
+  })
   return out
 })
 
@@ -188,9 +226,22 @@ onBeforeUnmount(() => {
             {{ item.label }}
           </span>
         </div>
+        <!-- INTERIM "New" unread divider (ENG-136): a rule with a right-aligned
+             accent "New" label. Placement is approximate until a readState.get RPC
+             lands (see the `unreadCount` prop note). -->
+        <div v-else-if="item.type === 'new'" class="relative my-2" data-testid="new-divider">
+          <hr class="border-subtle" />
+          <span
+            class="absolute -top-2 right-4 bg-background px-2 text-[11px] font-medium text-accent"
+          >
+            New
+          </span>
+        </div>
         <MessageItem
           v-else
           :message="item.message"
+          :show-header="item.showHeader"
+          :names="props.names"
           :editing="item.message.message_id === props.editingMessageId"
           @retry="emit('retry', $event)"
           @discard="emit('discard', $event)"
