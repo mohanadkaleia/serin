@@ -126,15 +126,43 @@ async def websocket_endpoint(websocket: WebSocket, db: DbSession) -> None:
     # Echo the negotiated subprotocol — a real browser aborts the handshake without
     # it (the token travelled in Sec-WebSocket-Protocol, security round 1).
     await websocket.accept(subprotocol=_BEARER_SUBPROTOCOL)
+    # Sample presence BEFORE registering: if the user held no socket, this connect is
+    # the 0→1 transition that makes them online (D3 — presence is DERIVED from the
+    # live registry, never persisted). register/deregister are sync; the relay is the
+    # async router's job.
+    was_online = hub.is_online(connection.user_id)
     if not hub.try_register(connection, max_connections=settings.ws_max_connections_per_user):
         # Accept-then-close so the client receives the 4029 close frame (§5).
         await websocket.close(code=WSCloseCode.TOO_MANY_CONNECTIONS)
         return
 
+    if not was_online:
+        # 0→1: relay online to same-workspace peers. Best-effort — a relay failure
+        # must never break the connection lifecycle (the frame is a hint, §3.3).
+        await _relay_presence_safely(connection, status="online")
+
     try:
-        await _serve(websocket, settings)
+        await _serve(websocket, connection, settings)
     finally:
         hub.deregister(connection)
+        if not hub.is_online(connection.user_id):
+            # 1→0: that was the user's last socket → relay offline. Best-effort in the
+            # teardown path — never let a relay failure escape the finally.
+            await _relay_presence_safely(connection, status="offline")
+
+
+async def _relay_presence_safely(connection: Connection, *, status: str) -> None:
+    """Relay a presence transition, swallowing any failure (best-effort, D3).
+
+    Presence is a convenience hint, never authoritative — a wedged peer socket or a
+    resolver hiccup must never fail this connection's accept or teardown path.
+    """
+    with contextlib.suppress(Exception):
+        await hub.publish_presence(
+            user_id=connection.user_id,
+            workspace_id=connection.workspace_id,
+            status=status,
+        )
 
 
 async def _authenticate(
@@ -181,10 +209,10 @@ async def _authenticate(
     )
 
 
-async def _serve(websocket: WebSocket, settings: Settings) -> None:
+async def _serve(websocket: WebSocket, connection: Connection, settings: Settings) -> None:
     """Run the receive loop + heartbeat concurrently; first to finish tears down."""
     state = _HeartbeatState()
-    receive_task = asyncio.create_task(_receive_loop(websocket, state))
+    receive_task = asyncio.create_task(_receive_loop(websocket, connection, state))
     heartbeat_task = asyncio.create_task(_heartbeat_loop(websocket, settings, state))
     tasks = (receive_task, heartbeat_task)
     try:
@@ -197,8 +225,10 @@ async def _serve(websocket: WebSocket, settings: Settings) -> None:
                 await task
 
 
-async def _receive_loop(websocket: WebSocket, state: _HeartbeatState) -> None:
-    """Tolerant inbound loop: ``ping`` → ``pong``, ``pong`` clears the flag, else ignore.
+async def _receive_loop(
+    websocket: WebSocket, connection: Connection, state: _HeartbeatState
+) -> None:
+    """Tolerant inbound loop: ``ping`` → ``pong``, ``pong`` clears the flag, ``typing`` relays.
 
     Any non-text / non-JSON / unknown frame is dropped without crashing (D9). Exits
     cleanly on client disconnect.
@@ -223,7 +253,35 @@ async def _receive_loop(websocket: WebSocket, state: _HeartbeatState) -> None:
                 await websocket.send_json(PONG)
         elif t == "pong":
             state.awaiting_pong = False
-        # Every other / reserved (M3) / unknown frame is ignored (D9 tolerance).
+        elif t == "typing":
+            await _handle_typing(connection, message)
+        # Every other / reserved / unknown frame is ignored (D9 tolerance). An
+        # inbound ``presence`` frame stays IGNORED — presence is server-derived,
+        # never client-asserted.
+
+
+async def _handle_typing(connection: Connection, message: dict[str, object]) -> None:
+    """Handle an inbound ``{"t":"typing","stream_id":…}`` signal (D3 ephemeral, ENG-125).
+
+    Order matters: (1) validate the shape — a missing / non-str / empty ``stream_id``
+    is silently ignored (D9, never crash); (2) rate-limit per user BEFORE any DB work
+    so a spammer cannot hammer the resolver (:meth:`Hub.allow_typing`); (3+4) the
+    permission gate + relay are folded into :meth:`Hub.publish_typing`, which resolves
+    the stream's readable connections with the SAME predicate event fanout uses, drops
+    if the sender isn't among them (``can_read`` gate, no oracle), and relays to the
+    OTHER readers only. Typing is WS-only and ephemeral — this path NEVER writes an
+    event or touches a projection.
+    """
+    stream_id = message.get("stream_id")
+    if not isinstance(stream_id, str) or not stream_id:
+        return
+    if not hub.allow_typing(connection.user_id):
+        return
+    await hub.publish_typing(
+        sender_user_id=connection.user_id,
+        workspace_id=connection.workspace_id,
+        stream_id=stream_id,
+    )
 
 
 async def _heartbeat_loop(websocket: WebSocket, settings: Settings, state: _HeartbeatState) -> None:

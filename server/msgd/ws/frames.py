@@ -14,13 +14,16 @@ against :func:`event_frame`).
 * ``{"t": "pong"}`` — reply to a client ``{"t": "ping"}``.
 * ``{"t": "ping"}`` — server heartbeat probe.
 
-**Client → server frames (M1):** ``{"t": "ping"}`` / ``{"t": "pong"}`` only.
-Any other / unknown / malformed inbound frame is ignored (D9 tolerance).
+**Client → server frames:** ``{"t": "ping"}`` / ``{"t": "pong"}`` and the inbound
+``{"t": "typing", "stream_id": …}`` signal (ENG-125). An inbound ``presence`` frame
+stays IGNORED — presence is server-derived, never client-asserted. Any other /
+unknown / malformed inbound frame is ignored (D9 tolerance).
 
-**RESERVED, NOT BUILT IN M1** (the M3 non-event signal surface, D3):
-server→client ``read_state`` / ``presence`` / ``typing`` and client→server
-``typing`` / ``presence``. Named here so M3 *extends* rather than redefines the
-``t`` space — building them now is out of scope (§13).
+**Signal-class ``t`` values** (the non-event surface, D3): server→client
+``read_state`` (ENG-123, synced KV) / ``prefs`` (ENG-124, synced KV) / ``presence``
++ ``typing`` (ENG-125, EPHEMERAL — WS-only, never persisted/projected/exported).
+All are named in ``RESERVED_*`` so each ticket *extends* rather than redefines the
+``t`` space.
 """
 
 from __future__ import annotations
@@ -39,6 +42,8 @@ __all__ = [
     "event_frame",
     "read_state_frame",
     "prefs_frame",
+    "presence_frame",
+    "typing_frame",
 ]
 
 
@@ -129,3 +134,39 @@ def prefs_frame(*, stream_id: str, level: str) -> dict[str, Any]:
     other user ever sees another's pref.
     """
     return {"t": "prefs", "stream_id": stream_id, "level": level}
+
+
+def presence_frame(*, user_id: str, status: str) -> dict[str, Any]:
+    """Build the ``{"t": "presence", …}`` online/offline frame (D3 ephemeral, ENG-125).
+
+    This ACTIVATES the reserved ``presence`` ``t`` value: the server now SENDS it.
+    Presence is the D3 **ephemeral** message class — a THIRD kind distinct from BOTH
+    durable events and synced per-user KV: WS-only, **never** appended to the log,
+    hashed, projected, rebuilt, or exported (the load-bearing negative guard). It is
+    not even persisted — it is DERIVED live from the connection registry (a user is
+    online iff they hold ≥1 live socket) and re-derived from scratch on reconnect
+    with ZERO persistence (there is no presence table). The hub emits this on the
+    0→1 (``online``) and 1→0 (``offline``) connection transitions to every OTHER
+    connection in the SAME workspace — presence never crosses a workspace boundary.
+    ``status`` is ``online`` / ``offline`` (no last-seen / custom status in scope;
+    an ``away`` state is deferred — it does not fall trivially out of the heartbeat).
+    """
+    return {"t": "presence", "user_id": user_id, "status": status}
+
+
+def typing_frame(*, stream_id: str, user_id: str) -> dict[str, Any]:
+    """Build the ``{"t": "typing", …}`` stream-scoped typing frame (D3 ephemeral, ENG-125).
+
+    This ACTIVATES the reserved ``typing`` ``t`` value: the server now SENDS it.
+    Typing is the SAME D3 **ephemeral** class as presence — WS-only, **never**
+    appended to the log, hashed, projected, rebuilt, or exported (the negative
+    guard), and never persisted. It originates as an inbound client ``typing`` frame
+    for a ``stream_id``; the hub rate-limits it, gates the sender on ``can_read`` of
+    that stream (the SAME readable-streams predicate event fanout uses, so typing
+    scoping cannot diverge from read scoping), and relays THIS frame to the stream's
+    OTHER connected readers — EXCLUDING the sender's own sockets, and never across a
+    workspace. ``user_id`` is the SENDER. TTL is a pure CLIENT concern (the client
+    shows "X is typing" for ~5 s then auto-clears); the server only relays, so no
+    TTL rides on the wire.
+    """
+    return {"t": "typing", "stream_id": stream_id, "user_id": user_id}

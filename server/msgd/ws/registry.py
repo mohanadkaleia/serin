@@ -72,6 +72,18 @@ class Registry:
         if not conns:
             del self._by_user[connection.user_id]
 
+    def is_online(self, user_id: str) -> bool:
+        """True iff ``user_id`` currently holds ≥1 live socket (D3 ephemeral presence).
+
+        Presence is DERIVED from the live registry — there is no presence table. The
+        router samples this before ``try_add`` and after ``remove`` to detect the
+        0→1 (became online) and 1→0 (went offline) transitions that drive the
+        workspace-scoped presence relay. A server restart / reconnect re-derives it
+        from scratch with zero persistence.
+        """
+        conns = self._by_user.get(user_id)
+        return conns is not None and len(conns) > 0
+
     def connections_for(self, user_id: str) -> set[Connection]:
         """Return a COPY of ``user_id``'s live sockets (empty set if none) — D3.
 
