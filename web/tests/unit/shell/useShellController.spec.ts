@@ -81,10 +81,10 @@ describe('useShellController (ENG-136 PR-B)', () => {
     setWorkerClient(fake.client)
     const { ctrl } = await mountController(router)
 
-    ctrl.setActiveView('feeds')
-    expect(ctrl.activeView.value).toBe('feeds')
-    expect(ctrl.scaffold.value?.title).toBe('Feeds')
-    expect(ctrl.mainTitle.value).toBe('Feeds')
+    ctrl.setActiveView('apps')
+    expect(ctrl.activeView.value).toBe('apps')
+    expect(ctrl.scaffold.value?.title).toBe('Apps')
+    expect(ctrl.mainTitle.value).toBe('Apps')
 
     // Selecting a real stream returns to the conversation timeline.
     ctrl.onPaletteSelect('s_a')

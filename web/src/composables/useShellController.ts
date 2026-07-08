@@ -9,7 +9,7 @@
 // (a ZERO-network projection read), the global Cmd+K opens the palette, the sync
 // store feeds the reconnect indicator, and a lightweight `activeView` flips the
 // main panel between the live conversation timeline and the scaffold placeholder
-// sections (Inbox / Feeds / Apps / Admin). No message data ever comes from the
+// sections (Inbox / Apps / Files / Admin). No message data ever comes from the
 // HTTP API — the shell reads exclusively through the worker client (via stores).
 import { computed, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { storeToRefs } from 'pinia'
@@ -24,7 +24,7 @@ import { useThreadStore } from '../stores/thread'
 import { useWorkspaceStore } from '../stores/workspace'
 
 /** Which panel the main column renders: the live timeline vs a scaffold section. */
-export type ActiveView = 'conversation' | 'inbox' | 'feeds' | 'apps' | 'files' | 'admin'
+export type ActiveView = 'conversation' | 'inbox' | 'apps' | 'files' | 'admin'
 
 /** The neutral workspace name shown in the sidebar header + rail glyph (NOT "Ranin"). */
 const WORKSPACE_NAME = 'msg'
@@ -35,7 +35,6 @@ const SCAFFOLD_COPY: Record<
   { title: string; body: string }
 > = {
   inbox: { title: 'Inbox', body: 'A unified inbox of your unreads and mentions is on the way.' },
-  feeds: { title: 'Feeds', body: 'Feeds are coming soon.' },
   apps: { title: 'Apps', body: 'Apps are coming soon.' },
   files: { title: 'Files', body: 'A workspace file browser is coming soon.' },
   admin: { title: 'Admin', body: 'Workspace administration is coming soon.' },
@@ -136,7 +135,7 @@ export function useShellController() {
     { immediate: false },
   )
 
-  /** Flip the main panel to a scaffold section (Inbox/Feeds/Apps/Admin) or the timeline. */
+  /** Flip the main panel to a scaffold section (Inbox/Apps/Files/Admin) or the timeline. */
   function setActiveView(view: ActiveView): void {
     // Navigating to a scaffold view closes any open thread so the drawer doesn't dock
     // beside a placeholder (PR-B review #4). The conversation view keeps its thread.

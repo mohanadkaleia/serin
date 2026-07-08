@@ -1,10 +1,14 @@
 <script setup lang="ts">
-// AppSidebar — ENG-136 "Ranin" feed-first sidebar (PR-3). A DUMB view over the
-// workspace store (streams + badges from the ENG-80 projection). Feed-first IA:
-// a "Ranin" wordmark header + a workspace selector pill, then Inbox (with a REAL
-// total-unread count), the REAL projection-backed DM + Channel lists, then the
-// scaffold Feeds / Apps / Files / Search / Admin sections. A pinned footer UserCard
-// shows the signed-in user with a REAL presence dot (ENG-126 presence store).
+// AppSidebar — ENG-136 "Ranin" sidebar (PR-3). A DUMB view over the workspace
+// store (streams + badges from the ENG-80 projection). IA: a "Ranin" wordmark
+// header + a workspace selector pill, then Inbox (with a REAL total-unread
+// count), the REAL projection-backed DM + Channel lists, then the scaffold
+// Apps / Files / Search / Admin sections. A pinned footer UserCard shows the
+// signed-in user with a REAL presence dot (ENG-126 presence store).
+//
+// IA NOTE (user decision): the former "Feeds" section was REMOVED — Inbox and
+// Feeds were the same triage concept, so Inbox becomes the single triage surface
+// (filter tabs land in a follow-up); a separate Feeds section was redundant.
 //
 // Clicking a channel/DM selects a stream (a local flip; the message load is a
 // separate ZERO-network projection read) and switches the main panel to the
@@ -31,7 +35,6 @@ import SidebarItem from '../ui/SidebarItem.vue'
 import ChannelBrowser from './ChannelBrowser.vue'
 import ChannelSettingsDialog from './ChannelSettingsDialog.vue'
 import CreateChannelDialog from './CreateChannelDialog.vue'
-import FeedNav from './FeedNav.vue'
 import NewDmDialog from './NewDmDialog.vue'
 import UserCard from './UserCard.vue'
 import WorkspaceSwitcher from './WorkspaceSwitcher.vue'
@@ -246,9 +249,6 @@ function dmInitial(stream: SidebarStream): string {
           </button>
         </div>
       </NavSection>
-
-      <!-- SCAFFOLD Feeds — expandable feed sub-streams (flip main to a placeholder). -->
-      <FeedNav :active="activeView === 'feeds'" @select-view="emit('selectView', 'feeds')" />
 
       <!-- SCAFFOLD single-row nav. -->
       <SidebarItem

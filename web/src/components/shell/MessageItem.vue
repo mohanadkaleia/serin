@@ -198,9 +198,10 @@ function confirmDelete(): void {
     data-testid="message-row"
     :data-state="props.message.state ?? 'settled'"
   >
-    <!-- Avatar gutter (40px). The avatar shows only on a group's LEADING row; a
-         grouped follow-up leaves the gutter empty so its content stays aligned. -->
-    <div class="w-10 shrink-0">
+    <!-- Avatar gutter (40px + the row's gap-3 = a ~52px content indent). The
+         avatar shows only on a group's LEADING row; a grouped follow-up keeps the
+         (empty) gutter so its text aligns under the first message's text. -->
+    <div class="w-10 shrink-0" data-testid="message-gutter">
       <div
         v-if="props.showHeader && !isDeleted"
         class="flex h-10 w-10 items-center justify-center rounded-full bg-accent-subtle text-sm font-semibold text-accent"

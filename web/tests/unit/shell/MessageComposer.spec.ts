@@ -130,4 +130,16 @@ describe('MessageComposer (TipTap, ENG-101)', () => {
     const wrapper = await mountComposer({ disabled: true })
     expect(wrapper.get('[data-testid="composer-send"]').attributes('disabled')).toBeDefined()
   })
+
+  it('renders the inner editor with NO border/outline/ring — the card is the only box', async () => {
+    const wrapper = await mountComposer()
+    const cls = wrapper.get('[data-testid="composer-input"]').attributes('class') ?? ''
+    // The ProseMirror node must not draw its own rectangle inside the card…
+    expect(cls).not.toMatch(/(^|\s)border(\s|$|-)/)
+    expect(cls).not.toMatch(/(^|\s)ring-/)
+    // …and must out-specify the global `:focus-visible` accent outline.
+    expect(cls).toContain('outline-none')
+    expect(cls).toContain('focus:outline-none')
+    expect(cls).toContain('focus-visible:outline-none')
+  })
 })

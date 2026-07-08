@@ -109,8 +109,12 @@ const editor = useEditor({
   editable: !props.disabled,
   editorProps: {
     attributes: {
+      // NO border/outline/ring here — the composer CARD (focus-within accent ring)
+      // is the only box. The `focus:`/`focus-visible:` variants out-specify the
+      // global `:focus-visible` accent outline in style.css, which a plain
+      // `outline-none` loses to (a contenteditable always matches :focus-visible).
       class:
-        'max-h-[200px] min-h-[1.5rem] w-full overflow-y-auto text-sm text-primary outline-none',
+        'max-h-[200px] min-h-[1.5rem] w-full overflow-y-auto text-sm text-primary outline-none focus:outline-none focus-visible:outline-none',
       'data-testid': 'composer-input',
     },
     // Enter-to-send / ArrowUp-edit — but ONLY when no mention popup is open (its

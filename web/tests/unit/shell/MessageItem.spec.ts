@@ -270,6 +270,34 @@ describe('MessageItem', () => {
     expect(wrapper.get('[data-testid="message-text"]').text()).toBe('grouped')
   })
 
+  it('indents content behind a 40px avatar gutter on a LEADING row (flex + gap-3)', () => {
+    const wrapper = mount(MessageItem, { props: { message: makeMessage() } })
+    const row = wrapper.get('[data-testid="message-row"]')
+    // Two-column row: a w-10 gutter + gap-3 → content sits ~52px from the left.
+    expect(row.classes()).toContain('flex')
+    expect(row.classes()).toContain('gap-3')
+    const gutter = row.get('[data-testid="message-gutter"]')
+    expect(gutter.classes()).toContain('w-10')
+    expect(gutter.classes()).toContain('shrink-0')
+    // The round avatar chip (accent-subtle circle) renders inside the gutter.
+    const avatar = gutter.get('[data-testid="message-avatar"]')
+    expect(avatar.classes()).toContain('rounded-full')
+    expect(avatar.classes()).toContain('bg-accent-subtle')
+    expect(avatar.classes()).toContain('text-accent')
+  })
+
+  it('keeps the (empty) gutter on a GROUPED follow-up so its text aligns under the first', () => {
+    const wrapper = mount(MessageItem, {
+      props: { message: makeMessage({ text: 'grouped' }), showHeader: false },
+    })
+    // Same left indent whether or not the avatar shows: the w-10 gutter stays,
+    // it is just empty — so the text is NOT flush-left.
+    const gutter = wrapper.get('[data-testid="message-gutter"]')
+    expect(gutter.classes()).toContain('w-10')
+    expect(gutter.classes()).toContain('shrink-0')
+    expect(gutter.find('[data-testid="message-avatar"]').exists()).toBe(false)
+  })
+
   // -- ENG-136 add-reaction ghost pill --------------------------------------
 
   it('opens the shared EmojiPicker from the add-reaction ghost pill and adds a reaction', async () => {
