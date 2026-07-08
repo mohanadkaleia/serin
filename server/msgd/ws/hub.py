@@ -30,6 +30,7 @@ this module imports only ``events.permissions`` + ``core`` + ``db``, never
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, cast
@@ -41,7 +42,13 @@ from msgd.core.envelope import Envelope
 from msgd.db.engine import get_session
 from msgd.db.models import Stream
 from msgd.events.permissions import readable_streams_predicate
-from msgd.ws.frames import event_frame, prefs_frame, read_state_frame
+from msgd.ws.frames import (
+    event_frame,
+    prefs_frame,
+    presence_frame,
+    read_state_frame,
+    typing_frame,
+)
 from msgd.ws.registry import Connection, Registry
 
 __all__ = ["Hub", "SessionFactory", "hub"]
@@ -58,6 +65,15 @@ _SEND_TIMEOUT_SECONDS: float = 3.0
 
 #: A callable yielding a short-lived read session as an async context manager.
 SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
+#: Inbound-``typing`` anti-spam window (ENG-125, D3): at most one relayed typing
+#: signal per user per this interval. A frame arriving inside the window is dropped
+#: BEFORE the ``can_read`` DB check, so a spammer cannot hammer the resolver — the
+#: gate query is bounded by this throttle. ~1/3 s ≈ 3 signals/s is ample for a
+#: "still typing" heartbeat while capping abuse. Per-user (not per-connection) so a
+#: multi-device user cannot multiply the rate; the small ``{user_id -> monotonic}``
+#: map is bounded (cleaned when the user goes fully offline — see :meth:`deregister`).
+_TYPING_THROTTLE_SECONDS: float = 1.0 / 3.0
 
 
 @asynccontextmanager
@@ -86,6 +102,10 @@ class Hub:
     def __init__(self, session_factory: SessionFactory | None = None) -> None:
         self._registry = Registry()
         self._session_factory: SessionFactory = session_factory or _production_session_scope
+        #: Per-user last-relayed-typing monotonic timestamp (the D3 anti-spam
+        #: throttle). In-memory only — like presence, typing state is NEVER
+        #: persisted. Bounded: an entry is dropped when the user goes fully offline.
+        self._typing_last: dict[str, float] = {}
 
     # --- injectable session factory + test reset (R1/R2) ---------------------
 
@@ -100,6 +120,7 @@ class Hub:
         connection state must be cleared explicitly between tests.
         """
         self._registry.clear()
+        self._typing_last.clear()
         self._session_factory = _production_session_scope
 
     # --- registry -------------------------------------------------------------
@@ -109,22 +130,115 @@ class Hub:
         return self._registry.try_add(connection, max_connections=max_connections)
 
     def deregister(self, connection: Connection) -> None:
-        """Remove a connection (the router's ``finally``; also the send-failure path)."""
+        """Remove a connection (the router's ``finally``; also the send-failure path).
+
+        When this drops the user's LAST socket, evict their typing-throttle entry so
+        the in-memory ``{user_id -> …}`` map cannot grow unbounded (D3: no leak). The
+        1→0 presence-offline relay itself is driven by the async router, which
+        re-checks :meth:`is_online` after this returns (deregister is sync).
+        """
         self._registry.remove(connection)
+        if not self._registry.is_online(connection.user_id):
+            self._typing_last.pop(connection.user_id, None)
+
+    def is_online(self, user_id: str) -> bool:
+        """True iff ``user_id`` holds ≥1 live socket — DERIVED presence (D3).
+
+        The router samples this before ``try_register`` and after ``deregister`` to
+        detect the 0→1 / 1→0 transitions that drive the presence relay. There is no
+        presence table: online-ness is purely the live registry, re-derived on
+        reconnect with zero persistence.
+        """
+        return self._registry.is_online(user_id)
 
     def connection_count(self) -> int:
         """Total live connections — the thin metrics hook (§5, no Prometheus here)."""
         return self._registry.total()
 
+    def allow_typing(self, user_id: str) -> bool:
+        """Consume one token of the per-user typing throttle (D3 anti-spam).
+
+        Returns ``True`` (and records ``now``) iff no relayed typing signal from
+        ``user_id`` fell inside the last ``_TYPING_THROTTLE_SECONDS``; otherwise
+        ``False`` (drop the frame, silently — no error, no oracle). Checked in the
+        router BEFORE the ``can_read`` DB gate so a spammer cannot force the resolver
+        to run faster than the throttle. Monotonic clock — immune to wall-clock skew.
+        """
+        now = time.monotonic()
+        last = self._typing_last.get(user_id)
+        if last is not None and now - last < _TYPING_THROTTLE_SECONDS:
+            return False
+        self._typing_last[user_id] = now
+        return True
+
     # --- fanout (§3 resolve + §4 send) ---------------------------------------
 
     async def publish(self, envelope: Envelope) -> None:
         """Resolve recipients per-send and push the event frame to each (the seam)."""
-        recipients = await self._resolve(envelope)
+        recipients = await self._resolve_readers(
+            workspace_id=envelope.body.workspace_id, stream_id=envelope.body.stream_id
+        )
         if not recipients:
             return
         frame = event_frame(envelope)
         await self._send_all(recipients, frame)
+
+    async def publish_presence(self, *, user_id: str, workspace_id: str, status: str) -> None:
+        """Relay a ``presence`` frame for ``user_id`` to their SAME-workspace peers (D3).
+
+        Presence is the D3 **ephemeral** class — WS-only, never persisted, projected,
+        or exported. The router calls this best-effort on ``user_id``'s 0→1
+        (``online``) and 1→0 (``offline``) connection transitions (presence is
+        DERIVED from the live registry, not stored). Scope = the WHOLE workspace:
+        every OTHER connection whose ``workspace_id`` matches receives the frame, so
+        connected members observe each other's presence — coarse, standard, and
+        cross-workspace-ISOLATED (``workspace_id`` rides on the Connection, so this
+        is a pure in-memory registry filter with NO DB round trip, and a different
+        workspace's socket is structurally never selected). The subject's own
+        sockets are excluded (a client does not need to hear about itself). Delivery
+        is a hint (§3.3): :meth:`_send_all` timeout-guards + drops a wedged socket
+        without propagating, so a relay failure can NEVER break the connection
+        lifecycle. No same-workspace peer connected is a no-op.
+        """
+        recipients = [
+            conn
+            for uid, conns in self._registry.snapshot().items()
+            if uid != user_id
+            for conn in conns
+            if conn.workspace_id == workspace_id
+        ]
+        if not recipients:
+            return
+        await self._send_all(recipients, presence_frame(user_id=user_id, status=status))
+
+    async def publish_typing(
+        self, *, sender_user_id: str, workspace_id: str, stream_id: str
+    ) -> None:
+        """Relay a ``typing`` frame to the stream's OTHER connected readers (D3).
+
+        Typing is the D3 **ephemeral** class — WS-only, never persisted, projected,
+        or exported. Recipient resolution reuses :meth:`_resolve_readers` — the
+        EXACT same live ``readable_streams_predicate`` event fanout uses — so typing
+        scoping cannot diverge from read scoping. The **permission gate IS that
+        resolve**: the sender is connected (they sent the frame), so they appear in
+        the readable set iff they can ``can_read`` the stream; if they do NOT appear,
+        the frame is dropped with no relay and no error (no oracle — a non-reader
+        never learns the stream exists). Otherwise the frame goes to every readable
+        connection EXCLUDING the sender's own sockets (you don't show yourself
+        typing) and never across a workspace (the resolver already filtered by
+        ``workspace_id``). TTL (~5 s) is a pure client concern — the server only
+        relays. Delivery is a hint (per-socket timeout + drop). No other reader is a
+        no-op. The caller rate-limits via :meth:`allow_typing` before this runs.
+        """
+        recipients = await self._resolve_readers(workspace_id=workspace_id, stream_id=stream_id)
+        # Permission gate == the fanout predicate: the sender can read the stream iff
+        # one of the resolved readers is the sender. If not, drop (no oracle).
+        if not any(conn.user_id == sender_user_id for conn in recipients):
+            return
+        others = [conn for conn in recipients if conn.user_id != sender_user_id]
+        if not others:
+            return
+        await self._send_all(others, typing_frame(stream_id=stream_id, user_id=sender_user_id))
 
     async def publish_read_state(self, *, user_id: str, stream_id: str, last_read_seq: int) -> None:
         """Echo a ``read_state`` frame to EVERY connection of ``user_id`` — and no one else (D3).
@@ -182,14 +296,14 @@ class Hub:
             return
         await self._send_all(recipients, frame)
 
-    async def _resolve(self, envelope: Envelope) -> list[Connection]:
+    async def _resolve_readers(self, *, workspace_id: str, stream_id: str) -> list[Connection]:
         """Return every connected socket whose user may currently read the stream.
 
-        One ``EXISTS`` per **distinct** connected user in the envelope's workspace;
-        users in another workspace are skipped without a query (§3b).
+        One ``EXISTS`` per **distinct** connected user in ``workspace_id``; users in
+        another workspace are skipped without a query (§3b). The SINGLE shared
+        stream-readable resolver behind BOTH event fanout (:meth:`publish`) and the
+        typing relay (:meth:`publish_typing`), so the two can never diverge in scope.
         """
-        stream_id = envelope.body.stream_id
-        workspace_id = envelope.body.workspace_id
         by_user = self._registry.snapshot()
         if not by_user:
             return []
