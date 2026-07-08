@@ -1,15 +1,19 @@
 <script setup lang="ts">
 // NewDmDialog — pick a workspace member → `dm.create` (ENG-104). Members come from
 // the local `directory` projection (zero-network). On success the store switches to
-// the new DM stream. 1:1 for M3 (group DM deferred).
+// the new DM stream. 1:1 for M3 (group DM deferred). Each candidate row carries a
+// REAL presence dot (ENG-128, ephemeral worker snapshot — unknown ⇒ offline).
 import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 
+import { usePresenceStore } from '../../stores/presence'
 import { useWorkspaceStore } from '../../stores/workspace'
+import PresenceDot from '../ui/PresenceDot.vue'
 
 const emit = defineEmits<{ close: [] }>()
 
 const workspace = useWorkspaceStore()
+const presence = usePresenceStore()
 const { directory } = storeToRefs(workspace)
 const filter = ref('')
 const busy = ref(false)
@@ -70,6 +74,11 @@ async function start(userId: string): Promise<void> {
             :disabled="busy"
             @click="start(user.user_id)"
           >
+            <PresenceDot
+              :status="presence.statusOf(user.user_id)"
+              size="sm"
+              class="mr-2 shrink-0"
+            />
             {{ user.display_name }}
           </button>
         </li>

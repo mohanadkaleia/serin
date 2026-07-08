@@ -65,6 +65,8 @@ export {
   type PresenceStatus,
   type PresenceEntry,
   type PresencePush,
+  // ENG-126 ephemeral typing (ENG-128 typing indicator reads this).
+  type TypingPush,
   // ENG-124/126 notification prefs (ENG-129 per-channel selector reads these).
   type PrefLevel,
   type PrefsRow,

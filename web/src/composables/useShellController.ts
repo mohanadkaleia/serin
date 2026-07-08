@@ -58,6 +58,9 @@ export function useShellController() {
   const presence = usePresenceStore()
 
   const { myUserId, role } = storeToRefs(auth)
+  // Live presence snapshot (ENG-128): `user_id → status`, threaded to the message
+  // list so author avatars carry a REAL presence dot. Ephemeral, worker-owned.
+  const { statuses: presenceStatuses } = storeToRefs(presence)
   const { selectedStream, selectedStreamId, channels, dms, mentionItems, directory } =
     storeToRefs(workspace)
   const { displayMessages, hasMore } = storeToRefs(messages)
@@ -336,6 +339,8 @@ export function useShellController() {
     workspaceName,
     workspaceInitials,
     // store-derived refs
+    myUserId,
+    presenceStatuses,
     selectedStream,
     selectedStreamId,
     channels,

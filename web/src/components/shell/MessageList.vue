@@ -13,6 +13,7 @@ import { computed, nextTick, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 
 import type { DisplayMessage } from '../../stores/messages'
 import { dayKey, formatDayDivider } from '../../lib/time'
+import type { PresenceStatus } from '../../worker'
 import MessageItem from './MessageItem.vue'
 
 const props = withDefaults(
@@ -38,6 +39,11 @@ const props = withDefaults(
      */
     names?: ReadonlyMap<string, string> | undefined
     /**
+     * Live presence `user_id → status` map (ENG-128), threaded to each row for the
+     * author avatar's presence dot. Absent ⇒ rows render no dot.
+     */
+    presence?: ReadonlyMap<string, PresenceStatus> | undefined
+    /**
      * INTERIM unread count for the "New" divider (ENG-136). There is no
      * `readState.get` RPC exposed to the tab yet, so the divider is placed before
      * the last `unreadCount` messages — a VISUAL APPROXIMATION. Exact placement
@@ -53,6 +59,7 @@ const props = withDefaults(
     loadOlder: () => Promise.resolve(0),
     editingMessageId: null,
     names: undefined,
+    presence: undefined,
     unreadCount: 0,
   },
 )
@@ -242,6 +249,7 @@ onBeforeUnmount(() => {
           :message="item.message"
           :show-header="item.showHeader"
           :names="props.names"
+          :presence="props.presence"
           :editing="item.message.message_id === props.editingMessageId"
           @retry="emit('retry', $event)"
           @discard="emit('discard', $event)"
