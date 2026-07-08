@@ -32,6 +32,12 @@ __all__ = [
 #: is the reaction-referential analogue of ``unknown_stream`` (ENG-97, M3): a
 #: ``reaction.*`` event whose target ``message_id`` does not exist in the stream
 #: the reaction is homed in (non-disclosing — see :mod:`msgd.events.validate`).
+#: ``unknown_file`` is the file-referential analogue (ENG-117, M3.5): a
+#: ``message.created.file_ids`` (or a ``file.uploaded``) reference that does not
+#: resolve to a PRESENT file UPLOADED BY THE AUTHOR in the event's HOMED stream —
+#: every non-qualifying shape (absent / not-present / other-author / other-workspace
+#: / other-stream / content-identity mismatch) collapses to this one uniform,
+#: non-disclosing outcome (see :mod:`msgd.events.validate`).
 RejectionCode = Literal[
     "permission_denied",
     "invalid_schema",
@@ -39,6 +45,7 @@ RejectionCode = Literal[
     "payload_too_large",
     "unknown_stream",
     "unknown_message",
+    "unknown_file",
 ]
 
 

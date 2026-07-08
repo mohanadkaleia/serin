@@ -164,6 +164,37 @@ class ThreadReply:
     text: str
 
 
+@dataclass(frozen=True)
+class UploadFile:
+    """``actor`` reserves + uploads a small blob into ``stream`` via the real Files API.
+
+    A genuine ``POST /v1/files/initiate`` + ``PUT /v1/files/{id}/blob`` (ENG-116),
+    NOT an event — it materializes the operational ``files`` row (present, homed in
+    ``stream``, owned by ``actor``) that a later :class:`AttachToMessage` references.
+    Each upload uses distinct random bytes so it is a genuinely new content hash.
+    """
+
+    actor: int
+    stream: int
+
+
+@dataclass(frozen=True)
+class AttachToMessage:
+    """``actor`` sends a ``message.created`` into ``stream`` attaching a prior upload.
+
+    ``file`` selects among the files ``actor`` has UPLOADED into ``stream`` (resolved
+    modulo at apply time; a no-op if it uploaded none there yet — the reaction/reply
+    unresolved-op pattern). Because the referenced file is the actor's own present file
+    homed in ``stream``, the attach is Accepted (ENG-117) and the ``file_ids`` binding is
+    genuinely exercised through the log + the referential invariant.
+    """
+
+    actor: int
+    stream: int
+    file: int
+    text: str
+
+
 Op = (
     Send
     | DuplicateSend
@@ -176,6 +207,8 @@ Op = (
     | Edit
     | Delete
     | ThreadReply
+    | UploadFile
+    | AttachToMessage
 )
 
 #: Reaction emoji domain sampled by the strategy. Deliberately exercises the
@@ -212,6 +245,10 @@ MAX_BURST = 3
 #: duplicate reactions on the SAME message likely, so the idempotent-add /
 #: absent-remove set semantics are exercised, not just distinct singletons).
 MAX_MSG_REF = 3
+#: How many distinct uploaded files an attach op may reference (resolved modulo the
+#: files the actor actually uploaded into the stream at apply time — a tiny pool keeps
+#: attaches likely to resolve to a real prior upload).
+MAX_FILE_REF = 2
 _TEXTS = ("a", "hi", "msg", "z9", "hello")
 
 
@@ -221,6 +258,7 @@ def _op(n: int) -> st.SearchStrategy[Op]:
     stream = st.integers(min_value=0, max_value=1)
     text = st.sampled_from(_TEXTS)
     msg = st.integers(min_value=0, max_value=MAX_MSG_REF - 1)
+    file = st.integers(min_value=0, max_value=MAX_FILE_REF - 1)
     emoji = st.integers(min_value=0, max_value=len(REACT_EMOJIS) - 1)
     return st.one_of(
         st.builds(Send, actor=actor, stream=stream, text=text),
@@ -244,6 +282,8 @@ def _op(n: int) -> st.SearchStrategy[Op]:
         st.builds(Edit, actor=actor, stream=stream, msg=msg, text=text),
         st.builds(Delete, actor=actor, stream=stream, msg=msg),
         st.builds(ThreadReply, actor=actor, stream=stream, msg=msg, text=text),
+        st.builds(UploadFile, actor=actor, stream=stream),
+        st.builds(AttachToMessage, actor=actor, stream=stream, file=file, text=text),
     )
 
 

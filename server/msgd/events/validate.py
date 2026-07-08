@@ -55,7 +55,7 @@ from msgd.core.envelope import MAX_EVENT_SIZE_BYTES, Body
 from msgd.core.hashing import hash_event
 from msgd.core.jcs import JCSError
 from msgd.core.payloads import get_payload_model
-from msgd.db.models import MessageProj, Stream
+from msgd.db.models import File, MessageProj, Stream
 from msgd.events.permissions import can_read, can_write
 
 __all__ = ["Accepted", "Rejected", "validate_event"]
@@ -76,6 +76,11 @@ _WRITE_MATRIX_TYPES = frozenset(
         "channel.member_added",
         "channel.member_removed",
         "dm.created",
+        # ENG-117: gated by ``can_write`` (which already implements write == read
+        # for ``file.uploaded``, ENG-116) EXPLICITLY, rather than falling through to
+        # the D9 ``can_read`` else-branch. Same predicate, but correct and intentional
+        # — ``file.uploaded`` is a known M3.5 type, not an unknown D9 type.
+        "file.uploaded",
     }
 )
 
@@ -115,6 +120,24 @@ _STREAM_DENIED_DETAIL = "not permitted to write to this stream"
 #: never-existed message and a message in a stream the author cannot see collapse
 #: to the identical outcome (D13 non-disclosure — no cross-stream existence oracle).
 _UNKNOWN_MESSAGE_DETAIL = "no such message in this stream"
+
+#: File-referential types whose ``file.uploaded`` payload names a single ``file_id``
+#: that must resolve to the author's OWN present file homed in the event's stream
+#: (ENG-117). ``message.created`` carries its file references in ``payload.file_ids``
+#: instead, so it is NOT in this set — its branch resolves each id inline.
+_FILE_TYPES = frozenset({"file.uploaded"})
+
+#: Uniform detail for a file reference (``file.uploaded.file_id`` or a
+#: ``message.created.file_ids`` entry) that does not resolve to a PRESENT file the
+#: AUTHOR uploaded in the event's HOMED stream. Like ``_UNKNOWN_MESSAGE_DETAIL`` it
+#: must NOT vary with which non-qualifying case occurred: absent, not-present,
+#: other-author, other-workspace, other-stream, and a content-identity (sha256 /
+#: size_bytes) mismatch ALL collapse to the identical outcome, so the file binding
+#: is never a cross-stream/cross-tenant existence oracle (D13 non-disclosure). In
+#: particular this stops a ``message.created`` from BORROWING a file whose
+#: ``files.stream_id`` binding (bound at ``initiate``, ENG-116) is a private stream
+#: the author cannot legitimately learn about.
+_UNKNOWN_FILE_DETAIL = "no such file in this stream"
 
 
 @dataclass
@@ -260,6 +283,52 @@ async def _resolve_message_home_and_author(
     if row is None:
         return None
     return row[0], row[1]
+
+
+async def _resolve_owned_present_file(
+    db: AsyncSession, *, file_id: str, uploaded_by: str, workspace_id: str
+) -> Any | None:
+    """The ``(stream_id, sha256, name, mime_type, size_bytes)`` of a file that is
+    PRESENT, uploaded by ``uploaded_by``, in ``workspace_id`` — or ``None`` (ENG-117).
+
+    The file-referential oracle (ENG-117). ``files.stream_id`` is the OPERATIONAL
+    binding bound at ``POST /v1/files/initiate`` under a write-access gate (ENG-116);
+    this reads that authoritative row directly (there is deliberately no projection
+    that writes ``files.stream_id`` — a second authoritative writer). The filter is
+    the whole non-disclosure story: EVERY non-qualifying shape resolves to ``None``
+    and thus to the identical ``unknown_file`` at the call site —
+
+    * ``File.present.is_(True)`` — a merely-initiated (not-yet-uploaded) row is
+      invisible, exactly as it is to download/dedup (ENG-116), so an initiate that
+      never completed is not a content-existence oracle;
+    * ``uploaded_by == author`` — a file another user uploaded is unreferenceable
+      (you may only attach files YOU uploaded), so a reference cannot confirm the
+      existence of, nor re-home, another principal's file;
+    * ``workspace_id`` scoping — a cross-tenant file id resolves to ``None`` exactly
+      like a never-existed id (no cross-tenant existence oracle).
+
+    Same-STREAM homing (``row.stream_id == body.stream_id``) and content identity
+    (``sha256`` / ``size_bytes``) are checked at the call site, not here, so this
+    resolver stays a pure existence+ownership lookup returning the fields both those
+    checks need.
+    """
+    row = (
+        await db.execute(
+            select(
+                File.stream_id,
+                File.sha256,
+                File.name,
+                File.mime_type,
+                File.size_bytes,
+            ).where(
+                File.file_id == file_id,
+                File.present.is_(True),
+                File.uploaded_by == uploaded_by,
+                File.workspace_id == workspace_id,
+            )
+        )
+    ).first()
+    return row
 
 
 async def validate_event(db: AsyncSession, *, ctx: AuthContext, item: Any) -> Accepted | Rejected:
@@ -455,8 +524,12 @@ async def _check_referential(
     ``message.edited`` / ``message.deleted`` add the same message-referential check
     plus an **author-or-admin** authorization gate (ENG-98). ``message.created`` adds
     a **thread-root** referential check (ENG-99): a non-null ``thread_root_id`` must
-    reference an existing NON-reply message in the reply's own stream. ``file_ids`` /
-    ``mentions`` existence are still deferred (D8d).
+    reference an existing NON-reply message in the reply's own stream. ``file.uploaded``
+    and ``message.created.file_ids`` add a **file-referential** check (ENG-117): every
+    referenced ``file_id`` must resolve to a PRESENT file the AUTHOR uploaded, homed in
+    the event's own stream (``unknown_file`` otherwise) — ``file.uploaded`` additionally
+    pins the content identity (``sha256`` / ``size_bytes``). ``mentions`` existence is
+    still deferred (D8d).
 
     TOTALITY (security round 2): every ``return None`` accept path leaves the
     effective home stream id (``body.stream_id``, which reaches ``insert_event``'s
@@ -797,6 +870,55 @@ async def _check_referential(
         # a projection concern (ENG-98 apply.py), never a reject here.
         return None
 
+    if event_type in _FILE_TYPES:
+        # §3.2 file-referential check (ENG-117). A ``file.uploaded`` is a durable,
+        # replicated LOG RECORD of an already-reserved blob — it runs NO server
+        # projection (a D9 no-op in apply_projection, exactly like a meta event), so
+        # its ONLY server obligation is accept-time referential truth: the named
+        # ``file_id`` must resolve to a PRESENT file the AUTHOR uploaded, homed in the
+        # exact stream this event is homed in, with a truthful content identity.
+        #
+        # Home totality: an accept here is only reachable for ``body.stream_id`` already
+        # ``can_write``-gated at step iii (write == read for ``file.uploaded``, ENG-116,
+        # == the workspace-scoped readable predicate), so the only accepted home is a
+        # stream in ``ctx.workspace_id`` — cross-tenant home injection is dead upstream,
+        # exactly as for ``message.created``.
+        #
+        # file_id shape guard (500-proof + D9): the known v1 payload model already forced
+        # a valid ``f_`` id, but an unknown ``file.uploaded`` version
+        # (get_payload_model("file.uploaded", 2) -> None) SKIPS it, so a garbage/absent
+        # file_id must be handled here — it references no real file, so the SAME
+        # non-disclosing ``unknown_file`` as a well-formed-but-absent reference (never
+        # invalid_schema, to keep ONE uniform non-disclosing outcome).
+        file_id = payload.get("file_id")
+        if not isinstance(file_id, str) or not ids.is_valid_typed_id(file_id, ids.IdKind.FILE):
+            return Rejected(event_id="", code="unknown_file", detail=_UNKNOWN_FILE_DETAIL)
+
+        # Resolve the author's OWN present file in this workspace (operational
+        # ``files`` row, bound at initiate — ENG-116). ``None`` for every non-qualifying
+        # shape (absent / not-present / other-author / other-workspace) keeps the
+        # outcome uniform; the remaining two gates below are same-stream homing and
+        # content identity.
+        row = await _resolve_owned_present_file(
+            db, file_id=file_id, uploaded_by=ctx.user_id, workspace_id=ctx.workspace_id
+        )
+        # (a) EXISTS + owned + present, (b) homed in THIS event's stream (a file may not
+        # be re-homed / borrowed into another stream than its operational binding), and
+        # (c) content identity: the payload's ``sha256`` + ``size_bytes`` — the
+        # load-bearing truthful-log fields (download authz and dedup key on them) — must
+        # equal the reserved row's. ``name`` / ``mime_type`` are DISPLAY fields only: a
+        # mismatch is harmless to authz (download never echoes them), so they are
+        # deliberately NOT gated here. Any failure collapses to the identical
+        # ``unknown_file``.
+        if (
+            row is None
+            or row.stream_id != body_model.stream_id
+            or payload.get("sha256") != row.sha256
+            or payload.get("size_bytes") != row.size_bytes
+        ):
+            return Rejected(event_id="", code="unknown_file", detail=_UNKNOWN_FILE_DETAIL)
+        return None
+
     if event_type == "message.created":
         # §3.2 thread-root referential check (ENG-99, D7). A message.created with a
         # non-null thread_root_id is a THREAD REPLY: the root must EXIST, live in the
@@ -808,30 +930,85 @@ async def _check_referential(
         # only accepted home is a stream in ctx.workspace_id — cross-tenant home
         # injection is dead upstream, exactly as for a top-level message.created.
         thread_root_id = payload.get("thread_root_id")
-        if thread_root_id is None:
-            return None  # top-level message — no thread root to resolve.
+        if thread_root_id is not None:
+            # Shape guard (500-proof + D9): the known v1 payload model already forced a
+            # valid m_ id, but an unknown message.created version skips it, so a
+            # garbage/mistyped thread_root_id must be handled here — it references no real
+            # message, so the same non-disclosing unknown_message as a well-formed-absent
+            # reference (never invalid_schema, to keep ONE uniform non-disclosing outcome).
+            if not isinstance(thread_root_id, str) or not ids.is_valid_typed_id(
+                thread_root_id, ids.IdKind.MESSAGE
+            ):
+                return Rejected(event_id="", code="unknown_message", detail=_UNKNOWN_MESSAGE_DETAIL)
 
-        # Shape guard (500-proof + D9): the known v1 payload model already forced a
-        # valid m_ id, but an unknown message.created version skips it, so a
-        # garbage/mistyped thread_root_id must be handled here — it references no real
-        # message, so the same non-disclosing unknown_message as a well-formed-absent
-        # reference (never invalid_schema, to keep ONE uniform non-disclosing outcome).
-        if not isinstance(thread_root_id, str) or not ids.is_valid_typed_id(
-            thread_root_id, ids.IdKind.MESSAGE
-        ):
-            return Rejected(event_id="", code="unknown_message", detail=_UNKNOWN_MESSAGE_DETAIL)
+            # Existence + §2.2 same-stream homing + flat-thread (non-reply root) in ONE
+            # check. A root that never existed (None), one in a DIFFERENT stream (private/
+            # unreadable or another workspace), AND one that is ITSELF a reply (reply-of-
+            # reply — forbidden by the flat-channel model, D7) all collapse to the identical
+            # unknown_message: existence is never disclosed, and the reply-of-reply case is
+            # within a readable stream so folding it into the same outcome leaks nothing.
+            # Replying into a DELETED root's thread is ALLOWED — the tombstone row still
+            # resolves with its stream_id + null thread_root_id (_resolve_message_home_and_root).
+            resolved = await _resolve_message_home_and_root(db, thread_root_id)
+            if resolved is None or resolved[0] != body_model.stream_id or resolved[1] is not None:
+                return Rejected(event_id="", code="unknown_message", detail=_UNKNOWN_MESSAGE_DETAIL)
 
-        # Existence + §2.2 same-stream homing + flat-thread (non-reply root) in ONE
-        # check. A root that never existed (None), one in a DIFFERENT stream (private/
-        # unreadable or another workspace), AND one that is ITSELF a reply (reply-of-
-        # reply — forbidden by the flat-channel model, D7) all collapse to the identical
-        # unknown_message: existence is never disclosed, and the reply-of-reply case is
-        # within a readable stream so folding it into the same outcome leaks nothing.
-        # Replying into a DELETED root's thread is ALLOWED — the tombstone row still
-        # resolves with its stream_id + null thread_root_id (see _resolve_message_home_and_root).
-        resolved = await _resolve_message_home_and_root(db, thread_root_id)
-        if resolved is None or resolved[0] != body_model.stream_id or resolved[1] is not None:
-            return Rejected(event_id="", code="unknown_message", detail=_UNKNOWN_MESSAGE_DETAIL)
+        # §3.2 file-attachment referential check (ENG-117). ``file_ids`` names the files
+        # this message attaches; each must resolve to a PRESENT file the AUTHOR uploaded,
+        # homed in THIS message's stream. This runs for BOTH a top-level message and a
+        # thread reply (a reply attaches files too). An empty or absent ``file_ids`` is a
+        # no-op — the overwhelming common case passes unchanged with no extra query.
+        #
+        # This is the same operational ``files`` binding as ``file.uploaded`` above, so a
+        # message can only attach files that are already reserved in its OWN stream: it
+        # cannot BORROW / re-home a file whose ``files.stream_id`` is a private stream A
+        # (the author, even one who CAN write stream B, gets ``unknown_file`` — proving
+        # message.created can't re-home another stream's file binding). A mixed list with
+        # ONE bad id rejects the whole event (all-or-nothing referential integrity). The
+        # content-identity (sha256/size_bytes) check lives on ``file.uploaded`` (the log
+        # record of the blob); here ``file_ids`` are bare ids, so existence + ownership +
+        # same-stream homing is the whole rule.
+        #
+        # DEDUPE + BATCH (review round): ``MessageCreatedV1.file_ids`` has no max length
+        # (frozen — not changed here) and the step-vii 64 KB cap is checked LATER than
+        # this branch, so a list of ~33k ids (or one id repeated ~33k times) would drive
+        # ~33k serialized PK lookups before the event is finally rejected for size. So the
+        # ids are DEDUPED and resolved in ONE batched ``IN`` query — O(1) queries
+        # regardless of list length. Semantics are byte-identical to the per-id loop:
+        # a malformed id is caught by the shape guard BEFORE any query; every DISTINCT
+        # requested id must both resolve (present + own + same workspace) AND home in
+        # ``body.stream_id``; any missing id or stream mismatch → the identical uniform
+        # ``unknown_file`` (all-or-nothing, non-disclosing). Duplicate legitimate ids are
+        # fine — dedupe collapses them, and each still resolves.
+        file_ids = payload.get("file_ids")
+        if isinstance(file_ids, list) and file_ids:
+            # Shape-guard every entry FIRST (500-proof + D9): a non-str / non-``f_`` id
+            # references no real file, so the same non-disclosing ``unknown_file`` as an
+            # absent reference — caught before any query touches the DB.
+            distinct_ids: set[str] = set()
+            for fid in file_ids:
+                if not isinstance(fid, str) or not ids.is_valid_typed_id(fid, ids.IdKind.FILE):
+                    return Rejected(event_id="", code="unknown_file", detail=_UNKNOWN_FILE_DETAIL)
+                distinct_ids.add(fid)
+
+            # ONE batched resolution over the distinct ids (present + own + same tenant).
+            rows = (
+                await db.execute(
+                    select(File.file_id, File.stream_id).where(
+                        File.file_id.in_(distinct_ids),
+                        File.present.is_(True),
+                        File.uploaded_by == ctx.user_id,
+                        File.workspace_id == ctx.workspace_id,
+                    )
+                )
+            ).all()
+            home_by_id = {row.file_id: row.stream_id for row in rows}
+            # EVERY distinct id must resolve AND home in this event's stream. A missing id
+            # (absent / not-present / other-author / other-workspace) OR a stream mismatch
+            # (other-stream — a borrowed private binding) both fail here → unknown_file.
+            for fid in distinct_ids:
+                if home_by_id.get(fid) != body_model.stream_id:
+                    return Rejected(event_id="", code="unknown_file", detail=_UNKNOWN_FILE_DETAIL)
         return None
 
     # unknown D9 types: no referential branch. Home totality is upheld UPSTREAM at

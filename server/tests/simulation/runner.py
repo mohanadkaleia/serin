@@ -18,7 +18,7 @@ import asyncio
 
 from authutil import committing_app, truncate_auth_tables
 from eventsutil import message_body, message_edited_body, post_batch, reaction_body, wire_item
-from msgd.db.models import Event, MessageProj, ReactionProj, ThreadParticipantProj
+from msgd.db.models import Event, File, MessageProj, ReactionProj, ThreadParticipantProj
 from msgd.projections.dump import (
     dump_messages_proj,
     dump_reactions_proj,
@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from simulation.client import SimClient
 from simulation.invariants import (
+    FileBindings,
     MessageRows,
     ReactionRows,
     ThreadCounterRows,
@@ -41,6 +42,7 @@ from simulation.invariants import (
 from simulation.setup import World, build_world
 from simulation.strategies import (
     REACT_EMOJIS,
+    AttachToMessage,
     ConcurrentReactBurst,
     ConcurrentSendBurst,
     Delete,
@@ -54,6 +56,7 @@ from simulation.strategies import (
     Send,
     ThreadReply,
     Unreact,
+    UploadFile,
 )
 
 
@@ -123,6 +126,21 @@ async def _apply_op(world: World, op: Op) -> None:
         await actor.reply(stream, root_id, text=op.text)
         if actor.connected:
             await actor.flush()
+    elif isinstance(op, UploadFile):
+        actor = world.actors[op.actor]
+        if actor.connected:
+            # Real Files API initiate + blob (ENG-116); materializes the operational
+            # ``files`` row a later AttachToMessage references. Not an event.
+            await actor.upload_file(world.stream_id(op.stream))
+    elif isinstance(op, AttachToMessage):
+        actor = world.actors[op.actor]
+        stream = world.stream_id(op.stream)
+        file_id = _resolve_uploaded_file(actor, stream, op.file)
+        if file_id is None:
+            return  # the actor uploaded no file into this stream yet → a no-op
+        await actor.send(stream, text=op.text, file_ids=[file_id])
+        if actor.connected:
+            await actor.flush()
     elif isinstance(op, ConcurrentReactBurst):
         stream = world.stream_id(op.stream)
         participants = [a for a in world.actors if a.connected]
@@ -163,6 +181,19 @@ def _resolve_own_message(actor: SimClient, stream: str, msg_index: int) -> str |
     if not known:
         return None
     return known[msg_index % len(known)]
+
+
+def _resolve_uploaded_file(actor: SimClient, stream: str, file_index: int) -> str | None:
+    """The ``file_id`` an attach op references: ``file_index`` modulo the files the actor
+    UPLOADED into ``stream`` (or ``None`` when it uploaded none there yet).
+
+    Attaching only own present files homed in the stream keeps every generated attach
+    Accepted (ENG-117), so the ``file_ids`` binding is genuinely exercised through the log.
+    """
+    known = actor.uploaded_files.get(stream, [])
+    if not known:
+        return None
+    return known[file_index % len(known)]
 
 
 def _resolve_root_message(actor: SimClient, stream: str, msg_index: int) -> str | None:
@@ -272,6 +303,46 @@ async def _settle(world: World) -> None:
             resp.status_code == 200 and len(resp.json()["accepted"]) == 0
         )
 
+    # ENG-117 file-attach isolation probe. The adversary uploads a file into a stream it
+    # CAN write (the public channel), then two attach attempts must BOTH be refused:
+    #   (a) attaching that file via a message.created INTO the private stream it cannot
+    #       write — blocked at step iii (permission_denied), the write==read stream gate,
+    #       exactly like the reaction/reply/DM write probes; and
+    #   (b) BORROWING the OWNER's private-stream file binding from a stream the adversary
+    #       CAN write (public): the message.created is stream-writable, but the referenced
+    #       file is neither owned by nor homed in a stream the adversary can reach, so the
+    #       ENG-117 referential check refuses it (unknown_file). This proves a writer
+    #       cannot re-home/borrow another stream's file binding into its own message.
+    # The owner's private file id is SOURCED from the owner (a private member); the
+    # adversary never legitimately learns it.
+    adv_pub_file = await world.adversary.upload_file(world.public_stream)
+    owner_priv_file = await world.owner.upload_file(world.private_stream)
+    attach_into_private_blocked = True
+    borrow_private_binding_blocked = True
+    if adv_pub_file is not None:
+        into_priv = message_body(
+            auth=world.adversary.auth,
+            stream_id=world.private_stream,
+            text="adversary-attach-into-private",
+            file_ids=[adv_pub_file],
+        )
+        resp = await post_batch(world.adversary.http, world.adversary.token, [wire_item(into_priv)])
+        attach_into_private_blocked = resp.status_code == 200 and len(resp.json()["accepted"]) == 0
+    if owner_priv_file is not None:
+        borrow = message_body(
+            auth=world.adversary.auth,
+            stream_id=world.public_stream,
+            text="adversary-borrow-private-file",
+            file_ids=[owner_priv_file],
+        )
+        resp = await post_batch(world.adversary.http, world.adversary.token, [wire_item(borrow)])
+        borrow_private_binding_blocked = (
+            resp.status_code == 200 and len(resp.json()["accepted"]) == 0
+        )
+    world.adversary_file_attach_forbidden = (
+        attach_into_private_blocked and borrow_private_binding_blocked
+    )
+
 
 async def _snapshot_truth(world: World) -> Truth:
     """Read the stored event set per shared stream via a fresh committing session."""
@@ -363,6 +434,19 @@ async def _snapshot_thread_participants(world: World) -> ThreadParticipantRows:
         return [(r[0], r[1]) for r in rows.all()]
 
 
+async def _snapshot_files(world: World) -> FileBindings:
+    """Read the operational ``files`` table as ``file_id -> (stream_id, present)``.
+
+    The authoritative binding bound at ``POST /v1/files/initiate`` (ENG-116) — the
+    referential invariant folds every accepted ``message.created.file_ids`` entry against
+    it to prove the log carries only valid file bindings (present + same-stream).
+    """
+    maker = async_sessionmaker(world.engine, expire_on_commit=False)
+    async with maker() as db:
+        rows = await db.execute(select(File.file_id, File.stream_id, File.present))
+        return {r[0]: (r[1], r[2]) for r in rows.all()}
+
+
 async def _assert_rebuild_equivalence(world: World) -> None:
     """§12 invariant 6 for BOTH projections: rebuild ≡ incremental, byte for byte.
 
@@ -412,6 +496,7 @@ async def run_plan(settings: Settings, plan: Plan) -> None:
             message_rows = await _snapshot_messages(world)
             thread_counter_rows = await _snapshot_thread_counters(world)
             thread_participant_rows = await _snapshot_thread_participants(world)
+            file_bindings = await _snapshot_files(world)
             assert_all(
                 world,
                 truth,
@@ -419,6 +504,7 @@ async def run_plan(settings: Settings, plan: Plan) -> None:
                 message_rows,
                 thread_counter_rows,
                 thread_participant_rows,
+                file_bindings,
             )
             # §12 invariant 6 (reactions + messages + thread participants):
             # rebuild ≡ incremental. Run last — it TRUNCATEs + replays the committed
