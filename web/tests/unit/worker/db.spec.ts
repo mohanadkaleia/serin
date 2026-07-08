@@ -20,7 +20,7 @@ describe('MsgDB schema (§5.2, verbatim)', () => {
     await db.open()
     try {
       // ENG-100 (M3) added the `reactions` + `thread_participants` derived sets;
-      // ENG-120 added the `files` set.
+      // ENG-120 added the `files` set; ENG-126 added the `prefs` synced-KV table.
       expect(db.tables.map((t) => t.name).sort()).toEqual([
         'cursors',
         'events',
@@ -28,6 +28,7 @@ describe('MsgDB schema (§5.2, verbatim)', () => {
         'messages',
         'meta',
         'outbox',
+        'prefs',
         'reactions',
         'read_state',
         'streams',
@@ -62,6 +63,8 @@ describe('MsgDB schema (§5.2, verbatim)', () => {
       expect(db.cursors.schema.primKey.keyPath).toBe('stream_id')
       expect(db.outbox.schema.primKey.keyPath).toBe('event_id')
       expect(db.read_state.schema.primKey.keyPath).toBe('stream_id')
+      // prefs (ENG-126): synced-KV table keyed by stream_id (Dexie version(4)).
+      expect(db.prefs.schema.primKey.keyPath).toBe('stream_id')
       expect(db.meta.schema.primKey.keyPath).toBe('key')
     } finally {
       db.close()
@@ -165,10 +168,12 @@ describe.each([
     expect(await db.count('messages')).toBe(0)
     expect(await db.count('streams')).toBe(0)
     expect(await db.count('cursors')).toBe(0)
-    expect(await db.count('read_state')).toBe(0)
     // source tables preserved
     expect(await db.count('events')).toBe(1)
     expect(await db.count('outbox')).toBe(1)
+    // ENG-126: read_state is SYNCED-KV, NOT derived — it SURVIVES a rebuild (the
+    // fix: it used to be wrongly dropped). Refilled from /v1/read-state, not replay.
+    expect(await db.count('read_state')).toBe(1)
     // version stamped forward
     expect(await db.metaGet<number>('projection_version')).toBe(PROJECTION_VERSION)
     await db.close()
