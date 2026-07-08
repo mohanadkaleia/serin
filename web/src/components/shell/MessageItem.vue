@@ -21,16 +21,30 @@ import { useAttachments } from '../../composables/useAttachments'
 import { formatTime } from '../../lib/time'
 import type { FileRow } from '../../worker'
 import EmojiPicker from '../ui/EmojiPicker.vue'
+import Icon from '../ui/Icon.vue'
 import AttachmentFile from './AttachmentFile.vue'
 import AttachmentImage from './AttachmentImage.vue'
+import ReactionPill from './ReactionPill.vue'
+import ThreadSummary from './ThreadSummary.vue'
 
 const props = withDefaults(
   defineProps<{
     message: DisplayMessage
     /** True while this row is the active inline-edit target (owned by the parent). */
     editing?: boolean
+    /**
+     * Show the row's avatar + name + time header line (ENG-136). False when this
+     * message is GROUPED under the previous row (same author, within ~5 min): the
+     * avatar/name/time are hidden and the content aligns under the group's first row.
+     */
+    showHeader?: boolean
+    /**
+     * Directory `user_id → display_name` map for resolving the author's name +
+     * avatar initial. Falls back to the raw id when a name is absent.
+     */
+    names?: ReadonlyMap<string, string> | undefined
   }>(),
-  { editing: false },
+  { editing: false, showHeader: true, names: undefined },
 )
 
 const emit = defineEmits<{
@@ -106,7 +120,15 @@ function initial(name: string): string {
   return c ? c.toUpperCase() : '?'
 }
 
+/** Author's resolved display name (directory-backed; raw id fallback). */
+const authorName = computed(
+  () => props.names?.get(props.message.author_user_id) ?? props.message.author_user_id,
+)
+const authorInitial = computed(() => initial(authorName.value))
+
 const pickerOpen = ref(false)
+/** The trailing "add reaction" ghost pill's picker (separate anchor; one open at a time). */
+const addPickerOpen = ref(false)
 const confirmingDelete = ref(false)
 const draft = ref('')
 
@@ -136,6 +158,7 @@ function pickReaction(emoji: string): void {
   const mine = reactions.value.some((r) => r.emoji === emoji && r.mine)
   toggleReaction(emoji, mine)
   pickerOpen.value = false
+  addPickerOpen.value = false
 }
 
 function startEdit(): void {
@@ -170,263 +193,279 @@ function confirmDelete(): void {
 
 <template>
   <div
-    class="group relative px-4 py-1.5 hover:bg-surface"
+    class="group relative flex gap-3 px-4 py-0.5 hover:bg-surface"
     :class="{ 'opacity-50': isPending }"
     data-testid="message-row"
     :data-state="props.message.state ?? 'settled'"
   >
-    <!-- TOMBSTONE (ENG-102/ENG-111): a soft-deleted message. Content is redacted
-         projection-side; we render only a muted marker, never the old text. -->
-    <p v-if="isDeleted" class="text-sm italic text-muted" data-testid="message-tombstone">
-      message deleted
-    </p>
+    <!-- Avatar gutter (40px). The avatar shows only on a group's LEADING row; a
+         grouped follow-up leaves the gutter empty so its content stays aligned. -->
+    <div class="w-10 shrink-0">
+      <div
+        v-if="props.showHeader && !isDeleted"
+        class="flex h-10 w-10 items-center justify-center rounded-full bg-accent-subtle text-sm font-semibold text-accent"
+        data-testid="message-avatar"
+        :title="authorName"
+        aria-hidden="true"
+      >
+        {{ authorInitial }}
+      </div>
+    </div>
 
-    <template v-else>
-      <div class="flex items-baseline gap-2">
-        <span class="text-sm font-semibold text-primary" data-testid="message-author">{{
-          props.message.author_user_id
-        }}</span>
-        <span class="text-xs text-muted" data-testid="message-time">
-          <template v-if="isPending">Sending…</template>
-          <template v-else>{{ time }}</template>
-        </span>
-        <span v-if="isEdited" class="text-xs text-muted" data-testid="edited-marker">
+    <!-- Content column — aligns under the avatar for both leading + grouped rows. -->
+    <div class="min-w-0 flex-1">
+      <!-- TOMBSTONE (ENG-102/ENG-111): a soft-deleted message. Content is redacted
+           projection-side; we render only a muted marker, never the old text. -->
+      <p v-if="isDeleted" class="text-sm italic text-muted" data-testid="message-tombstone">
+        message deleted
+      </p>
+
+      <template v-else>
+        <div v-if="props.showHeader" class="flex items-baseline gap-2">
+          <span class="text-sm font-semibold text-primary" data-testid="message-author">{{
+            authorName
+          }}</span>
+          <span class="text-xs text-muted" data-testid="message-time">
+            <template v-if="isPending">Sending…</template>
+            <template v-else>{{ time }}</template>
+          </span>
+          <span v-if="isEdited" class="text-xs text-muted" data-testid="edited-marker">
+            (edited)
+          </span>
+        </div>
+
+        <!-- INLINE EDIT (own message) — plain textarea, serialized as source text. -->
+        <div v-if="props.editing" class="mt-1" data-testid="message-edit">
+          <textarea
+            v-model="draft"
+            rows="2"
+            class="w-full resize-y rounded-md border border-strong px-2 py-1 text-sm text-primary outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+            data-testid="message-edit-input"
+            @keydown="onEditKeydown"
+          ></textarea>
+          <div class="mt-1 flex items-center gap-2 text-xs">
+            <button
+              type="button"
+              class="rounded bg-accent px-2 py-0.5 font-medium text-accent-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+              data-testid="message-edit-save"
+              @click="submitEdit"
+            >
+              Save
+            </button>
+            <button
+              type="button"
+              class="font-medium text-secondary hover:text-primary"
+              data-testid="message-edit-cancel"
+              @click="emit('edit-cancel')"
+            >
+              Cancel
+            </button>
+            <span class="text-muted">Enter to save · Esc to cancel</span>
+          </div>
+        </div>
+
+        <!-- Plain text ONLY — Vue interpolation escapes; never v-html (XSS). On a
+             GROUPED follow-up the header (with its "(edited)" marker) is hidden, so
+             the marker renders inline here instead — always visible, exactly one in
+             the DOM (the header + inline variants are mutually exclusive on showHeader). -->
+        <p
+          v-else
+          class="whitespace-pre-wrap break-words text-sm text-primary"
+          data-testid="message-text"
+        >
+          {{ props.message.text }}
+        </p>
+        <span
+          v-if="!props.editing && !props.showHeader && isEdited"
+          class="text-xs text-muted"
+          data-testid="edited-marker"
+        >
           (edited)
         </span>
-      </div>
 
-      <!-- INLINE EDIT (own message) — plain textarea, serialized as source text. -->
-      <div v-if="props.editing" class="mt-1" data-testid="message-edit">
-        <textarea
-          v-model="draft"
-          rows="2"
-          class="w-full resize-y rounded-md border border-strong px-2 py-1 text-sm text-primary outline-none focus:border-accent focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-          data-testid="message-edit-input"
-          @keydown="onEditKeydown"
-        ></textarea>
-        <div class="mt-1 flex items-center gap-2 text-xs">
+        <!-- Attachments (ENG-121). Resolved from the local `attachments.forMessage`
+           projection. image (by mime_type) → thumbnail + lightbox; other → file
+           card + download; not-yet-projected ids → a muted pending placeholder.
+           Names/sizes are attacker-controlled and render ONLY via text / :alt. -->
+        <div
+          v-if="hasAttachments"
+          class="mt-1 flex flex-col gap-1.5"
+          data-testid="message-attachments"
+        >
+          <template v-for="file in attachmentFiles" :key="file.file_id">
+            <AttachmentImage v-if="isImage(file)" :file="file" />
+            <AttachmentFile v-else :file="file" />
+          </template>
+          <div
+            v-for="id in pendingFileIds"
+            :key="id"
+            class="flex h-10 max-w-sm items-center rounded-md border border-dashed border-subtle px-3 text-xs italic text-muted"
+            data-testid="attachment-pending"
+          >
+            attachment loading…
+          </div>
+        </div>
+
+        <!-- Reaction pills (aggregated, present-only). Clicking toggles YOUR reaction;
+           the trailing ghost pill opens the shared EmojiPicker to add a new one. -->
+        <div v-if="reactions.length > 0" class="mt-1 flex flex-wrap items-center gap-1">
+          <ReactionPill
+            v-for="chip in reactions"
+            :key="chip.emoji"
+            :chip="chip"
+            :disabled="!canReact"
+            @toggle="toggleReaction"
+          />
+          <div v-if="canReact" class="relative">
+            <button
+              type="button"
+              class="inline-flex items-center gap-0.5 rounded-full border border-subtle bg-surface px-2 py-0.5 text-xs text-secondary hover:bg-surface-elevated focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+              data-testid="add-reaction"
+              aria-label="Add reaction"
+              @click="addPickerOpen = !addPickerOpen"
+            >
+              <Icon name="smile" :size="14" />
+              <span aria-hidden="true">+</span>
+            </button>
+            <EmojiPicker
+              v-if="addPickerOpen"
+              class="absolute left-0 top-full z-30 mt-1"
+              menu-testid="reaction-picker-menu"
+              option-testid="reaction-option"
+              @select="pickReaction"
+            />
+          </div>
+        </div>
+
+        <!-- Thread summary (ENG-103): overlapping participant avatars + reply count on
+           a root. Click opens the thread pane. Avatars/names are safe-interpolated. -->
+        <ThreadSummary
+          v-if="isThreadRoot"
+          :reply-count="replyCount"
+          :participants="participants"
+          @open="emit('open-thread', props.message.message_id)"
+        />
+
+        <!-- Hover toolbar: quick reactions + emoji picker + (own) edit/delete. -->
+        <div
+          v-if="canReact && !props.editing"
+          class="absolute right-3 top-0 z-10 -mt-2 hidden items-center gap-0.5 rounded-md border border-subtle bg-surface-elevated px-1 py-0.5 shadow-sm group-hover:flex"
+          data-testid="message-toolbar"
+        >
+          <button
+            v-for="emoji in QUICK_REACTIONS"
+            :key="emoji"
+            type="button"
+            class="rounded px-1 text-sm hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+            data-testid="reaction-quick"
+            :data-emoji="emoji"
+            @click="pickReaction(emoji)"
+          >
+            {{ emoji }}
+          </button>
+          <div class="relative">
+            <button
+              type="button"
+              class="rounded px-1 text-sm text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+              data-testid="reaction-picker"
+              aria-label="Add reaction"
+              @click="pickerOpen = !pickerOpen"
+            >
+              +
+            </button>
+            <EmojiPicker
+              v-if="pickerOpen"
+              class="absolute right-0 top-full z-30 mt-1"
+              menu-testid="reaction-picker-menu"
+              option-testid="reaction-option"
+              @select="pickReaction"
+            />
+          </div>
           <button
             type="button"
-            class="rounded bg-accent px-2 py-0.5 font-medium text-accent-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-            data-testid="message-edit-save"
-            @click="submitEdit"
+            class="rounded px-1 text-xs text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+            data-testid="reply-in-thread"
+            aria-label="Reply in thread"
+            @click="emit('open-thread', threadTarget)"
           >
-            Save
+            Reply
+          </button>
+          <template v-if="canModify">
+            <button
+              type="button"
+              class="rounded px-1 text-xs text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+              data-testid="message-edit"
+              aria-label="Edit message"
+              @click="startEdit"
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              class="rounded px-1 text-xs text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+              data-testid="message-delete"
+              aria-label="Delete message"
+              @click="confirmingDelete = true"
+            >
+              Delete
+            </button>
+          </template>
+        </div>
+
+        <!-- Soft-delete confirm (ENG-111 honest labeling: removed for everyone, NOT
+           a permanent/unrecoverable erasure — the log retains it). -->
+        <div
+          v-if="confirmingDelete"
+          class="mt-1 flex items-center gap-2 rounded-md border border-subtle bg-surface px-2 py-1 text-xs"
+          data-testid="message-delete-confirm"
+        >
+          <span class="text-secondary">Delete message? It will be removed for everyone.</span>
+          <button
+            type="button"
+            class="rounded bg-danger px-2 py-0.5 font-medium text-accent-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+            data-testid="message-delete-confirm-yes"
+            @click="confirmDelete"
+          >
+            Delete
           </button>
           <button
             type="button"
             class="font-medium text-secondary hover:text-primary"
-            data-testid="message-edit-cancel"
-            @click="emit('edit-cancel')"
+            data-testid="message-delete-cancel"
+            @click="confirmingDelete = false"
           >
             Cancel
           </button>
-          <span class="text-muted">Enter to save · Esc to cancel</span>
         </div>
-      </div>
 
-      <!-- Plain text ONLY — Vue interpolation escapes; never v-html (XSS). -->
-      <p
-        v-else
-        class="whitespace-pre-wrap break-words text-sm text-primary"
-        data-testid="message-text"
-      >
-        {{ props.message.text }}
-      </p>
-
-      <!-- Attachments (ENG-121). Resolved from the local `attachments.forMessage`
-           projection. image (by mime_type) → thumbnail + lightbox; other → file
-           card + download; not-yet-projected ids → a muted pending placeholder.
-           Names/sizes are attacker-controlled and render ONLY via text / :alt. -->
-      <div
-        v-if="hasAttachments"
-        class="mt-1 flex flex-col gap-1.5"
-        data-testid="message-attachments"
-      >
-        <template v-for="file in attachmentFiles" :key="file.file_id">
-          <AttachmentImage v-if="isImage(file)" :file="file" />
-          <AttachmentFile v-else :file="file" />
-        </template>
         <div
-          v-for="id in pendingFileIds"
-          :key="id"
-          class="flex h-10 max-w-sm items-center rounded-md border border-dashed border-subtle px-3 text-xs italic text-muted"
-          data-testid="attachment-pending"
+          v-if="isFailed"
+          class="mt-1 flex items-center gap-2 text-xs"
+          data-testid="message-failed"
         >
-          attachment loading…
+          <span class="text-danger">
+            Failed to send{{ formatCode(props.message.error_code) }}
+          </span>
+          <template v-if="canAct">
+            <button
+              type="button"
+              class="font-medium text-secondary underline hover:text-primary"
+              data-testid="message-retry"
+              @click="emit('retry', props.message.message_id)"
+            >
+              Retry
+            </button>
+            <button
+              type="button"
+              class="font-medium text-secondary underline hover:text-primary"
+              data-testid="message-failed-discard"
+              @click="emit('discard', props.message.message_id)"
+            >
+              Discard
+            </button>
+          </template>
         </div>
-      </div>
-
-      <!-- Reaction chips (aggregated, present-only). Clicking toggles YOUR reaction. -->
-      <div v-if="reactions.length > 0" class="mt-1 flex flex-wrap gap-1">
-        <button
-          v-for="chip in reactions"
-          :key="chip.emoji"
-          type="button"
-          class="group/chip relative flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-xs focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-          :class="
-            chip.mine
-              ? 'border-accent bg-accent-subtle text-accent'
-              : 'border-subtle bg-surface text-secondary hover:bg-surface-elevated'
-          "
-          data-testid="reaction-chip"
-          :data-mine="chip.mine"
-          :disabled="!canReact"
-          @click="toggleReaction(chip.emoji, chip.mine)"
-        >
-          <!-- OPAQUE emoji bytes — text interpolation only. -->
-          <span>{{ chip.emoji }}</span>
-          <span class="tabular-nums">{{ chip.count }}</span>
-          <!-- Who-reacted tooltip: display names via interpolation (escaped). -->
-          <span
-            class="pointer-events-none absolute bottom-full left-0 z-20 mb-1 hidden whitespace-nowrap rounded border border-subtle bg-surface-elevated px-2 py-1 text-[11px] text-primary shadow-sm group-hover/chip:block"
-            data-testid="reaction-tooltip"
-            >{{ chip.display_names.join(', ') }}</span
-          >
-        </button>
-      </div>
-
-      <!-- Thread affordance (ENG-103): reply count + participant avatars on a
-           root. Click opens the thread pane. Avatars/names are safe-interpolated. -->
-      <button
-        v-if="isThreadRoot"
-        type="button"
-        class="mt-1 flex items-center gap-1.5 rounded-md border border-subtle bg-surface px-2 py-1 text-xs text-accent hover:bg-accent-subtle focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-        data-testid="thread-affordance"
-        @click="emit('open-thread', props.message.message_id)"
-      >
-        <span class="flex -space-x-1">
-          <span
-            v-for="p in participants.slice(0, 3)"
-            :key="p.user_id"
-            class="flex h-4 w-4 items-center justify-center rounded-full border border-surface bg-strong text-[9px] font-semibold text-secondary"
-            data-testid="thread-participant"
-            :title="p.display_name"
-            >{{ initial(p.display_name) }}</span
-          >
-        </span>
-        <span class="font-medium" data-testid="thread-reply-count"
-          >{{ replyCount }} {{ replyCount === 1 ? 'reply' : 'replies' }}</span
-        >
-      </button>
-
-      <!-- Hover toolbar: quick reactions + emoji picker + (own) edit/delete. -->
-      <div
-        v-if="canReact && !props.editing"
-        class="absolute right-3 top-0 z-10 -mt-2 hidden items-center gap-0.5 rounded-md border border-subtle bg-surface-elevated px-1 py-0.5 shadow-sm group-hover:flex"
-        data-testid="message-toolbar"
-      >
-        <button
-          v-for="emoji in QUICK_REACTIONS"
-          :key="emoji"
-          type="button"
-          class="rounded px-1 text-sm hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-          data-testid="reaction-quick"
-          :data-emoji="emoji"
-          @click="pickReaction(emoji)"
-        >
-          {{ emoji }}
-        </button>
-        <div class="relative">
-          <button
-            type="button"
-            class="rounded px-1 text-sm text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-            data-testid="reaction-picker"
-            aria-label="Add reaction"
-            @click="pickerOpen = !pickerOpen"
-          >
-            +
-          </button>
-          <EmojiPicker
-            v-if="pickerOpen"
-            class="absolute right-0 top-full z-30 mt-1"
-            menu-testid="reaction-picker-menu"
-            option-testid="reaction-option"
-            @select="pickReaction"
-          />
-        </div>
-        <button
-          type="button"
-          class="rounded px-1 text-xs text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-          data-testid="reply-in-thread"
-          aria-label="Reply in thread"
-          @click="emit('open-thread', threadTarget)"
-        >
-          Reply
-        </button>
-        <template v-if="canModify">
-          <button
-            type="button"
-            class="rounded px-1 text-xs text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-            data-testid="message-edit"
-            aria-label="Edit message"
-            @click="startEdit"
-          >
-            Edit
-          </button>
-          <button
-            type="button"
-            class="rounded px-1 text-xs text-secondary hover:bg-surface focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-            data-testid="message-delete"
-            aria-label="Delete message"
-            @click="confirmingDelete = true"
-          >
-            Delete
-          </button>
-        </template>
-      </div>
-
-      <!-- Soft-delete confirm (ENG-111 honest labeling: removed for everyone, NOT
-           a permanent/unrecoverable erasure — the log retains it). -->
-      <div
-        v-if="confirmingDelete"
-        class="mt-1 flex items-center gap-2 rounded-md border border-subtle bg-surface px-2 py-1 text-xs"
-        data-testid="message-delete-confirm"
-      >
-        <span class="text-secondary">Delete message? It will be removed for everyone.</span>
-        <button
-          type="button"
-          class="rounded bg-danger px-2 py-0.5 font-medium text-accent-fg focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
-          data-testid="message-delete-confirm-yes"
-          @click="confirmDelete"
-        >
-          Delete
-        </button>
-        <button
-          type="button"
-          class="font-medium text-secondary hover:text-primary"
-          data-testid="message-delete-cancel"
-          @click="confirmingDelete = false"
-        >
-          Cancel
-        </button>
-      </div>
-
-      <div
-        v-if="isFailed"
-        class="mt-1 flex items-center gap-2 text-xs"
-        data-testid="message-failed"
-      >
-        <span class="text-danger"> Failed to send{{ formatCode(props.message.error_code) }} </span>
-        <template v-if="canAct">
-          <button
-            type="button"
-            class="font-medium text-secondary underline hover:text-primary"
-            data-testid="message-retry"
-            @click="emit('retry', props.message.message_id)"
-          >
-            Retry
-          </button>
-          <button
-            type="button"
-            class="font-medium text-secondary underline hover:text-primary"
-            data-testid="message-failed-discard"
-            @click="emit('discard', props.message.message_id)"
-          >
-            Discard
-          </button>
-        </template>
-      </div>
-    </template>
+      </template>
+    </div>
   </div>
 </template>

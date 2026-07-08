@@ -5,12 +5,12 @@ import { describe, expect, it, vi } from 'vitest'
 import MessageList from '../../../src/components/shell/MessageList.vue'
 import type { DisplayMessage } from '../../../src/stores/messages'
 
-function msg(i: number, ts: number): DisplayMessage {
+function msg(i: number, ts: number, author = 'u_other'): DisplayMessage {
   return {
     message_id: `m_${String(i).padStart(24, '0')}`,
     stream_id: 's1',
     created_seq: i,
-    author_user_id: 'u_other',
+    author_user_id: author,
     text: `m${i}`,
     format: 'plain',
     mention_user_ids: [],
@@ -61,6 +61,51 @@ describe('MessageList virtualization', () => {
     })
 
     expect(wrapper.findAll('[data-testid="day-divider"]')).toHaveLength(2)
+  })
+
+  // -- ENG-136 grouping + display names + "New" divider ---------------------
+
+  it('groups consecutive same-author messages within ~5 min (only the first shows a header)', () => {
+    const t = new Date('2026-07-06T10:00:00').getTime()
+    const messages = [
+      msg(1, t, 'u_a'),
+      msg(2, t + 60_000, 'u_a'), // grouped (same author, +1 min)
+      msg(3, t + 120_000, 'u_b'), // new author → header
+      msg(4, t + 10 * 60_000, 'u_b'), // same author but >5 min → header
+    ]
+    const wrapper = mount(MessageList, {
+      props: { messages, viewportHeight: 2000, rowHeight: 64, streamKey: 's1' },
+    })
+    // One avatar per LEADING row of a group: rows 1, 3, 4 → 3 avatars (row 2 grouped).
+    expect(wrapper.findAll('[data-testid="message-avatar"]')).toHaveLength(3)
+    expect(wrapper.findAll('[data-testid="message-row"]')).toHaveLength(4)
+  })
+
+  it('threads the display-name map down to each row', () => {
+    const t = new Date('2026-07-06T10:00:00').getTime()
+    const names = new Map([['u_a', 'Alice']])
+    const wrapper = mount(MessageList, {
+      props: { messages: [msg(1, t, 'u_a')], viewportHeight: 2000, streamKey: 's1', names },
+    })
+    expect(wrapper.get('[data-testid="message-author"]').text()).toBe('Alice')
+  })
+
+  it('renders a "New" divider before the last unreadCount messages', () => {
+    const t = new Date('2026-07-06T10:00:00').getTime()
+    const messages = Array.from({ length: 5 }, (_, i) => msg(i, t + i * 60_000))
+    const wrapper = mount(MessageList, {
+      props: { messages, viewportHeight: 2000, rowHeight: 64, streamKey: 's1', unreadCount: 2 },
+    })
+    expect(wrapper.findAll('[data-testid="new-divider"]')).toHaveLength(1)
+  })
+
+  it('omits the "New" divider when there are no unreads', () => {
+    const t = new Date('2026-07-06T10:00:00').getTime()
+    const messages = Array.from({ length: 5 }, (_, i) => msg(i, t + i * 60_000))
+    const wrapper = mount(MessageList, {
+      props: { messages, viewportHeight: 2000, rowHeight: 64, streamKey: 's1', unreadCount: 0 },
+    })
+    expect(wrapper.find('[data-testid="new-divider"]').exists()).toBe(false)
   })
 
   it('calls loadOlder when the user scrolls to the top and more remain', async () => {

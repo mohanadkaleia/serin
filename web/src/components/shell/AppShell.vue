@@ -19,6 +19,7 @@
 // STILL LIGHT theme (dark mode ships in PR-D); the message/composer components are
 // NOT restyled here (that's PR-D too) — this PR only restructures the shell chrome.
 import AppSidebar from './AppSidebar.vue'
+import ChannelHeader from './ChannelHeader.vue'
 import CommandPalette from './CommandPalette.vue'
 import MessageComposer from './MessageComposer.vue'
 import MessageList from './MessageList.vue'
@@ -42,6 +43,9 @@ const {
   hasMore,
   threadOpen,
   mainTitle,
+  names,
+  memberCount,
+  unreadCount,
   scaffold,
   composerPlaceholder,
   quickItems,
@@ -58,6 +62,15 @@ const {
   onOpenThread,
   onLogout,
 } = useShellController()
+
+/** SCAFFOLD: the add-member affordance lives in the sidebar's channel settings
+ * today; the header's button is a forward hook (details drawer lands in a later PR). */
+function onHeaderAddMember(): void {
+  // No-op scaffold — a real add-member entry point is wired in a follow-up.
+}
+function onToggleDetails(): void {
+  // No-op scaffold — the details drawer is a later PR.
+}
 </script>
 
 <template>
@@ -84,17 +97,19 @@ const {
 
     <!-- Main track. -->
     <main role="main" class="flex min-h-0 min-w-0 flex-col">
-      <header
-        class="flex items-center justify-between border-b border-subtle px-4 py-3"
-        data-testid="channel-header"
-      >
-        <h1 class="truncate text-sm font-semibold text-primary">{{ mainTitle }}</h1>
-      </header>
+      <ChannelHeader
+        :title="mainTitle"
+        :member-count="memberCount"
+        @add-member="onHeaderAddMember"
+        @toggle-details="onToggleDetails"
+      />
 
       <!-- Live conversation timeline (real channel/DM). -->
       <template v-if="activeView === 'conversation'">
         <MessageList
           :messages="displayMessages"
+          :names="names"
+          :unread-count="unreadCount"
           :has-more="hasMore"
           :stream-key="selectedStreamId"
           :load-older="messages.loadOlder"
