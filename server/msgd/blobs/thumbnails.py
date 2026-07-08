@@ -6,15 +6,23 @@ header, a decompression bomb, a truncated or non-image payload — so the entire
 function is written to the discipline "**bound it, contain it, and never trust the
 result**":
 
-* **Decompression-bomb bound.** ``Image.MAX_IMAGE_PIXELS`` caps the source W×H Pillow
-  will decode. A tiny compressed file can claim enormous dimensions (a 100000×100000
-  PNG is a few bytes of zlib but tens of GB decoded); the bytes-on-disk cap
-  (``file_max_size_bytes``) does nothing against that, so this DECODED-pixel bound is
-  the real guard. Pillow raises :class:`Image.DecompressionBombError` past 2×
-  the limit and emits a :class:`Image.DecompressionBombWarning` past 1×; we promote
-  that warning to an exception locally (``simplefilter("error", ...)``) so both land
-  in the reject path. The guard is checked at ``Image.open`` — before the pixels are
-  actually decoded — so a bomb is rejected without ever allocating its buffer.
+* **Decompression-bomb bound.** A tiny compressed file can claim enormous dimensions
+  (a 100000×100000 PNG is a few bytes of zlib but tens of GB decoded); the bytes-on-disk
+  cap (``file_max_size_bytes``) does nothing against that, so this DECODED-pixel bound is
+  the real guard. We reject with an EXPLICIT pre-decode pixel check: ``Image.open`` reads
+  only the header and populates ``.size`` WITHOUT decoding the raster, so
+  ``w * h > max_source_pixels`` is compared BEFORE any pixel buffer is allocated, and a
+  bomb returns ``None`` without ever being decoded. This check is thread-safe — it
+  mutates no process-global state — which matters because decodes run concurrently on a
+  dedicated bounded executor (ENG-118 review): the earlier approach promoted Pillow's
+  :class:`Image.DecompressionBombWarning` to an exception via ``warnings.catch_warnings``
+  + ``simplefilter``, but the warnings filter is PROCESS-GLOBAL and ``catch_warnings`` is
+  not thread-safe, so one render's context-exit could restore the filter mid-decode in
+  another thread and let a 1×–2× source slip through. The explicit check covers the whole
+  ``> max_source_pixels`` range uniformly and deterministically. ``Image.MAX_IMAGE_PIXELS``
+  is still set per call as a harmless backstop, and :class:`Image.DecompressionBombError`
+  (the hard raise at >2×, independent of any filter) stays in the caught tuple for any
+  exotic format whose size is not known until load.
 * **Containment.** EVERYTHING is wrapped in try/except → return ``None``. Pillow's
   many decoders raise a zoo of exceptions on malformed input
   (:class:`UnidentifiedImageError`, :class:`OSError` from a truncated stream, plus
@@ -42,7 +50,6 @@ with ``asyncio.to_thread`` so a slow or adversarial decode never blocks the even
 from __future__ import annotations
 
 import io
-import warnings
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
@@ -73,28 +80,34 @@ def render_thumbnail(source: bytes, *, max_px: int, max_source_pixels: int) -> b
         max_source_pixels: decompression-bomb guard — the max source W×H Pillow will
             decode before rejecting (wired into ``Image.MAX_IMAGE_PIXELS``).
     """
-    # Per-call decompression-bomb bound (Pillow module global; see module docstring).
+    # Per-call decompression-bomb backstop (Pillow module global; see module docstring).
+    # The authoritative guard is the explicit pre-decode pixel check below.
     Image.MAX_IMAGE_PIXELS = max_source_pixels
     try:
-        with warnings.catch_warnings():
-            # A DecompressionBombWarning (source between 1× and 2× the limit) becomes a
-            # raised exception, landing in the reject path alongside the hard Error.
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
+        with Image.open(io.BytesIO(source)) as img:
+            # EXPLICIT, THREAD-SAFE, PRE-DECODE bomb check: Image.open reads only the
+            # header and fills .size without decoding the raster, so this rejects an
+            # oversized source BEFORE any pixel buffer is allocated — no global state
+            # mutated, so it is safe under the concurrent decodes the bounded executor
+            # runs (unlike the old warnings-filter promotion). Covers the whole
+            # > max_source_pixels range uniformly.
+            width, height = img.size
+            if width * height > max_source_pixels:
+                return None
 
-            with Image.open(io.BytesIO(source)) as img:
-                # Honor EXIF orientation so a rotated phone photo thumbnails upright
-                # (and its width/height are swapped when the camera stored it sideways).
-                oriented = ImageOps.exif_transpose(img)
-                # exif_transpose returns a new image when EXIF is present, else the same
-                # object; fall back to the original defensively.
-                flat = _flatten_to_rgb(oriented if oriented is not None else img)
-                # thumbnail() preserves aspect ratio and ONLY downscales — a small
-                # source is returned unchanged rather than blown up.
-                flat.thumbnail((max_px, max_px))
+            # Honor EXIF orientation so a rotated phone photo thumbnails upright
+            # (and its width/height are swapped when the camera stored it sideways).
+            oriented = ImageOps.exif_transpose(img)
+            # exif_transpose returns a new image when EXIF is present, else the same
+            # object; fall back to the original defensively.
+            flat = _flatten_to_rgb(oriented if oriented is not None else img)
+            # thumbnail() preserves aspect ratio and ONLY downscales — a small
+            # source is returned unchanged rather than blown up.
+            flat.thumbnail((max_px, max_px))
 
-                buf = io.BytesIO()
-                flat.save(buf, format="WEBP", quality=_WEBP_QUALITY)
-                return buf.getvalue()
+            buf = io.BytesIO()
+            flat.save(buf, format="WEBP", quality=_WEBP_QUALITY)
+            return buf.getvalue()
     except (Image.DecompressionBombError, UnidentifiedImageError, OSError):
         # The named, expected hostile-input failures: an oversized decode, bytes that
         # are not a recognized image, and a truncated/unreadable stream.

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 
+import pytest
 from msgd.blobs.thumbnails import render_thumbnail
 from PIL import Image
 
@@ -104,6 +105,38 @@ def test_decompression_bomb_returns_none() -> None:
     assert render_thumbnail(source, max_px=_MAX_PX, max_source_pixels=1_000_000) is None
     # The same bytes are fine under a cap above their pixel count (guard is the bound).
     assert render_thumbnail(source, max_px=_MAX_PX, max_source_pixels=_MAX_SOURCE_PX) is not None
+
+
+@pytest.mark.filterwarnings("ignore::PIL.Image.DecompressionBombWarning")
+def test_bomb_in_1x_2x_band_returns_none() -> None:
+    """A source in the 1×–2× band (over the cap, under 2×) is rejected deterministically.
+
+    Regression for the review-round hardening: the old warnings-filter promotion made
+    this band thread-order-dependent. The explicit pre-decode pixel check rejects it
+    unconditionally. 2.25 MP source against a 2 MP cap sits between 1× and 2×.
+
+    Pillow still emits an INFORMATIONAL DecompressionBombWarning at ``Image.open`` (the
+    ``MAX_IMAGE_PIXELS`` backstop is set to the cap); it is filtered here because our
+    explicit pixel check — not the warning — is what enforces the rejection.
+    """
+    source = _encode(Image.new("RGB", (1500, 1500), (9, 9, 9)), "PNG")  # 2.25 MP
+    assert render_thumbnail(source, max_px=_MAX_PX, max_source_pixels=2_000_000) is None
+
+
+def test_multiframe_gif_thumbnails_single_frame() -> None:
+    """A multi-frame animated source thumbnails frame 0 as a SINGLE-frame WEBP.
+
+    Proves no frame-count amplification: an N-frame GIF/APNG yields one still frame,
+    not an N-frame animation.
+    """
+    frames = [Image.new("RGB", (80, 60), (i * 60, 0, 0)) for i in range(3)]
+    buf = io.BytesIO()
+    frames[0].save(buf, format="GIF", save_all=True, append_images=frames[1:], loop=0)
+    out = render_thumbnail(buf.getvalue(), max_px=_MAX_PX, max_source_pixels=_MAX_SOURCE_PX)
+    assert out is not None
+    with Image.open(io.BytesIO(out)) as thumb:
+        assert thumb.format == "WEBP"
+        assert getattr(thumb, "n_frames", 1) == 1  # single frame, no animation carried
 
 
 def test_exif_orientation_is_applied() -> None:

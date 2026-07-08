@@ -49,8 +49,10 @@ Invariants this module upholds (each mapped to code below):
 from __future__ import annotations
 
 import asyncio
+import functools
 import urllib.parse
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -65,6 +67,7 @@ from msgd.api.deps import (
     file_download_rate_limit,
     file_rate_limit,
     get_blob_store,
+    get_thumbnail_executor,
 )
 from msgd.api.schemas.files import (
     FileBlobResponse,
@@ -84,6 +87,7 @@ router = APIRouter(prefix="/v1", tags=["files"])
 
 DbSession = Annotated[AsyncSession, Depends(get_session)]
 Blobs = Annotated[BlobStore, Depends(get_blob_store)]
+ThumbnailExecutor = Annotated[ThreadPoolExecutor, Depends(get_thumbnail_executor)]
 
 
 class _StreamTooLarge(Exception):
@@ -315,6 +319,7 @@ async def upload_blob(
     db: DbSession,
     settings: AppSettings,
     blobs: Blobs,
+    thumbnail_executor: ThumbnailExecutor,
 ) -> FileBlobResponse:
     """Stream the raw request body into the store for ``file_id`` and mark it present.
 
@@ -393,18 +398,23 @@ async def upload_blob(
     #    declared ``mime_type`` is only a cheap "is this worth decoding" hint — it is
     #    NOT trusted for safety; render_thumbnail treats the bytes as hostile and is
     #    the real guard (decompression-bomb bound + catch-all → None). The CPU-bound
-    #    decode/encode is offloaded with ``asyncio.to_thread`` so a slow/adversarial
-    #    image can never block the event loop. On success the thumbnail is stored as
-    #    its OWN content-addressed derived blob (a re-encoded, known-safe WEBP) and its
-    #    sha recorded; on failure ``thumbnail_sha256`` stays NULL and the upload still
-    #    succeeds.
+    #    decode/encode runs on the DEDICATED bounded ``thumbnail_executor`` (NOT the
+    #    event loop's default pool, which serves argon2 + BlobStore fs I/O), so a decode
+    #    flood cannot block the loop OR starve auth/blob I/O server-wide. On success the
+    #    thumbnail is stored as its OWN content-addressed derived blob (a re-encoded,
+    #    known-safe WEBP) and its sha recorded; on failure ``thumbnail_sha256`` stays
+    #    NULL and the upload still succeeds.
     if settings.thumbnails_enabled and file.mime_type.startswith("image/"):
         source = await blobs.get_bytes(file.sha256)
-        thumb = await asyncio.to_thread(
-            render_thumbnail,
-            source,
-            max_px=settings.thumbnail_max_px,
-            max_source_pixels=settings.thumbnail_max_source_pixels,
+        loop = asyncio.get_running_loop()
+        thumb = await loop.run_in_executor(
+            thumbnail_executor,
+            functools.partial(
+                render_thumbnail,
+                source,
+                max_px=settings.thumbnail_max_px,
+                max_source_pixels=settings.thumbnail_max_source_pixels,
+            ),
         )
         if thumb is not None:
             file.thumbnail_sha256 = await blobs.put(_bytes_to_async_iter(thumb))

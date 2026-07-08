@@ -106,6 +106,14 @@ class Settings(BaseSettings):
     # ``file_max_size_bytes``; this bounds the DECODED (post-decompression) size,
     # which a tiny compressed file can still blow up.
     thumbnail_max_source_pixels: int = 24_000_000
+    # Bounded worker count for the DEDICATED thumbnail-decode ThreadPoolExecutor
+    # (ENG-118 review hardening). Untrusted image decodes are CPU-heavy (~70ms) and
+    # memory-heavy (up to ~168 MB at the 24 MP cap), so they run on their OWN pool —
+    # never the event loop's default ThreadPoolExecutor, which also serves argon2
+    # password hashing and BlobStore fs I/O. A flood of attacker-triggered decodes is
+    # thus confined to this pool (it cannot starve auth/verify or blob I/O) and
+    # transient decode memory is capped at ``thumbnail_max_concurrency × ~168 MB``.
+    thumbnail_max_concurrency: int = 2
 
     # --- First-run defaults (ENG-109) ----------------------------------------
     # Name of the default public channel /v1/setup auto-creates so a fresh
