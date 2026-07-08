@@ -61,6 +61,10 @@ export {
   // ENG-120 client `file.uploaded` projection + attachments query (ENG-121 UI reads these).
   type FileRow,
   type AttachmentsResult,
+  // ENG-126 ephemeral presence (ENG-136 PR-3 presence store reads these).
+  type PresenceStatus,
+  type PresenceEntry,
+  type PresencePush,
 } from './types'
 
 // ENG-80 projection functions — the ENG-79 apply seam + the ENG-83 dump surface.
