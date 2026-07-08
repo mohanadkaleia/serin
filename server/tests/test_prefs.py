@@ -37,6 +37,7 @@ from authutil import (
 from eventsutil import (
     bootstrap_channel,
     lifecycle_body,
+    message_body,
     post_batch,
     wire_item,
 )
@@ -45,7 +46,14 @@ from harness import make_ws_client
 from httpx import AsyncClient
 from httpx_ws import aconnect_ws
 from msgd.core import ids
-from msgd.db.models import Event, Pref
+from msgd.db.models import (
+    Event,
+    File,
+    MessageProj,
+    Pref,
+    ReactionProj,
+    ThreadParticipantProj,
+)
 from msgd.ws.hub import hub
 from msgd.ws.registry import Connection
 from sqlalchemy import func, select
@@ -269,11 +277,23 @@ async def test_get_returns_only_explicit_readable_prefs(
 async def test_put_prefs_is_not_an_event(client: AsyncClient, db_session: AsyncSession) -> None:
     """A prefs PUT creates NO ``events`` row and mutates NO projection (D3).
 
-    Prefs are synced per-user KV, not the log — so the ``events`` count is
-    unchanged across a PUT, while a ``prefs`` row DID appear (non-vacuous).
+    Prefs are synced per-user KV, not the log — so the ``events`` count AND every
+    rebuildable projection dump (``messages_proj`` / ``reactions_proj`` /
+    ``thread_participants_proj`` / ``files``) are byte-for-byte unchanged across a
+    PUT, while a ``prefs`` row DID appear (non-vacuous). A message is posted first
+    so the projection dump carries real rows — the equality assertion is not over
+    empty tables. Parity with the read-state analog
+    (``test_read_state.py::test_put_read_state_is_not_an_event``), extended to all
+    four projections.
     """
     owner = await do_setup(client)
     channel = await bootstrap_channel(client, db_session, owner)
+    # Post a message so messages_proj (and the projection dump) is non-empty — the
+    # before/after equality then compares REAL rows, not empty sets.
+    resp = await post_batch(
+        client, owner["token"], [wire_item(message_body(auth=owner, stream_id=channel))]
+    )
+    assert len(resp.json()["accepted"]) == 1, resp.text
 
     async def _events_count() -> int:
         return int((await db_session.execute(select(func.count()).select_from(Event))).scalar_one())
@@ -281,14 +301,53 @@ async def test_put_prefs_is_not_an_event(client: AsyncClient, db_session: AsyncS
     async def _prefs_count() -> int:
         return int((await db_session.execute(select(func.count()).select_from(Pref))).scalar_one())
 
+    async def _proj_dump() -> tuple[list[Any], list[Any], list[Any], list[Any]]:
+        msgs = (
+            (await db_session.execute(select(MessageProj).order_by(MessageProj.message_id)))
+            .scalars()
+            .all()
+        )
+        reacts = (
+            (
+                await db_session.execute(
+                    select(ReactionProj).order_by(
+                        ReactionProj.message_id, ReactionProj.author_user_id, ReactionProj.emoji
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        threads = (
+            (
+                await db_session.execute(
+                    select(ThreadParticipantProj).order_by(
+                        ThreadParticipantProj.root_message_id, ThreadParticipantProj.user_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        files = (await db_session.execute(select(File).order_by(File.file_id))).scalars().all()
+        msg_dump = [(m.message_id, m.stream_id, m.text, m.created_seq, m.deleted) for m in msgs]
+        react_dump = [(r.message_id, r.author_user_id, r.emoji) for r in reacts]
+        thread_dump = [(t.root_message_id, t.user_id) for t in threads]
+        file_dump = [(f.file_id, f.stream_id, f.present, f.thumbnail_sha256) for f in files]
+        return msg_dump, react_dump, thread_dump, file_dump
+
     events_before = await _events_count()
     prefs_before = await _prefs_count()
+    proj_before = await _proj_dump()
 
     resp = await _put(client, owner["token"], stream_id=channel, level="mentions")
     assert resp.status_code == 200, resp.text
 
     # The log is untouched — a pref is NOT an event.
     assert await _events_count() == events_before
+    # And every rebuildable projection is byte-for-byte unchanged (matches the
+    # module/model/schema docstrings' D3 promise).
+    assert await _proj_dump() == proj_before
     # But the synced-KV row itself DID land (the write is real, just not the log).
     assert await _prefs_count() == prefs_before + 1
     row = await db_session.get(Pref, (owner["user_id"], channel))
