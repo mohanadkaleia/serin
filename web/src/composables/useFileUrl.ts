@@ -33,7 +33,13 @@ function acquire(key: string, loadBlob: () => Promise<Blob | null>): Promise<str
   if (!entry) {
     entry = {
       refcount: 0,
-      promise: loadBlob().then((blob) => (blob ? URL.createObjectURL(blob) : null)),
+      // Defensive `.catch`: today `client.files.*` resolve `{blob:null}` on a 404 and
+      // never reject, but a future rejection must not become an unhandled promise
+      // rejection NOR leak a URL — fold it to `null` (treated as "no url") here, so
+      // both consumers (`acquire().then` and `release().then`) are reject-proof.
+      promise: loadBlob()
+        .then((blob) => (blob ? URL.createObjectURL(blob) : null))
+        .catch(() => null),
     }
     entries.set(key, entry)
   }

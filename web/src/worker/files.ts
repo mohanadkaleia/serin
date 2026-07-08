@@ -80,10 +80,22 @@ export interface FileManagerDeps {
   setTimeout?: (cb: () => void, ms: number) => TimerId
   /** [0,1) jitter source; inject a stub for deterministic backoff assertions. */
   random?: () => number
+  /** Override the download LRU count cap (tests exercise eviction at a small cap). */
+  cacheMax?: number
+  /** Override the download LRU byte budget (tests exercise the byte-budget path). */
+  cacheMaxBytes?: number
 }
 
-/** Bounded worker-side blob LRU so repeated renders don't re-GET the same bytes. */
+/**
+ * Bounded worker-side blob LRU so repeated renders don't re-GET the same bytes. The
+ * cache is bounded on BOTH axes: a COUNT cap and a BYTE budget. Count alone is unsafe
+ * — 32 × up-to-50 MB blobs ≈ 1.6 GB — so a byte cap evicts oldest until the total
+ * fits a sensible preview/download working set.
+ */
 const BLOB_CACHE_MAX = 32
+
+/** Byte budget for the download LRU (64 MiB — a reasonable preview working set). */
+const BLOB_CACHE_MAX_BYTES = 64 * 1024 * 1024
 
 export class FileManager {
   private readonly http: HttpClient
@@ -92,6 +104,8 @@ export class FileManager {
   private readonly publishUpload: (uploadId: string, progress: UploadProgress) => void
   private readonly setTimer: (cb: () => void, ms: number) => TimerId
   private readonly random: () => number
+  private readonly cacheMax: number
+  private readonly cacheMaxBytes: number
 
   /** Live jobs by tab-minted `upload_id`. Terminal `done` jobs are dropped; a
    *  `failed` job is KEPT so `file.retry` can restart it. */
@@ -99,6 +113,8 @@ export class FileManager {
 
   /** Worker-side download LRU keyed `file_id:variant` (insertion-order = LRU). */
   private readonly blobCache = new Map<string, { blob: Blob; mimeType: string }>()
+  /** Running sum of `blob.size` across `blobCache` — drives the byte-budget eviction. */
+  private cachedBytes = 0
 
   constructor(deps: FileManagerDeps) {
     this.http = deps.http
@@ -108,6 +124,13 @@ export class FileManager {
     this.setTimer =
       deps.setTimeout ?? ((cb, ms) => globalThis.setTimeout(cb, ms) as unknown as TimerId)
     this.random = deps.random ?? Math.random
+    this.cacheMax = deps.cacheMax ?? BLOB_CACHE_MAX
+    this.cacheMaxBytes = deps.cacheMaxBytes ?? BLOB_CACHE_MAX_BYTES
+  }
+
+  /** Count of live upload jobs (diagnostic/test read — not part of the RPC surface). */
+  get activeUploads(): number {
+    return this.jobs.size
   }
 
   // -- RPC arms (dispatched from WorkerCore) -------------------------------
@@ -247,9 +270,16 @@ export class FileManager {
         }
         case 'emitting': {
           this.enter(job, 'emitting')
-          // FIRST the durable file.uploaded log record, THEN the message that
-          // references it — both drain in ONE ordered batch (blob already present,
-          // so the server's referential check sees a present file, never unknown_file).
+          // Enqueue the durable file.uploaded log record + the referencing message —
+          // both land in the SAME drained batch. The REAL correctness invariant is
+          // that we only reach `emitting` AFTER initiate homed the file row and the
+          // PUT flipped it `present` (the prior phases), so ENG-117's referential
+          // check — which validates the `files` ROW (present + homed to this stream),
+          // NOT the event order — always sees a present, homed file. The intra-batch
+          // ORDER of file.uploaded vs message.created is therefore COSMETIC and is NOT
+          // relied upon: a real Dexie `listOutbox()` returns primary-key (event_id)
+          // order on a `created_at` tie, so message.created may precede file.uploaded
+          // in the batch — harmless, since both reference the already-present file.
           await this.outbox.enqueueFileUploaded({
             stream_id: job.stream_id,
             file_id: job.file_id!,
@@ -323,6 +353,10 @@ export class FileManager {
   }
 
   private clearRetryTimer(job: UploadJob): void {
+    // We only drop the handle — no `clearTimeout` (no clock is injected for that).
+    // That is deliberate, not a leak: a timer that fires later re-enters `pump`,
+    // whose `if (job.cancelled) return` (and the phase re-check) makes the stale
+    // firing a no-op. The cancelled-guard is the real stop, not this.
     job.retryTimer = undefined
   }
 
@@ -354,11 +388,32 @@ export class FileManager {
   }
 
   private cachePut(key: string, value: { blob: Blob; mimeType: string }): void {
-    this.blobCache.delete(key)
+    const existing = this.blobCache.get(key)
+    if (existing) {
+      this.cachedBytes -= existing.blob.size
+      this.blobCache.delete(key)
+    }
     this.blobCache.set(key, value)
-    if (this.blobCache.size > BLOB_CACHE_MAX) {
+    this.cachedBytes += value.blob.size
+    this.evict()
+  }
+
+  /**
+   * Evict oldest-first until the cache is under BOTH the count cap AND the byte
+   * budget. A lone blob larger than the byte budget is kept TRANSIENTLY (the loop
+   * stops once only it remains, size === 1) rather than being un-cacheable — the
+   * next put displaces it — so an over-budget download still serves from cache once.
+   */
+  private evict(): void {
+    while (
+      this.blobCache.size > this.cacheMax ||
+      (this.cachedBytes > this.cacheMaxBytes && this.blobCache.size > 1)
+    ) {
       const oldest = this.blobCache.keys().next().value
-      if (oldest !== undefined) this.blobCache.delete(oldest)
+      if (oldest === undefined) break
+      const entry = this.blobCache.get(oldest)
+      this.blobCache.delete(oldest)
+      if (entry) this.cachedBytes -= entry.blob.size
     }
   }
 }

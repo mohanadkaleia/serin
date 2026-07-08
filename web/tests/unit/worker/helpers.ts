@@ -454,6 +454,36 @@ export class FakeSyncServer {
   }
 
   /**
+   * Directly reserve a PRESENT file row (bypassing initiate/PUT) so a download test
+   * can populate many files cheaply. Returns the minted `file_id`. `size_bytes`
+   * controls the served `Blob` size (drives the cache byte-budget tests).
+   */
+  presentFile(
+    opts: {
+      stream_id?: string
+      sha256?: string
+      mime_type?: string
+      name?: string
+      size_bytes?: number
+    } = {},
+  ): string {
+    const file_id = newFileId()
+    const size = opts.size_bytes ?? 1
+    this.files.set(file_id, {
+      file_id,
+      sha256: opts.sha256 ?? file_id,
+      name: opts.name ?? 'f',
+      mime_type: opts.mime_type ?? 'application/octet-stream',
+      size_bytes: size,
+      stream_id: opts.stream_id ?? 's_1',
+      present: true,
+      thumbnail: false,
+      bytes: new ArrayBuffer(size),
+    })
+    return file_id
+  }
+
+  /**
    * `POST /v1/files/initiate`: reserve a NEW file row (server mints the id — even a
    * re-used sha gets a fresh row) and report whether bytes are still needed
    * (`upload_needed:false` only when this sha is already present — the dedup path).
@@ -593,12 +623,30 @@ export class FakeHttpClient implements HttpClient {
   maxInFlight = 0
   /** Queued transient failures — one per `putBlob` (a blip injector for retry tests). */
   private readonly putBlips: ApiError[] = []
+  /** The `signal` of the most recent `putBlob` — lets a test assert cancel aborted it. */
+  lastPutSignal: AbortSignal | undefined
+  /** Gate for `putBlob` (hold an in-flight upload so a test can cancel mid-PUT). */
+  private putBlobGate: Promise<void> | undefined
+  private releasePutBlobGate: (() => void) | undefined
 
   constructor(private readonly server: FakeSyncServer) {}
 
   /** Make the NEXT `putBlob` fail transiently (default a `network` blip). */
   failNextPutBlob(error: ApiError = { status: 0, code: 'network', title: 'Network error' }): void {
     this.putBlips.push(error)
+  }
+
+  /** Hold every subsequent `putBlob` response until {@link resumePutBlob}. */
+  pausePutBlob(): void {
+    this.putBlobGate = new Promise<void>((resolve) => {
+      this.releasePutBlobGate = resolve
+    })
+  }
+
+  resumePutBlob(): void {
+    this.releasePutBlobGate?.()
+    this.putBlobGate = undefined
+    this.releasePutBlobGate = undefined
   }
 
   async get<T>(path: string): Promise<ApiResult<T>> {
@@ -642,21 +690,27 @@ export class FakeHttpClient implements HttpClient {
     return Promise.resolve({ ok: true, value: undefined })
   }
 
-  putBlob(
+  async putBlob(
     path: string,
     body: Blob | ArrayBuffer,
-    opts?: { contentType?: string },
+    opts?: { contentType?: string; signal?: AbortSignal },
   ): Promise<ApiResult<void>> {
     this.putBlobCalls.push({
       path,
       body,
       ...(opts?.contentType ? { contentType: opts.contentType } : {}),
     })
+    this.lastPutSignal = opts?.signal
+    if (this.putBlobGate) await this.putBlobGate
     const blip = this.putBlips.shift()
-    if (blip) return Promise.resolve({ ok: false, error: blip })
+    if (blip) return { ok: false, error: blip }
+    // A cancel while the PUT was gated aborts the signal — model the real fetch reject.
+    if (opts?.signal?.aborted) {
+      return { ok: false, error: { status: 0, code: 'network', title: 'Network error' } }
+    }
     // path = /v1/files/{file_id}/blob
     const fileId = path.slice('/v1/files/'.length, -'/blob'.length)
-    return Promise.resolve(this.server.respondPutBlob(fileId, body))
+    return this.server.respondPutBlob(fileId, body)
   }
 
   getBlob(path: string): Promise<ApiResult<{ blob: Blob; mimeType: string }>> {
