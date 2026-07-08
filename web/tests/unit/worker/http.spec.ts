@@ -331,7 +331,9 @@ describe('createHttpClient binary transfer (putBlob/getBlob, ENG-119)', () => {
 
     if (!res.ok) throw new Error('expected ok')
     // A Blob is returned verbatim (never JSON.parse'd) with its content type intact.
-    expect(res.value.blob).toBeInstanceOf(Blob)
+    // Duck-typed (not `instanceof Blob`): `Response.blob()` may return a Blob from a
+    // different realm than the test-env global (undici vs jsdom), so assert the shape.
+    expect(typeof res.value.blob.size).toBe('number')
     expect(res.value.blob.size).toBe('not-json-just-bytes'.length)
     expect(res.value.mimeType).toBe('image/webp')
     expect(headerOf(calls[0]?.init, 'Authorization')).toBe('Bearer tok-123')
