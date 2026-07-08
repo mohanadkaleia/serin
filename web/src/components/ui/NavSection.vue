@@ -1,8 +1,9 @@
 <script setup lang="ts">
-// ui/NavSection.vue — ENG-136 "Ranin" primitive (PR-A). A collapsible sidebar
-// section: an 11px uppercase tracking-wide muted header with a chevron toggling
-// the body (v-show), an optional trailing action slot (e.g. a `+` IconButton),
-// and the default slot for the section's items.
+// ui/NavSection.vue — ENG-136 "Ranin" primitive (PR-A; PR-3 `#icon` slot). A
+// collapsible sidebar section: an 11px uppercase tracking-wide muted header with a
+// chevron toggling the body (v-show), an optional leading `#icon` slot (a 16px
+// outline glyph before the title — ADDITIVE), an optional trailing action slot
+// (e.g. a `+` IconButton), and the default slot for the section's items.
 import { ref } from 'vue'
 
 const props = withDefaults(defineProps<{ title: string; defaultOpen?: boolean }>(), {
@@ -37,6 +38,9 @@ function toggle(): void {
         >
           <path d="M4.5 3 8 6l-3.5 3" />
         </svg>
+        <span v-if="$slots.icon" aria-hidden="true" class="flex shrink-0 items-center">
+          <slot name="icon" />
+        </span>
         <span class="truncate">{{ title }}</span>
       </button>
       <span v-if="$slots.action" class="shrink-0">

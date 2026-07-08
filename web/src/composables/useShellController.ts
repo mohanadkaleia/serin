@@ -18,12 +18,13 @@ import { useRouter } from 'vue-router'
 import type { QuickItem } from '../components/shell/CommandPalette.vue'
 import { useAuthStore } from '../stores/auth'
 import { useMessagesStore } from '../stores/messages'
+import { usePresenceStore } from '../stores/presence'
 import { useSyncStore } from '../stores/sync'
 import { useThreadStore } from '../stores/thread'
 import { useWorkspaceStore } from '../stores/workspace'
 
 /** Which panel the main column renders: the live timeline vs a scaffold section. */
-export type ActiveView = 'conversation' | 'inbox' | 'feeds' | 'apps' | 'admin'
+export type ActiveView = 'conversation' | 'inbox' | 'feeds' | 'apps' | 'files' | 'admin'
 
 /** The neutral workspace name shown in the sidebar header + rail glyph (NOT "Ranin"). */
 const WORKSPACE_NAME = 'msg'
@@ -36,6 +37,7 @@ const SCAFFOLD_COPY: Record<
   inbox: { title: 'Inbox', body: 'A unified inbox of your unreads and mentions is on the way.' },
   feeds: { title: 'Feeds', body: 'Feeds are coming soon.' },
   apps: { title: 'Apps', body: 'Apps are coming soon.' },
+  files: { title: 'Files', body: 'A workspace file browser is coming soon.' },
   admin: { title: 'Admin', body: 'Workspace administration is coming soon.' },
 }
 
@@ -46,6 +48,7 @@ export function useShellController() {
   const messages = useMessagesStore()
   const thread = useThreadStore()
   const sync = useSyncStore()
+  const presence = usePresenceStore()
 
   const { myUserId, role } = storeToRefs(auth)
   const { selectedStream, selectedStreamId, channels, dms, mentionItems, directory } =
@@ -218,6 +221,9 @@ export function useShellController() {
     messages.setMyUserId(myUserId.value ?? '')
     thread.setMyUserId(myUserId.value ?? '')
     void sync.start()
+    // REAL presence (ENG-126): subscribe to the ephemeral snapshot; the footer
+    // UserCard dot reads the signed-in user's status (online by default).
+    void presence.start(myUserId.value)
     await workspace.load()
     if (selectedStreamId.value) void messages.selectStream(selectedStreamId.value)
     window.addEventListener('keydown', onGlobalKeydown)
@@ -229,6 +235,7 @@ export function useShellController() {
     messages.dispose()
     thread.dispose()
     sync.stop()
+    presence.stop()
   })
 
   return {

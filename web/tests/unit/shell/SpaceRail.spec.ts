@@ -64,10 +64,24 @@ describe('SpaceRail (ENG-136 PR-B)', () => {
     expect(wrapper.get('[data-testid="sync-indicator"]').attributes('data-tone')).toBe('offline')
   })
 
-  it('emits logout from the account affordance', async () => {
+  it('emits logout from the settings gear popover', async () => {
     const wrapper = mountRail()
+    // Sign-out lives in the gear popover — closed until the gear is opened.
+    expect(wrapper.find('[data-testid="logout"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="open-settings"]').trigger('click')
     await wrapper.get('[data-testid="logout"]').trigger('click')
     expect(wrapper.emitted('logout')).toHaveLength(1)
+  })
+
+  it('renders the brand logo and the active workspace square', () => {
+    const wrapper = mountRail()
+    // The "R" brand mark is a labeled image.
+    const logo = wrapper.get('[role="img"][aria-label="Ranin"]')
+    expect(logo.text()).toBe('R')
+    // The one real workspace is the active square (aria-current) with its initials.
+    const square = wrapper.get('button[aria-current="true"]')
+    expect(square.text()).toBe('MS')
+    expect(square.attributes('title')).toBe('msg')
   })
 
   it('mounts the ThemeToggle in the rail (PR-D)', () => {

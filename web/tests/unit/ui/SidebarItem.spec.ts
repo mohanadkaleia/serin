@@ -44,4 +44,21 @@ describe('ui/SidebarItem', () => {
     expect(wrapper.get('button').attributes('data-testid')).toBe('nav-general')
     expect(wrapper.text()).toContain('3')
   })
+
+  it('renders the optional leading slot before the label (aria-hidden wrapper)', () => {
+    const wrapper = mount(SidebarItem, {
+      slots: { default: 'general', leading: '<svg data-testid="lead-icon" />' },
+    })
+    const lead = wrapper.get('[data-testid="lead-icon"]')
+    // The leading glyph is wrapped in an aria-hidden decorative container.
+    expect(lead.element.parentElement?.getAttribute('aria-hidden')).toBe('true')
+    // And it precedes the label in document order.
+    const html = wrapper.html()
+    expect(html.indexOf('lead-icon')).toBeLessThan(html.indexOf('general'))
+  })
+
+  it('omits the leading wrapper when no leading slot is provided', () => {
+    const wrapper = mount(SidebarItem, { slots: { default: 'general' } })
+    expect(wrapper.find('[aria-hidden="true"]').exists()).toBe(false)
+  })
 })

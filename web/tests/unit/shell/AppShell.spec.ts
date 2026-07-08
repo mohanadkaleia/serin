@@ -64,13 +64,13 @@ describe('AppShell (ENG-136 PR-C)', () => {
     document.body.innerHTML = ''
   })
 
-  it('lays out the rail / sidebar / main landmarks on a CSS grid', async () => {
+  it('lays out the rail / sidebar / top-bar / main landmarks', async () => {
     fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
     const wrapper = await mountShell(fake, router)
 
-    // Root is a CSS grid application region.
+    // Root is a flex application region (rail+sidebar beside the top-bar/main region).
     const root = wrapper.get('[role="application"]')
-    expect(root.classes()).toContain('grid')
+    expect(root.classes()).toContain('flex')
 
     // Rail — Workspaces navigation landmark.
     const rail = wrapper.get('nav[aria-label="Workspaces"]')
@@ -80,11 +80,36 @@ describe('AppShell (ENG-136 PR-C)', () => {
     const sidebar = wrapper.get('aside[role="navigation"]')
     expect(sidebar.attributes('aria-label')).toBe('Channels and direct messages')
 
+    // TopBar — a centered search that opens the palette.
+    expect(wrapper.find('[data-testid="topbar-search"]').exists()).toBe(true)
+
     // Main region.
     expect(wrapper.find('main[role="main"]').exists()).toBe(true)
 
     // Drawer is absent until a thread opens.
     expect(wrapper.find('[role="complementary"][aria-label="Thread"]').exists()).toBe(false)
+  })
+
+  it('opens the command palette from the top-bar search', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    // Unstub CommandPalette so we can observe it opening.
+    setWorkerClient(fake.client)
+    const wrapper = mount(AppShell, {
+      attachTo: document.body,
+      global: {
+        plugins: [router],
+        stubs: {
+          MessageList: stubs.MessageList,
+          MessageComposer: stubs.MessageComposer,
+          ThreadPane: stubs.ThreadPane,
+        },
+      },
+    })
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="command-palette"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="topbar-search"]').trigger('click')
+    expect(wrapper.find('[data-testid="command-palette"]').exists()).toBe(true)
   })
 
   it('renders channel-header + MessageList + MessageComposer for a real conversation', async () => {
@@ -122,12 +147,10 @@ describe('AppShell (ENG-136 PR-C)', () => {
     await thread.openThread(root.message_id, 's_a')
     await flushPromises()
 
-    // Drawer appears as its own grid track (4-column template) hosting the thread pane.
+    // Drawer appears as a second column in the main/drawer grid, hosting the thread pane.
     const drawer = wrapper.get('[role="complementary"][aria-label="Thread"]')
     expect(drawer.find('[data-testid="thread-pane"]').exists()).toBe(true)
-    expect(wrapper.get('[role="application"]').classes()).toContain(
-      'grid-cols-[3.5rem_16rem_1fr_24rem]',
-    )
+    expect(wrapper.find('.grid-cols-\\[1fr_24rem\\]').exists()).toBe(true)
 
     // Closing removes the pane immediately (no leave transition), as before.
     thread.close()

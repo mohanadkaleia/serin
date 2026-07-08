@@ -17,9 +17,14 @@ async function mountSidebar(): Promise<ReturnType<typeof mount>> {
   await store.load()
   const wrapper = mount(AppSidebar, {
     attachTo: document.body,
-    // ENG-136 PR-B: feed-first sidebar props (activeView drives active state; the
+    // ENG-136 feed-first sidebar props (activeView drives active state; the
     // ENG-104 flows asserted here are unchanged and testid-addressed).
-    props: { activeView: 'conversation', workspaceName: 'msg', canAdmin: false },
+    props: {
+      activeView: 'conversation',
+      workspaceName: 'msg',
+      workspaceInitials: 'MS',
+      canAdmin: false,
+    },
   })
   await flushPromises()
   return wrapper
@@ -166,5 +171,102 @@ describe('AppSidebar — ENG-104 channel/DM management', () => {
       stream_id: 's_proj',
     })
     expect(fake.fetch).not.toHaveBeenCalled()
+  })
+})
+
+describe('AppSidebar — ENG-136 feed-first structure', () => {
+  let fake: FakeWorker
+
+  beforeEach(() => {
+    setActivePinia(createPinia())
+    fake = new FakeWorker()
+  })
+
+  afterEach(() => {
+    setWorkerClient(undefined)
+    document.body.innerHTML = ''
+  })
+
+  it('shows the "Ranin" brand wordmark and the workspace selector pill', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    // Header wordmark is the BRAND, not the workspace name.
+    expect(wrapper.text()).toContain('Ranin')
+    // The workspace selector pill preserves the open-switcher affordance.
+    const pill = wrapper.get('[data-testid="open-switcher"]')
+    await pill.trigger('click')
+    expect(wrapper.emitted('openSwitcher')).toHaveLength(1)
+  })
+
+  it('renders the feed-first nav rows with their preserved test-ids', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    for (const id of ['nav-inbox', 'nav-feeds', 'nav-apps', 'nav-files', 'nav-search']) {
+      expect(wrapper.find(`[data-testid="${id}"]`).exists()).toBe(true)
+    }
+    // A real channel row carries a leading hash icon (lucide-hash svg).
+    const channel = wrapper.get('[data-testid="sidebar-channel"]')
+    expect(channel.find('svg.lucide-hash').exists()).toBe(true)
+  })
+
+  it('shows a REAL total-unread badge on Inbox summed across channels + DMs', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel', unread: 2 })
+    fake.addStream({ stream_id: 's_dm', name: 'dana', kind: 'dm', unread: 3, member: true })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    expect(wrapper.get('[data-testid="inbox-unread"]').text()).toBe('5')
+  })
+
+  it('emits selectView("feeds") from a feed sub-item and shows its scaffold count', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    // Expand the feeds section, then click a sub-item.
+    await wrapper.get('[data-testid="nav-feeds-toggle"]').trigger('click')
+    const sub = wrapper.get('[data-testid="feed-subitem"]')
+    await sub.trigger('click')
+    expect(wrapper.emitted('selectView')?.some((e) => e[0] === 'feeds')).toBe(true)
+  })
+
+  it('opens the palette from the Search row (openSwitcher)', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    await wrapper.get('[data-testid="nav-search"]').trigger('click')
+    expect(wrapper.emitted('openSwitcher')).toHaveLength(1)
+  })
+
+  it('renders the footer user card', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    expect(wrapper.find('[data-testid="user-card"]').exists()).toBe(true)
+  })
+
+  it('gates the Admin section on canAdmin', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+
+    const store = useWorkspaceStore()
+    await store.load()
+    const wrapper = mount(AppSidebar, {
+      attachTo: document.body,
+      props: {
+        activeView: 'conversation',
+        workspaceName: 'msg',
+        workspaceInitials: 'MS',
+        canAdmin: true,
+      },
+    })
+    await flushPromises()
+    expect(wrapper.find('[data-testid="nav-admin"]').exists()).toBe(true)
   })
 })

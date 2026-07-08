@@ -32,6 +32,25 @@ describe('ui/Icon', () => {
     expect(svg.attributes('aria-label')).toBeUndefined()
   })
 
+  it('maps the ENG-136 nav glyphs added in PR-3', () => {
+    const cases = [
+      ['settings', 'lucide-settings'],
+      ['mail', 'lucide-mail'],
+      ['users', 'lucide-users'],
+      ['rss', 'lucide-rss'],
+      ['grid', 'lucide-layout-grid'],
+      ['file', 'lucide-file'],
+      ['shield', 'lucide-shield'],
+      ['square-pen', 'lucide-square-pen'],
+      ['bell', 'lucide-bell'],
+      ['chevrons-left-right', 'lucide-chevrons-left-right'],
+    ] as const
+    for (const [name, cls] of cases) {
+      const svg = mount(Icon, { props: { name } }).get('svg')
+      expect(svg.classes().join(' ')).toContain(cls)
+    }
+  })
+
   it('is a semantic image (role=img + aria-label, not hidden) when labeled', () => {
     const svg = mount(Icon, { props: { name: 'paperclip', label: 'Attachment' } }).get('svg')
     expect(svg.attributes('role')).toBe('img')
