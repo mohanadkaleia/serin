@@ -35,6 +35,15 @@ export default tseslint.config(
     },
   },
   {
+    // ENG-136 "Ranin" design-system primitives (src/components/ui/**) use
+    // single-word names by convention (Button, IconButton is multi-word but
+    // Button/Badge-style names are the norm) — disable the multi-word rule here.
+    files: ['src/components/ui/**/*.vue'],
+    rules: {
+      'vue/multi-word-component-names': 'off',
+    },
+  },
+  {
     // Config files run under Node tooling, not typed against the app project.
     files: ['*.config.{ts,js}'],
     ...tseslint.configs.disableTypeChecked,

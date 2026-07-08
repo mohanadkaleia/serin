@@ -1,3 +1,69 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/*
+ * ENG-136 "Ranin" design tokens (PR-A, ADDITIVE).
+ *
+ * Each token is SPACE-SEPARATED RGB CHANNELS (not rgb()/hex) so Tailwind can
+ * compose opacity modifiers via `rgb(var(--c-NAME) / <alpha-value>)` — see
+ * tailwind.config.ts. `:root` holds LIGHT values; `[data-theme="dark"]` holds
+ * DARK values. index.html PINS data-theme="light" for PR-A (dark ships in PR-D),
+ * so the running app is byte-identical to today: existing components still use
+ * hardcoded slate/white/indigo classes and simply sit on the light background.
+ */
+:root {
+  --c-background: 255 255 255; /* #FFFFFF */
+  --c-surface: 247 248 249; /* #F7F8F9 */
+  --c-surface-elevated: 255 255 255; /* #FFFFFF */
+  --c-border-subtle: 236 237 239; /* #ECEDEF */
+  --c-border-strong: 216 218 222; /* #D8DADE */
+  --c-text-primary: 23 24 26; /* #17181A */
+  --c-text-secondary: 91 94 102; /* #5B5E66 */
+  --c-text-muted: 138 143 152; /* #8A8F98 */
+  --c-accent: 91 103 228; /* #5B67E4 */
+  --c-accent-fg: 255 255 255; /* #FFFFFF */
+  --c-accent-subtle: 238 240 254; /* #EEF0FE */
+  --c-danger: 229 72 77; /* #E5484D */
+  --c-warning: 217 130 43; /* #D9822B */
+  --c-success: 47 158 99; /* #2F9E63 */
+  --c-sync-pending: 138 143 152; /* #8A8F98 */
+}
+
+[data-theme='dark'] {
+  --c-background: 11 12 14; /* #0B0C0E */
+  --c-surface: 20 21 23; /* #141517 */
+  --c-surface-elevated: 28 30 34; /* #1C1E22 */
+  --c-border-subtle: 38 40 45; /* #26282D */
+  --c-border-strong: 54 57 65; /* #363941 */
+  --c-text-primary: 232 234 237; /* #E8EAED */
+  --c-text-secondary: 166 171 180; /* #A6ABB4 */
+  --c-text-muted: 110 116 128; /* #6E7480 */
+  --c-accent: 123 135 240; /* #7B87F0 */
+  --c-accent-fg: 11 12 14; /* #0B0C0E */
+  --c-accent-subtle: 32 35 63; /* #20233F */
+  --c-danger: 242 85 90; /* #F2555A */
+  --c-warning: 232 150 58; /* #E8963A */
+  --c-success: 63 184 120; /* #3FB878 */
+  --c-sync-pending: 110 116 128; /* #6E7480 */
+}
+
+body {
+  background-color: rgb(var(--c-background));
+  color: rgb(var(--c-text-primary));
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif,
+    'Apple Color Emoji', 'Segoe UI Emoji';
+}
+
+/*
+ * Baseline focus-visible ring in the accent color for keyboard users. Individual
+ * primitives set their own richer rings; this is the default for anything else.
+ * Pointer clicks don't trigger :focus-visible, so no visual change to mouse UX.
+ */
+:focus-visible {
+  outline: 2px solid rgb(var(--c-accent));
+  outline-offset: 2px;
+}
