@@ -405,6 +405,14 @@ def assert_permission_isolation(
     write into it (refused at the stream gate) — a user cannot access, observe, or
     post to a DM they are not part of.
 
+    ENG-122 extends it to SEARCH: (l) the adversary's ``GET /v1/search`` for a
+    sentinel token that lives ONLY in the private stream (owner-authored, never
+    legitimately readable) returned ZERO hits — the shared readable-streams
+    predicate is joined in-query, so a full-text search is as isolated as sync/pull;
+    a non-member cannot surface a private message's content by searching for it. The
+    probe is non-vacuous: the OWNER's search for the same token DID hit (recorded
+    together in ``adversary_search_isolated``), so a dropped predicate would fail it.
+
     ENG-117 extends it to file attachments: (j) the adversary could neither attach a
     file it uploaded INTO the private stream it cannot write (step-iii permission_denied)
     nor BORROW the owner's private-stream file binding from a stream it CAN write
@@ -493,6 +501,14 @@ def assert_permission_isolation(
                     f"file binding: file_ids entry {fid!r} is homed in {file_stream!r}, "
                     f"not the message's stream {body.get('stream_id')!r}"
                 )
+
+    # ENG-122 (l) the adversary's search for a private-only sentinel token returned zero
+    # hits, and the owner's search for the same token DID hit (non-vacuous) — a full-text
+    # search leaks no private content to a non-member.
+    assert world.adversary_search_isolated, (
+        "isolation: adversary surfaced a private-stream message through GET /v1/search "
+        "(or the probe was vacuous — the owner's own search did not find the sentinel)"
+    )
 
 
 def assert_all(

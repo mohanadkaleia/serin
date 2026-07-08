@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     # the fixed-window RateLimiter counts one hit per check and has no weight).
     event_rate_limit_per_minute: int = 60
     event_rate_limit_burst_per_second: int = 20
+    # Search rate limit (ENG-122, §8): per user, keyed ``user:{user_id}`` exactly
+    # like the event/file limiters. FTS (``websearch_to_tsquery`` + ``ts_rank_cd``
+    # over a GIN index) is a cheap-ish read but not free, so it gets its own modest
+    # per-user budget so a search flood cannot monopolize the DB.
+    search_rate_limit_per_minute: int = 60
 
     # --- Invites (D7) --------------------------------------------------------
     invite_default_ttl_seconds: int = 604800  # 7 days
