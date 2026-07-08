@@ -58,6 +58,9 @@ export {
   type UploadPhase,
   type UploadProgress,
   type FileFetchResult,
+  // ENG-120 client `file.uploaded` projection + attachments query (ENG-121 UI reads these).
+  type FileRow,
+  type AttachmentsResult,
 } from './types'
 
 // ENG-80 projection functions — the ENG-79 apply seam + the ENG-83 dump surface.

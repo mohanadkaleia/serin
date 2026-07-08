@@ -31,7 +31,13 @@ import type { ApiError } from './http'
 // tombstone rows) so reactions converge under the client's out-of-order
 // (cold-window + backfill) delivery. A row-shape change → drop + rebuild reactions
 // from `events` on boot (no Dexie index change — the new fields are unindexed).
-export const PROJECTION_VERSION = 4
+// ENG-120 bumped 4 → 5 (client `file.uploaded` projection): the derived set gained
+// the `files` table (a keyed upsert mirror of `file.uploaded`, keyed by `file_id`)
+// and `MessageRow` gained the client-only `file_ids` display column (projected from
+// the `message.created` body). A shape/derived-set change bumps this so existing
+// clients drop + rebuild the derived tables from the raw `events` cache on boot —
+// which is what populates the new `files` table + backfills `MessageRow.file_ids`.
+export const PROJECTION_VERSION = 5
 
 /** `meta` key under which the current `PROJECTION_VERSION` is stored. */
 export const META_PROJECTION_VERSION = 'projection_version'
@@ -152,6 +158,19 @@ export interface MessageRow {
   thread_root_id?: string
   mention_user_ids: string[]
   /**
+   * The attachment linkage (ENG-120) — the `file_id`s this message references,
+   * projected VERBATIM from the `message.created` body's `file_ids` (default `[]`
+   * when absent/invalid). This is a CLIENT-ONLY display field: it is a pure,
+   * deterministic function of the single `message.created` event (no cross-event
+   * accumulation), so it is trivially order-independent and rebuild ≡ incremental
+   * holds. It is DELIBERATELY EXCLUDED from `dumpMessages` — the ENG-83
+   * cross-language byte-equality surface — because the SERVER has no
+   * message→attachment projection (ENG-117: `messages_proj` is search-only, no
+   * `file_ids`), so the frozen server dump has no such field. The `attachments.
+   * forMessage` query resolves these ids against the `files` table (see FileRow).
+   */
+  file_ids: string[]
+  /**
    * LWW edit stamp (ENG-100, M3). ABSENT = never edited. When present it is the
    * `server_sequence` of the winning `message.edited` event; a later edit applies
    * only if its `server_sequence > coalesce(edited_seq, created_seq)` AND the row
@@ -228,6 +247,38 @@ export interface ThreadParticipantRow {
   user_id: string
 }
 
+/**
+ * Projected file row (ENG-120) — the client mirror of a `file.uploaded` v1 event,
+ * so the UI can render a message's attachments (name / mime / size) from the LOCAL
+ * projection instead of a network read.
+ *
+ * One row per `file_id` (the PK). Unlike the ENG-100 stateful projections
+ * (reactions/threads/edits), a file is uploaded EXACTLY ONCE and its
+ * `file.uploaded` event is IMMUTABLE, so this is a plain IDEMPOTENT KEYED UPSERT:
+ * a re-delivery is byte-identical, and whether the event arrives before or after
+ * its referencing `message.created` does not matter (the row is keyed by
+ * `file_id`; the attachments query reads whatever has projected). Order-
+ * independence therefore comes FOR FREE — no seq-aware LWW / recompute is needed
+ * (contrast the reactions/threads handlers). Derived table: dropped + rebuilt from
+ * `events` on a version bump.
+ *
+ * The five payload fields (`sha256`/`name`/`mime_type`/`size_bytes` + `file_id`)
+ * come from the `file.uploaded` body; `stream_id` is read from the event ENVELOPE
+ * (`event.stream_id`), NOT the payload (the payload carries no stream_id). No
+ * server `thumbnail_sha256` is stored — the client cannot know it; the UI derives
+ * "attempt a thumbnail" from `mime_type` starting with `image/` and fetches it
+ * lazily via `file.fetch{variant:'thumbnail'}` (ENG-119), which 404s when absent.
+ */
+export interface FileRow {
+  file_id: string
+  sha256: string
+  name: string
+  mime_type: string
+  size_bytes: number
+  /** The stream the file was uploaded into — from the event envelope, not the payload. */
+  stream_id: string
+}
+
 /** Projected stream row (derived). */
 export interface StreamRow {
   stream_id: string
@@ -285,12 +336,16 @@ export interface MetaRow {
   value: unknown
 }
 
-/** The tables of the §5.2 schema (+ ENG-100's `reactions` / `thread_participants`). */
+/**
+ * The tables of the §5.2 schema (+ ENG-100's `reactions` / `thread_participants`
+ * and ENG-120's `files`).
+ */
 export type TableName =
   | 'events'
   | 'messages'
   | 'reactions'
   | 'thread_participants'
+  | 'files'
   | 'streams'
   | 'cursors'
   | 'outbox'
@@ -302,6 +357,7 @@ export const DERIVED_TABLES = [
   'messages',
   'reactions',
   'thread_participants',
+  'files',
   'streams',
   'cursors',
   'read_state',
@@ -376,6 +432,15 @@ export interface MsgDb {
   listThreadParticipantsByRoot(rootMessageId: string): Promise<ThreadParticipantRow[]>
   /** A root's replies (by `thread_root_id` index) — the recompute input. */
   listRepliesByRoot(rootMessageId: string): Promise<MessageRow[]>
+  // -- ENG-120 files (keyed upsert; mirror of `file.uploaded`) ---------------
+  /** Upsert file rows by their `file_id` PK (idempotent — a re-apply is a no-op). */
+  putFiles(rows: readonly FileRow[]): Promise<void>
+  /** A single projected file by `file_id`, or undefined if not yet projected. */
+  getFile(fileId: string): Promise<FileRow | undefined>
+  /** The projected file rows for a set of ids (present only; missing ids omitted). */
+  getFilesByIds(fileIds: readonly string[]): Promise<FileRow[]>
+  /** Every projected file row — the `dumpFiles` source (sorted in JS). */
+  getAllFiles(): Promise<FileRow[]>
   putStreams(rows: readonly StreamRow[]): Promise<void>
   putCursors(rows: readonly CursorRow[]): Promise<void>
   putReadState(rows: readonly ReadStateRow[]): Promise<void>
@@ -458,6 +523,13 @@ export type QueryParams =
   //     renders them ONLY via Vue text interpolation (never a raw-HTML sink).
   | { q: 'messages.thread'; root_message_id: string; before_seq?: number; limit?: number }
   | { q: 'messages.threads'; root_message_ids: string[] }
+  // ENG-120: a message's ATTACHMENTS — the resolved `FileRow`s for the message's
+  // `file_ids`, read from the local `files` projection (the `file.uploaded` mirror).
+  // Ids not yet projected come back in `pending_file_ids` (the blob's `file.uploaded`
+  // has not landed / been backfilled). A pure LOCAL projection read (zero network) —
+  // the client only holds data it is authorized for. ENG-121 (the attachment UI)
+  // pairs each returned FileRow with a download/thumbnail handle via `client.files.*`.
+  | { q: 'attachments.forMessage'; message_id: string }
 
 /**
  * Mutation taxonomy (ENG-81) — durable mutations carried on the existing
@@ -644,6 +716,20 @@ export interface ThreadResult {
   participants: ThreadParticipant[]
 }
 
+/**
+ * `attachments.forMessage` result (ENG-120) — a message's resolved attachments.
+ * `files` are the projected {@link FileRow}s for the message's `file_ids`, in the
+ * SAME order as the message's `file_ids` (so the UI renders them stably);
+ * `pending_file_ids` are the ids whose `file.uploaded` has not yet projected
+ * (not-yet-delivered / not-yet-backfilled) — the UI shows them as pending. An
+ * empty `file_ids` (or an unknown message) yields both arrays empty.
+ */
+export interface AttachmentsResult {
+  message_id: string
+  files: FileRow[]
+  pending_file_ids: string[]
+}
+
 /** The union of every projection-query result (RpcResultMap['query']). */
 export type QueryResultUnion =
   | MessagesListResult
@@ -653,6 +739,7 @@ export type QueryResultUnion =
   | ReactionsListResult
   | ThreadResult
   | ThreadsListResult
+  | AttachmentsResult
 
 /** Result keyed to the query's `q` discriminant (WorkerClient.query<Q>). */
 export type QueryResult<Q extends QueryParams> = Q extends { q: 'messages.list' }
@@ -669,7 +756,9 @@ export type QueryResult<Q extends QueryParams> = Q extends { q: 'messages.list' 
             ? ThreadResult
             : Q extends { q: 'messages.threads' }
               ? ThreadsListResult
-              : never
+              : Q extends { q: 'attachments.forMessage' }
+                ? AttachmentsResult
+                : never
 export type MutateResult<M extends MutateParams> = M extends {
   m: 'outbox.send' | 'outbox.react' | 'outbox.edit' | 'outbox.remove'
 }

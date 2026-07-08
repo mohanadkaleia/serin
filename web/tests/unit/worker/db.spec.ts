@@ -8,19 +8,23 @@ import {
   openDb,
   rebuildProjections,
 } from '../../../src/worker/db'
-import { PROJECTION_VERSION, type MsgDb } from '../../../src/worker/types'
+import { applyEventsToProjection } from '../../../src/worker/projection'
+import { PROJECTION_VERSION, type FileRow, type MsgDb } from '../../../src/worker/types'
 
 import { fakeIdbOptions, makeFakeMsgDB, stubEnvelope } from './helpers'
+import { fileId, fileUploadedEvent } from './projfixtures'
 
 describe('MsgDB schema (§5.2, verbatim)', () => {
   it('declares the schema tables with the load-bearing indexes', async () => {
     const db = makeFakeMsgDB()
     await db.open()
     try {
-      // ENG-100 (M3) added the `reactions` + `thread_participants` derived sets.
+      // ENG-100 (M3) added the `reactions` + `thread_participants` derived sets;
+      // ENG-120 added the `files` set.
       expect(db.tables.map((t) => t.name).sort()).toEqual([
         'cursors',
         'events',
+        'files',
         'messages',
         'meta',
         'outbox',
@@ -38,6 +42,9 @@ describe('MsgDB schema (§5.2, verbatim)', () => {
       expect(db.thread_participants.schema.indexes.map((i) => i.keyPath)).toContainEqual(
         'root_message_id',
       )
+      // files (ENG-120): file_id pk + a stream_id secondary index.
+      expect(db.files.schema.primKey.keyPath).toBe('file_id')
+      expect(db.files.schema.indexes.map((i) => i.keyPath)).toContainEqual('stream_id')
 
       // events: compound primary key + secondary indexes.
       expect(db.events.schema.primKey.keyPath).toEqual(['stream_id', 'server_sequence'])
@@ -134,6 +141,7 @@ async function seedAllTables(db: MsgDb): Promise<void> {
       text: '',
       format: 'plain',
       mention_user_ids: [],
+      file_ids: [],
     },
   ])
   await db.putStreams([{ stream_id: 's1', kind: 'channel', head_seq: 1, member: true }])
@@ -192,8 +200,71 @@ describe('rebuildProjections stub', () => {
         text: '',
         format: 'plain',
         mention_user_ids: [],
+        file_ids: [],
       },
     ])
     await expect(rebuildProjections(db)).rejects.toThrow(/must be cleared/)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// ENG-120 files accessors + version(3)/PROJECTION_VERSION-bump rebuild.
+// ---------------------------------------------------------------------------
+
+const F1 = fileId(1)
+const F2 = fileId(2)
+
+function fileRow(id: string, over: Partial<FileRow> = {}): FileRow {
+  return {
+    file_id: id,
+    sha256: 'a'.repeat(64),
+    name: 'f.png',
+    mime_type: 'image/png',
+    size_bytes: 7,
+    stream_id: 's1',
+    ...over,
+  }
+}
+
+describe.each([
+  { name: 'MemoryDb', make: (): Promise<MsgDb> => Promise.resolve(new MemoryDb()) },
+  { name: 'DexieDb', make: (): Promise<MsgDb> => openDb(fakeIdbOptions()) },
+])('files accessors (ENG-120) [$name]', ({ make }) => {
+  it('putFiles/getFile/getFilesByIds/getAllFiles round-trip; getFilesByIds omits misses', async () => {
+    const db = await make()
+    await db.putFiles([fileRow(F1), fileRow(F2)])
+    expect((await db.getFile(F1))?.file_id).toBe(F1)
+    expect(await db.getFile('f_missing')).toBeUndefined()
+    // getFilesByIds returns only the PRESENT rows (a missing id is silently dropped).
+    const got = await db.getFilesByIds([F1, 'f_absent', F2])
+    expect(got.map((r) => r.file_id).sort()).toEqual([F1, F2].sort())
+    expect(await db.count('files')).toBe(2)
+    expect((await db.getAllFiles()).length).toBe(2)
+    await db.close()
+  })
+
+  it('clearDerivedTables wipes files', async () => {
+    const db = await make()
+    await db.putFiles([fileRow(F1)])
+    await db.clearDerivedTables()
+    expect(await db.count('files')).toBe(0)
+    await db.close()
+  })
+
+  it('a PROJECTION_VERSION-bump rebuild drops + repopulates files from cached events', async () => {
+    const db = await make()
+    const events = [fileUploadedEvent({ streamId: 's1', seq: 1, fileId: F1 })]
+    await db.putEvents(events)
+    await applyEventsToProjection(db, 's1', events)
+    expect(await db.count('files')).toBe(1)
+
+    await db.metaPut('projection_version', 0) // stale ⇒ mismatch ⇒ drop + rebuild
+    const { rebuilt } = await checkProjectionVersion(db)
+    expect(rebuilt).toBe(true)
+    // files was cleared AND repopulated from the cached file.uploaded event.
+    expect(await db.count('files')).toBe(1)
+    expect((await db.getFile(F1))?.stream_id).toBe('s1')
+    expect(await db.metaGet<number>('projection_version')).toBe(PROJECTION_VERSION)
+    await db.close()
   })
 })

@@ -13,6 +13,7 @@ function makeMessage(over: Partial<DisplayMessage> = {}): DisplayMessage {
     text: 'hello',
     format: 'plain',
     mention_user_ids: [],
+    file_ids: [],
     ts: Date.now(),
     mine: false,
     ...over,

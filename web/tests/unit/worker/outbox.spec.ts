@@ -505,6 +505,7 @@ async function seedMessage(
       text: 'original',
       format: 'markdown',
       mention_user_ids: [],
+      file_ids: [],
     },
   ])
   // A matching settled event so the target is rebuildable / recompute-able.

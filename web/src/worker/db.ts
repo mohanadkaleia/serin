@@ -16,6 +16,7 @@ import {
   PROJECTION_VERSION,
   type CursorRow,
   type EventRow,
+  type FileRow,
   type MessageRow,
   type MetaRow,
   type MsgDb,
@@ -40,6 +41,7 @@ export class MsgDB extends Dexie {
   messages!: Table<MessageRow, string>
   reactions!: Table<ReactionRow, [string, string, string]>
   thread_participants!: Table<ThreadParticipantRow, [string, string]>
+  files!: Table<FileRow, string>
   streams!: Table<StreamRow, string>
   cursors!: Table<CursorRow, string>
   outbox!: Table<OutboxRow, string>
@@ -66,6 +68,15 @@ export class MsgDB extends Dexie {
     this.version(2).stores({
       reactions: '[message_id+author_user_id+emoji], message_id',
       thread_participants: '[root_message_id+user_id], root_message_id',
+    })
+    // ENG-120: the `files` set — one row per uploaded file, PK `file_id`
+    // (immutable keyed upsert; a re-apply is byte-identical) + a `stream_id`
+    // secondary index. Additive table only; the existing indexes are unchanged
+    // (Dexie carries them forward), so no `.upgrade()` data migration is needed —
+    // the PROJECTION_VERSION bump (4 → 5) drops + rebuilds the derived tables,
+    // which populates `files` from the cached `file.uploaded` events on boot.
+    this.version(3).stores({
+      files: 'file_id, stream_id',
     })
   }
 }
@@ -206,6 +217,27 @@ export class DexieDb implements MsgDb {
     return this.db.messages.where('thread_root_id').equals(rootMessageId).toArray()
   }
 
+  // -- ENG-120 files (keyed upsert; mirror of `file.uploaded`) --------------
+
+  async putFiles(rows: readonly FileRow[]): Promise<void> {
+    await this.db.files.bulkPut([...rows])
+  }
+
+  async getFile(fileId: string): Promise<FileRow | undefined> {
+    return this.db.files.get(fileId)
+  }
+
+  async getFilesByIds(fileIds: readonly string[]): Promise<FileRow[]> {
+    // `bulkGet` returns an entry per id (undefined for a miss); drop the misses
+    // so callers get only the PRESENT rows (pending ids are computed by the query).
+    const rows = await this.db.files.bulkGet([...fileIds])
+    return rows.filter((r): r is FileRow => r !== undefined)
+  }
+
+  async getAllFiles(): Promise<FileRow[]> {
+    return this.db.files.toArray()
+  }
+
   async putStreams(rows: readonly StreamRow[]): Promise<void> {
     await this.db.streams.bulkPut([...rows])
   }
@@ -225,6 +257,7 @@ export class DexieDb implements MsgDb {
         this.db.messages,
         this.db.reactions,
         this.db.thread_participants,
+        this.db.files,
         this.db.streams,
         this.db.cursors,
         this.db.read_state,
@@ -234,6 +267,7 @@ export class DexieDb implements MsgDb {
           this.db.messages.clear(),
           this.db.reactions.clear(),
           this.db.thread_participants.clear(),
+          this.db.files.clear(),
           this.db.streams.clear(),
           this.db.cursors.clear(),
           this.db.read_state.clear(),
@@ -308,6 +342,8 @@ export class DexieDb implements MsgDb {
         return this.db.reactions.count()
       case 'thread_participants':
         return this.db.thread_participants.count()
+      case 'files':
+        return this.db.files.count()
       case 'streams':
         return this.db.streams.count()
       case 'cursors':
@@ -343,6 +379,7 @@ export class MemoryDb implements MsgDb {
   private readonly messagesMap = new Map<string, MessageRow>()
   private readonly reactionsMap = new Map<string, ReactionRow>()
   private readonly participantsMap = new Map<string, ThreadParticipantRow>()
+  private readonly filesMap = new Map<string, FileRow>()
   private readonly streamsMap = new Map<string, StreamRow>()
   private readonly cursorsMap = new Map<string, CursorRow>()
   private readonly readStateMap = new Map<string, ReadStateRow>()
@@ -520,6 +557,30 @@ export class MemoryDb implements MsgDb {
     )
   }
 
+  // -- ENG-120 files (keyed upsert; same shapes as DexieDb) -----------------
+
+  putFiles(rows: readonly FileRow[]): Promise<void> {
+    for (const row of rows) this.filesMap.set(row.file_id, row)
+    return Promise.resolve()
+  }
+
+  getFile(fileId: string): Promise<FileRow | undefined> {
+    return Promise.resolve(this.filesMap.get(fileId))
+  }
+
+  getFilesByIds(fileIds: readonly string[]): Promise<FileRow[]> {
+    const rows: FileRow[] = []
+    for (const id of fileIds) {
+      const row = this.filesMap.get(id)
+      if (row !== undefined) rows.push(row)
+    }
+    return Promise.resolve(rows)
+  }
+
+  getAllFiles(): Promise<FileRow[]> {
+    return Promise.resolve([...this.filesMap.values()])
+  }
+
   putStreams(rows: readonly StreamRow[]): Promise<void> {
     for (const row of rows) this.streamsMap.set(row.stream_id, row)
     return Promise.resolve()
@@ -539,6 +600,7 @@ export class MemoryDb implements MsgDb {
     this.messagesMap.clear()
     this.reactionsMap.clear()
     this.participantsMap.clear()
+    this.filesMap.clear()
     this.streamsMap.clear()
     this.cursorsMap.clear()
     this.readStateMap.clear()
@@ -608,6 +670,8 @@ export class MemoryDb implements MsgDb {
         return Promise.resolve(this.reactionsMap.size)
       case 'thread_participants':
         return Promise.resolve(this.participantsMap.size)
+      case 'files':
+        return Promise.resolve(this.filesMap.size)
       case 'streams':
         return Promise.resolve(this.streamsMap.size)
       case 'cursors':

@@ -19,11 +19,21 @@
 // assertion ALSO replays a drawn history through the real DexieDb (fake-indexeddb)
 // so the SHIPPING IndexedDB rebuild path is what is gated.
 //
+// ENG-120 EXTENSION: the generated histories ALSO emit `file.uploaded` events
+// (interleaved with message.created that reference them via `file_ids`), and the
+// gate dump appends the `files` set (via `dumpFiles`) + the message rows'
+// `file_ids`. Because `file.uploaded` is an IMMUTABLE keyed upsert, it converges
+// under the windowed (newest-first + backfill) delivery for free — a duplicate is
+// byte-identical and arrival before/after its message.created does not matter.
+//
 // TEETH (all rebuild-pass-only, ENG-61 pattern):
 //   MSG_MUTATE=inv6-rebuild-skew    — corrupt one message.created row's text.
 //   MSG_MUTATE=inv6-delete-skew     — rebuild "forgets" the delete tombstone.
 //   MSG_MUTATE=inv6-reaction-skew   — rebuild ignores reaction removes (blind add).
+//   MSG_MUTATE=inv6-file-skew       — corrupt one file.uploaded row's name.
 // Each makes rebuild != incremental → RED. Unset (CI default) the suite is green.
+// Plus deterministic file teeth (no env var): a NON-idempotent/order-dependent
+// file handler makes windowed != in-order rebuild → RED (Property 2f).
 
 import fc from 'fast-check'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -32,12 +42,16 @@ import { openDb, MemoryDb, rebuildProjections } from '../../../src/worker/db'
 import { applyPendingOutboxRow } from '../../../src/worker/outbox'
 import {
   applyEventsToProjection,
+  applyFileUploadedV1,
   applyMessageCreatedV1,
+  dumpFiles,
   dumpMessages,
+  FILE_HANDLERS,
   HANDLERS,
 } from '../../../src/worker/projection'
 import type {
   EventRow,
+  FileRow,
   MessageRow,
   MsgDb,
   OutboxRow,
@@ -47,6 +61,8 @@ import type {
 
 import { fakeIdbOptions } from './helpers'
 import {
+  fileId,
+  fileUploadedEvent,
   malformedMessageEvent,
   messageCreatedEvent,
   messageDeletedEvent,
@@ -105,6 +121,7 @@ async function dumpProjection(db: MsgDb): Promise<string> {
       format: row.format,
       thread_root_id: row.thread_root_id ?? null,
       mention_user_ids: row.mention_user_ids,
+      file_ids: row.file_ids, // ENG-120 attachment linkage (gate-only; not in dumpMessages)
       edited_seq: row.edited_seq ?? null, // M3
       deleted: row.deleted ?? false, // M3
       reply_count: row.reply_count ?? 0, // M3 threads
@@ -129,6 +146,11 @@ async function dumpProjection(db: MsgDb): Promise<string> {
     JSON.stringify({ root_message_id: p.root_message_id, user_id: p.user_id }),
   )
 
+  // ENG-120: the `files` set — the NEW rebuild ≡ incremental surface. `dumpFiles`
+  // sorts by file_id with a stable field order, so any incremental-vs-rebuild
+  // divergence in the keyed-upsert files projection turns the gate RED.
+  const filesDump = await dumpFiles(db)
+
   return [
     'MESSAGES',
     ...messageLines,
@@ -136,6 +158,8 @@ async function dumpProjection(db: MsgDb): Promise<string> {
     ...reactionLines,
     'PARTICIPANTS',
     ...participantLines,
+    'FILES',
+    filesDump,
   ].join('\n')
 }
 
@@ -148,6 +172,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks()
   HANDLERS['message.created@1'] = applyMessageCreatedV1 // restore after any teeth patch
+  FILE_HANDLERS['file.uploaded@1'] = applyFileUploadedV1
 })
 
 // ---------------------------------------------------------------------------
@@ -169,6 +194,7 @@ type EventKind =
   | 'react-remove'
   | 'edit'
   | 'delete'
+  | 'file' // ENG-120: a file.uploaded event (a fresh file id in the stream)
   | 'unknown'
   | 'meta'
   | 'malformed'
@@ -218,6 +244,8 @@ const eventChoiceArb: fc.Arbitrary<EventChoice> = fc.record({
     'react-remove',
     'edit',
     'delete',
+    'file',
+    'file',
     'unknown',
     'meta',
     'malformed',
@@ -293,8 +321,11 @@ function materialize(draw: { events: EventChoice[]; outbox: OutboxChoice[] }): H
   // Per-stream: message ids created so far (settled), + the subset that are roots.
   const createdByStream: string[][] = streamIds.map(() => [])
   const rootsByStream: string[][] = streamIds.map(() => [])
+  // ENG-120: file ids uploaded so far per stream (a create may reference them).
+  const filesByStream: string[][] = streamIds.map(() => [])
   const settledCreatedIds: { streamId: string; messageId: string; eventId: string }[] = []
   let id = 0
+  let fileCounter = 0
 
   const push = (streamId: string, ev: EventRow): void => {
     byStream.get(streamId)!.push(ev)
@@ -304,6 +335,7 @@ function materialize(draw: { events: EventChoice[]; outbox: OutboxChoice[] }): H
     const streamId = streamIds[ec.stream]!
     const created = createdByStream[ec.stream]!
     const roots = rootsByStream[ec.stream]!
+    const files = filesByStream[ec.stream]!
     // Degrade a target-needing op to a plain create when the stream has no target.
     let kind = ec.kind
     if (
@@ -327,6 +359,27 @@ function materialize(draw: { events: EventChoice[]; outbox: OutboxChoice[] }): H
       push(streamId, malformedMessageEvent(streamId, seq))
       continue
     }
+    if (kind === 'file') {
+      // A fresh, globally-unique file id (each file is uploaded exactly once).
+      const fid = fileId(++fileCounter)
+      push(
+        streamId,
+        fileUploadedEvent({
+          streamId,
+          seq,
+          fileId: fid,
+          name: `f${fileCounter}.png`,
+          mimeType: ec.emoji % 2 === 0 ? 'image/png' : 'application/pdf',
+          sizeBytes: ec.target,
+        }),
+      )
+      files.push(fid)
+      continue
+    }
+    // A create/reply may REFERENCE a subset of the stream's already-uploaded files
+    // (0..N of them, picked deterministically) — the message→attachment linkage.
+    const attach = (): string[] =>
+      files.length === 0 ? [] : files.slice(0, ec.target % (files.length + 1))
     if (kind === 'create') {
       const messageId = `m_${++id}`
       push(
@@ -338,6 +391,7 @@ function materialize(draw: { events: EventChoice[]; outbox: OutboxChoice[] }): H
           text: ec.text,
           format: ec.format,
           mentions: ec.mentions,
+          fileIds: attach(),
         }),
       )
       created.push(messageId)
@@ -357,6 +411,7 @@ function materialize(draw: { events: EventChoice[]; outbox: OutboxChoice[] }): H
           text: ec.text,
           threadRootId: root,
           authorUserId: USERS[ec.reactor]!,
+          fileIds: attach(),
         }),
       )
       created.push(messageId)
@@ -549,6 +604,21 @@ async function rebuildMaybeSkewed(db: MsgDb): Promise<void> {
     db.putReactions = (rows: readonly ReactionRow[]): Promise<void> =>
       real(rows.filter((r) => r.present))
     restore.push(() => (db.putReactions = real))
+  } else if (MUTATION === 'inv6-file-skew') {
+    // ENG-120: rebuild corrupts one file row's `name` — a files-set divergence.
+    let corrupted = false
+    const real = db.putFiles.bind(db)
+    db.putFiles = (rows: readonly FileRow[]): Promise<void> =>
+      real(
+        rows.map((r) => {
+          if (!corrupted) {
+            corrupted = true
+            return { ...r, name: r.name + 'X' }
+          }
+          return r
+        }),
+      )
+    restore.push(() => (db.putFiles = real))
   }
   try {
     await rebuildProjections(db)
@@ -799,6 +869,65 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
     const skewed = await deliver(toothDb, true)
     expect(skewed).not.toBe(inOrder) // edit lost → original text → RED
     expect(skewed).toContain('original')
+    await toothDb.close()
+  })
+
+  // ------------------------------------------------------------------------
+  // Property 2f — DETERMINISTIC file.uploaded TEETH (ENG-120). Two file.uploaded
+  // for the SAME file_id (a duplicate delivery) at seq 1 and seq 3, with a
+  // message.created referencing it at seq 2. Because file.uploaded is an IMMUTABLE
+  // KEYED UPSERT, the two writes are byte-identical: a duplicate does not change
+  // the dump AND arrival-before/after the message.created (teeth (a) + (b)) lands
+  // the same final row, so windowed (newest-first) delivery converges to the
+  // in-order rebuild. Modelling an ORDER-DEPENDENT / non-idempotent handler (bake
+  // the event's seq into `name`) makes last-applied-wins → windowed (seq1 last) !=
+  // in-order (seq3 last) → RED. The clean pass is GREEN.
+  // ------------------------------------------------------------------------
+  it('TEETH: a non-idempotent/order-dependent file.uploaded handler → out-of-order gate RED', async () => {
+    const F = fileId(7)
+    // Same file_id uploaded twice (duplicate), with a referencing create between.
+    const events: EventRow[] = [
+      fileUploadedEvent({ streamId: 's_0', seq: 1, fileId: F, name: 'pic.png' }),
+      messageCreatedEvent({ streamId: 's_0', seq: 2, messageId: 'm_1', text: 'hi', fileIds: [F] }),
+      fileUploadedEvent({ streamId: 's_0', seq: 3, fileId: F, name: 'pic.png' }),
+    ]
+
+    // In-order truth: exactly ONE files row (the duplicate is an idempotent no-op).
+    const truth = new MemoryDb()
+    await truth.putEvents(events)
+    await applyEventsToProjection(truth, 's_0', events)
+    const inOrder = await dumpProjection(truth)
+    expect(await truth.count('files')).toBe(1)
+    await truth.close()
+
+    // Deliver NEWEST-FIRST: [fu@3] then [create@2, fu@1] — duplicate before create.
+    const deliver = async (db: MsgDb, defeatIdempotence: boolean): Promise<string> => {
+      const real = FILE_HANDLERS['file.uploaded@1']!
+      if (defeatIdempotence) {
+        // Order-dependent handler: stamp the event seq into the row so the two
+        // deliveries are NO LONGER byte-identical (last applied wins).
+        FILE_HANDLERS['file.uploaded@1'] = (event, body) => {
+          const row = applyFileUploadedV1(event, body)
+          return row ? { ...row, name: `${row.name}#${event.server_sequence}` } : null
+        }
+      }
+      for (const window of [[events[2]!], [events[1]!, events[0]!]]) {
+        await db.putEvents(window)
+        await applyEventsToProjection(db, 's_0', window)
+      }
+      FILE_HANDLERS['file.uploaded@1'] = real
+      return dumpProjection(db)
+    }
+
+    // Positive control: the real (idempotent) handler converges to the in-order truth.
+    const cleanDb = new MemoryDb()
+    expect(await deliver(cleanDb, false)).toBe(inOrder)
+    await cleanDb.close()
+
+    // TOOTH: order-dependent handler → seq1 wins under newest-first → diverges → RED.
+    const toothDb = new MemoryDb()
+    const skewed = await deliver(toothDb, true)
+    expect(skewed).not.toBe(inOrder)
     await toothDb.close()
   })
 

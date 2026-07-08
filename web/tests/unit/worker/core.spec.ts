@@ -334,6 +334,7 @@ describe('WorkerCore.init reconciles PROJECTION_VERSION', () => {
         text: '',
         format: 'plain',
         mention_user_ids: [],
+        file_ids: [],
       },
     ])
 
