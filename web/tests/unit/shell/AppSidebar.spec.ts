@@ -15,7 +15,12 @@ import { FakeWorker } from './fakeWorker'
 async function mountSidebar(): Promise<ReturnType<typeof mount>> {
   const store = useWorkspaceStore()
   await store.load()
-  const wrapper = mount(AppSidebar, { attachTo: document.body })
+  const wrapper = mount(AppSidebar, {
+    attachTo: document.body,
+    // ENG-136 PR-B: feed-first sidebar props (activeView drives active state; the
+    // ENG-104 flows asserted here are unchanged and testid-addressed).
+    props: { activeView: 'conversation', workspaceName: 'msg', canAdmin: false },
+  })
   await flushPromises()
   return wrapper
 }
