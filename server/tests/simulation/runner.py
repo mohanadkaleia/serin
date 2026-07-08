@@ -15,9 +15,11 @@ discipline, so committed rows never leak into other integration tests.
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
-from authutil import committing_app, truncate_auth_tables
+from authutil import auth_header, committing_app, truncate_auth_tables
 from eventsutil import message_body, message_edited_body, post_batch, reaction_body, wire_item
+from httpx import AsyncClient
 from msgd.db.models import Event, File, MessageProj, ReactionProj, ThreadParticipantProj
 from msgd.projections.dump import (
     dump_messages_proj,
@@ -58,6 +60,20 @@ from simulation.strategies import (
     Unreact,
     UploadFile,
 )
+
+#: A collision-free full-text token the sim posts ONLY into the private stream for the
+#: ENG-122 search-isolation probe. It is nothing like any strategy ``_TEXTS`` value, so no
+#: generated message ever contains it — the adversary's zero-hits is exact, and the owner's
+#: non-zero-hits proves the probe is non-vacuous (it would find the leak if one existed).
+_SEARCH_SENTINEL = "quixoticzephyrsentinel"
+
+
+async def _search_hit_count(http: AsyncClient, token: str, q: str) -> int:
+    """``GET /v1/search?q=`` as ``token``; return the number of hits (asserts a 200)."""
+    resp = await http.get("/v1/search", params={"q": q}, headers=auth_header(token))
+    assert resp.status_code == 200, resp.text
+    hits: list[Any] = resp.json()["hits"]
+    return len(hits)
 
 
 async def _apply_op(world: World, op: Op) -> None:
@@ -211,6 +227,14 @@ def _resolve_root_message(actor: SimClient, stream: str, msg_index: int) -> str 
 
 async def _settle(world: World) -> None:
     """Reconnect + flush every writer, catch up all readable streams, probe adversary."""
+    # ENG-122 search-isolation setup: the owner (a private member) enqueues a message
+    # carrying a collision-free sentinel token INTO the private stream, sent through the
+    # NORMAL outbox path so it flows into server truth, ``intended``, and every member's
+    # ``pulled`` exactly like any other message (keeping the convergence/idempotency
+    # invariants consistent). The adversary — a non-member — never pulls it. The end-of-
+    # settle search probe then asserts the adversary cannot surface it via GET /v1/search.
+    await world.owner.send(world.private_stream, text=_SEARCH_SENTINEL)
+
     for actor in world.actors:
         actor.connected = True
         await actor.flush()
@@ -342,6 +366,19 @@ async def _settle(world: World) -> None:
     world.adversary_file_attach_forbidden = (
         attach_into_private_blocked and borrow_private_binding_blocked
     )
+
+    # ENG-122 search isolation probe. The private-stream sentinel enqueued at the top of
+    # settle is now committed; two searches for that token run: the adversary (a non-member)
+    # MUST get ZERO hits — the shared readable-streams predicate filters the private message
+    # inside Postgres, so a full-text search is exactly as isolated as sync/pull — while the
+    # OWNER MUST get a hit, which makes the probe non-vacuous (a search that always returned
+    # empty, or a dropped predicate, would fail one side or the other). The token is authored
+    # by the owner; the adversary never legitimately learns it and cannot surface it.
+    adversary_hits = await _search_hit_count(
+        world.adversary.http, world.adversary.token, _SEARCH_SENTINEL
+    )
+    owner_hits = await _search_hit_count(world.owner.http, world.owner.token, _SEARCH_SENTINEL)
+    world.adversary_search_isolated = adversary_hits == 0 and owner_hits >= 1
 
 
 async def _snapshot_truth(world: World) -> Truth:

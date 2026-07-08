@@ -60,6 +60,12 @@ def get_file_limiters(request: Request) -> tuple[RateLimiter, RateLimiter]:
     return write, download
 
 
+def get_search_limiter(request: Request) -> RateLimiter:
+    """Return the per-user search :class:`RateLimiter` (app.state, ENG-122)."""
+    limiter: RateLimiter = request.app.state.search_limiter_minute
+    return limiter
+
+
 def get_blob_store(request: Request) -> BlobStore:
     """Return the process-wide content-addressed :class:`BlobStore` (app.state, ENG-116).
 
@@ -240,6 +246,19 @@ async def file_download_rate_limit(ctx: CurrentAuth, request: Request) -> None:
     """
     _write_limiter, download_limiter = get_file_limiters(request)
     result = download_limiter.check(f"user:{ctx.user_id}")
+    if not result.allowed:
+        raise problems.rate_limited(result.retry_after)
+
+
+async def search_rate_limit(ctx: CurrentAuth, request: Request) -> None:
+    """Search rate limit (ENG-122, §8): ``search_rate_limit_per_minute`` per user.
+
+    Mounted on ``GET /v1/search``. Modelled on :func:`event_rate_limit` /
+    :func:`file_rate_limit`: it depends on :data:`CurrentAuth` so the bucket is
+    keyed by the authenticated user and the limit runs before the FTS query. The
+    exceeded bucket raises 429 ``/problems/rate-limited`` with ``Retry-After``.
+    """
+    result = get_search_limiter(request).check(f"user:{ctx.user_id}")
     if not result.allowed:
         raise problems.rate_limited(result.retry_after)
 

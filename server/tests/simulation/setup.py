@@ -78,6 +78,13 @@ class World:
     #: binding from a stream it CAN write (unknown_file). Vacuously True when a probe
     #: input was unavailable (e.g. the adversary could not upload).
     adversary_file_attach_forbidden: bool = True
+    #: ENG-122 search isolation: True once the adversary's ``GET /v1/search`` for a token
+    #: known to be in the private stream it cannot read returned ZERO hits — the shared
+    #: readable-streams predicate filters the private message inside Postgres, so a search
+    #: is exactly as isolated as sync/pull. The probe token is SOURCED from the owner (a
+    #: private member); the adversary never legitimately learns it. Vacuously True when the
+    #: private stream held no message to probe.
+    adversary_search_isolated: bool = True
 
     @property
     def shared_streams(self) -> list[str]:
