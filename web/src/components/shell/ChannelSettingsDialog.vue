@@ -2,16 +2,20 @@
 // ChannelSettingsDialog — rename / archive a channel and add/remove members
 // (ENG-104). All actions author workspace-meta events worker-side (owner/admin
 // only server-side; a member's attempt is rejected and surfaced here). Members are
-// picked from the local `directory` projection (zero-network).
+// picked from the local `directory` projection (zero-network). Each row carries a
+// REAL presence dot (ENG-128, ephemeral worker snapshot — unknown ⇒ offline).
 import { computed, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 
+import { usePresenceStore } from '../../stores/presence'
 import { useWorkspaceStore, type SidebarStream } from '../../stores/workspace'
+import PresenceDot from '../ui/PresenceDot.vue'
 
 const props = defineProps<{ stream: SidebarStream }>()
 const emit = defineEmits<{ close: [] }>()
 
 const workspace = useWorkspaceStore()
+const presence = usePresenceStore()
 const { directory } = storeToRefs(workspace)
 
 const newName = ref(props.stream.name ?? '')
@@ -95,7 +99,10 @@ function removeMember(userId: string): void {
             :key="user.user_id"
             class="flex items-center justify-between rounded-md px-2 py-1 hover:bg-surface"
           >
-            <span class="truncate text-sm text-primary">{{ user.display_name }}</span>
+            <span class="flex min-w-0 items-center gap-2">
+              <PresenceDot :status="presence.statusOf(user.user_id)" size="sm" class="shrink-0" />
+              <span class="truncate text-sm text-primary">{{ user.display_name }}</span>
+            </span>
             <span class="flex gap-1">
               <button
                 type="button"

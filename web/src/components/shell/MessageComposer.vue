@@ -28,6 +28,7 @@ import StarterKit from '@tiptap/starter-kit'
 import Mention from '@tiptap/extension-mention'
 
 import { useComposerAttachments } from '../../composables/useComposerAttachments'
+import { resolveWorkerClient } from '../../composables/useWorkerClient'
 import { formatBytes } from '../../lib/bytes'
 import EmojiPicker from '../ui/EmojiPicker.vue'
 import ComposerToolbar from './ComposerToolbar.vue'
@@ -135,8 +136,25 @@ const editor = useEditor({
   },
   onUpdate: ({ editor }) => {
     empty.value = editor.isEmpty
+    signalTyping()
   },
 })
+
+/**
+ * Ephemeral "I'm typing" signal (ENG-128): fired on every content update while the
+ * composer targets a real stream and has content. The WORKER rate-limits outbound
+ * typing frames (~1 per 3s) and drops them when offline, so no client-side
+ * debounce is needed. Fire-and-forget — a failed signal must never break typing.
+ */
+function signalTyping(): void {
+  const streamId = props.streamId
+  if (streamId === undefined || empty.value) return
+  void resolveWorkerClient()
+    .then((client) => client.typing.send(streamId))
+    .catch(() => {
+      /* ephemeral — never surface */
+    })
+}
 
 // Send gate (ENG-121): text OR at least one attachment must be present, AND — when
 // there are attachments — every one must have finished uploading (blocks Send while

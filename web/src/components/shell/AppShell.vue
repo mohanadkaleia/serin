@@ -29,6 +29,7 @@ import NewDmDialog from './NewDmDialog.vue'
 import RightDrawer from './RightDrawer.vue'
 import SpaceRail from './SpaceRail.vue'
 import TopBar from './TopBar.vue'
+import TypingIndicator from './TypingIndicator.vue'
 import EmptyState from '../ui/EmptyState.vue'
 import { useShellController } from '../../composables/useShellController'
 import type { SidebarStream } from '../../stores/workspace'
@@ -41,6 +42,8 @@ const {
   canAdmin,
   workspaceName,
   workspaceInitials,
+  myUserId,
+  presenceStatuses,
   selectedStream,
   selectedStreamId,
   mentionItems,
@@ -135,6 +138,7 @@ const gridCols = computed(() => {
             <MessageList
               :messages="displayMessages"
               :names="names"
+              :presence="presenceStatuses"
               :unread-count="unreadCount"
               :has-more="hasMore"
               :stream-key="selectedStreamId"
@@ -148,6 +152,13 @@ const gridCols = computed(() => {
               @edit-cancel="onEditCancel"
               @delete="onDeleteMessage"
               @open-thread="onOpenThread"
+            />
+
+            <!-- Ephemeral "X is typing…" line (ENG-128), just above the composer. -->
+            <TypingIndicator
+              :stream-id="selectedStreamId"
+              :names="names"
+              :my-user-id="myUserId ?? undefined"
             />
 
             <MessageComposer

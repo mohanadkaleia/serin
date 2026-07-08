@@ -319,4 +319,46 @@ describe('MessageItem', () => {
     await options[3]!.trigger('click')
     expect(wrapper.emitted('react')?.[0]?.[2]).toBe(false)
   })
+
+  // -- ENG-128 presence dot on the author avatar -----------------------------
+
+  it('renders the author presence dot from a provided presence map', () => {
+    const wrapper = mount(MessageItem, {
+      props: {
+        message: makeMessage({ author_user_id: 'u_other' }),
+        presence: new Map([['u_other', 'online' as const]]),
+      },
+    })
+    const dot = wrapper.get('[data-testid="presence-dot"]')
+    expect(dot.attributes('data-status')).toBe('online')
+    expect(dot.classes()).toContain('bg-success')
+  })
+
+  it('defaults an author unknown to the presence map to offline', () => {
+    const wrapper = mount(MessageItem, {
+      props: {
+        message: makeMessage({ author_user_id: 'u_other' }),
+        presence: new Map([['u_someone_else', 'online' as const]]),
+      },
+    })
+    const dot = wrapper.get('[data-testid="presence-dot"]')
+    expect(dot.attributes('data-status')).toBe('offline')
+    expect(dot.classes()).toContain('bg-muted')
+  })
+
+  it('renders NO dot without a presence map (e.g. the thread pane)', () => {
+    const wrapper = mount(MessageItem, { props: { message: makeMessage() } })
+    expect(wrapper.find('[data-testid="presence-dot"]').exists()).toBe(false)
+  })
+
+  it('renders NO dot on a grouped follow-up row (no avatar to anchor to)', () => {
+    const wrapper = mount(MessageItem, {
+      props: {
+        message: makeMessage({ author_user_id: 'u_other' }),
+        showHeader: false,
+        presence: new Map([['u_other', 'online' as const]]),
+      },
+    })
+    expect(wrapper.find('[data-testid="presence-dot"]').exists()).toBe(false)
+  })
 })

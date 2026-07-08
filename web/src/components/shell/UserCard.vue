@@ -12,6 +12,7 @@ import { computed } from 'vue'
 
 import type { PresenceStatus } from '../../worker'
 import Icon from '../ui/Icon.vue'
+import PresenceDot from '../ui/PresenceDot.vue'
 
 const props = withDefaults(defineProps<{ name: string; status?: PresenceStatus }>(), {
   status: 'online',
@@ -20,6 +21,8 @@ const props = withDefaults(defineProps<{ name: string; status?: PresenceStatus }
 const initial = computed(() => (props.name.trim()[0] ?? '?').toUpperCase())
 const online = computed(() => props.status === 'online')
 const statusLabel = computed(() => (online.value ? 'Online' : 'Offline'))
+/** Narrowed for the dot (exactOptionalPropertyTypes: the default is 'online'). */
+const dotStatus = computed<PresenceStatus>(() => props.status ?? 'online')
 </script>
 
 <template>
@@ -34,11 +37,9 @@ const statusLabel = computed(() => (online.value ? 'Online' : 'Offline'))
         class="grid h-7 w-7 place-items-center rounded-full bg-accent-subtle text-[12px] font-semibold text-accent"
         >{{ initial }}</span
       >
-      <span
-        aria-hidden="true"
-        class="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-surface"
-        :class="online ? 'bg-success' : 'bg-muted'"
-        :data-status="status"
+      <PresenceDot
+        :status="dotStatus"
+        class="absolute -bottom-0.5 -right-0.5 border-2 border-surface"
       />
     </span>
     <span class="min-w-0 flex-1">
