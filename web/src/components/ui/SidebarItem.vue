@@ -12,7 +12,7 @@ const props = withDefaults(
     unread?: boolean
     href?: string
   }>(),
-  { active: false, unread: false, href: undefined },
+  { active: false, unread: false, href: '' },
 )
 
 const tag = computed(() => (props.href ? 'a' : 'button'))
@@ -32,7 +32,7 @@ const weightClass = computed(() => (props.unread && !props.active ? 'font-medium
 </script>
 
 <template>
-  <component :is="tag" :href="href" :class="[base, stateClasses, weightClass]">
+  <component :is="tag" :href="href || undefined" :class="[base, stateClasses, weightClass]">
     <!-- Left accent marker for the active row (calm, not a full bar). -->
     <span
       v-if="active"

@@ -8,7 +8,7 @@ type Tone = 'online' | 'success' | 'syncing' | 'sync-pending' | 'offline' | 'dan
 
 const props = withDefaults(defineProps<{ tone?: Tone; label?: string }>(), {
   tone: 'muted',
-  label: undefined,
+  label: '',
 })
 
 const dotColor: Record<Tone, string> = {
