@@ -270,6 +270,7 @@ describe('AuthManager session lifecycle', () => {
         text: '',
         format: 'plain',
         mention_user_ids: [],
+        file_ids: [],
       },
     ])
 

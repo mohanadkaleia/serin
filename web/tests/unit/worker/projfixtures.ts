@@ -13,6 +13,7 @@ export interface MessageCreatedOpts {
   threadRootId?: string
   authorUserId?: string
   mentions?: string[]
+  fileIds?: string[]
   typeVersion?: number
 }
 
@@ -24,7 +25,7 @@ export function messageCreatedEvent(opts: MessageCreatedOpts): EventRow {
     text: opts.text ?? 'hello',
     format: opts.format ?? 'markdown',
     thread_root_id: opts.threadRootId ?? null,
-    file_ids: [],
+    file_ids: opts.fileIds ?? [],
     mentions: opts.mentions ?? [],
   }
   return {
@@ -201,4 +202,64 @@ export function messageEditedEvent(
 /** A `message.deleted` v1 tombstone event for `messageId`. */
 export function messageDeletedEvent(opts: RefEventOpts): EventRow {
   return refEvent('message.deleted', { message_id: opts.messageId }, opts)
+}
+
+// ---------------------------------------------------------------------------
+// ENG-120 file.uploaded builders. A `file.uploaded` v1 payload carries NO
+// stream_id (it comes from the envelope); the five fields mirror FileUploadedV1.
+// ---------------------------------------------------------------------------
+
+/**
+ * A deterministic, format-valid `f_` id from a short numeric tag (26-char ULID:
+ * Crockford base32, first char ≤ '7'). e.g. `fileId(1)` → `f_00…01`.
+ */
+export function fileId(tag: number): string {
+  // Hex digits (0-9A-F) are all valid Crockford base32 chars, so the id is a
+  // format-valid ULID for any tag; pad to the 26-char ULID width.
+  const suffix = tag.toString(16).toUpperCase()
+  return `f_${'0'.repeat(26 - suffix.length)}${suffix}`
+}
+
+export interface FileUploadedOpts {
+  streamId: string
+  seq: number
+  fileId: string
+  sha256?: string
+  name?: string
+  mimeType?: string
+  sizeBytes?: number
+  authorUserId?: string
+  typeVersion?: number
+}
+
+/** A well-formed `file.uploaded` event (v1 by default). */
+export function fileUploadedEvent(opts: FileUploadedOpts): EventRow {
+  const eventId = `e_${opts.streamId}_${opts.seq}`
+  const type = 'file.uploaded'
+  return {
+    stream_id: opts.streamId,
+    server_sequence: opts.seq,
+    event_id: eventId,
+    type,
+    envelope: {
+      body: {
+        event_id: eventId,
+        workspace_id: 'w_test',
+        stream_id: opts.streamId,
+        type,
+        type_version: opts.typeVersion ?? 1,
+        author_user_id: opts.authorUserId ?? 'u_author',
+        author_device_id: 'd_test',
+        client_created_at: '2026-01-01T00:00:00.000Z',
+        payload: {
+          file_id: opts.fileId,
+          sha256: opts.sha256 ?? 'a'.repeat(64),
+          name: opts.name ?? 'photo.png',
+          mime_type: opts.mimeType ?? 'image/png',
+          size_bytes: opts.sizeBytes ?? 1234,
+        },
+      },
+      event_hash: `hash_${eventId}`,
+    },
+  }
 }

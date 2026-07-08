@@ -11,6 +11,7 @@ import type {
   BackfillResult,
   DirectoryChannel,
   DirectoryUser,
+  FileRow,
   MessageRow,
   MutateParams,
   MutateResult,
@@ -56,6 +57,8 @@ export class FakeWorker {
   private messages = new Map<string, MessageRow[]>()
   /** Present reactions: `message_id → emoji → set of reactor user_ids`. */
   private reactions = new Map<string, Map<string, Set<string>>>()
+  /** ENG-120 projected files: `file_id → FileRow` (the `attachments.forMessage` source). */
+  private files = new Map<string, FileRow>()
   private subs = new Map<string, Set<(p: unknown) => void>>()
   private syncStatus: SyncStatus = { state: 'live', online: true }
   private myUserId = 'u_me'
@@ -92,6 +95,7 @@ export class FakeWorker {
       text: opts.text ?? 'hello',
       format: opts.format ?? 'plain',
       mention_user_ids: opts.mention_user_ids ?? [],
+      file_ids: opts.file_ids ?? [],
       created_seq: opts.created_seq,
       ...(opts.thread_root_id ? { thread_root_id: opts.thread_root_id } : {}),
       ...(opts.reply_count !== undefined ? { reply_count: opts.reply_count } : {}),
@@ -157,6 +161,19 @@ export class FakeWorker {
     return this
   }
 
+  /** Seed a projected file (ENG-120) the `attachments.forMessage` query resolves. */
+  addFile(file: Partial<FileRow> & { file_id: string }): this {
+    this.files.set(file.file_id, {
+      stream_id: 's_x',
+      sha256: 'a'.repeat(64),
+      name: 'file.bin',
+      mime_type: 'application/octet-stream',
+      size_bytes: 0,
+      ...file,
+    })
+    return this
+  }
+
   /** Seed a present reaction membership (message_id, reactor, emoji). */
   addReaction(messageId: string, userId: string, emoji: string): this {
     const byEmoji = this.reactions.get(messageId) ?? new Map<string, Set<string>>()
@@ -188,6 +205,7 @@ export class FakeWorker {
       text: r.text ?? 'old',
       format: r.format ?? 'plain',
       mention_user_ids: r.mention_user_ids ?? [],
+      file_ids: r.file_ids ?? [],
       created_seq: r.created_seq,
     }))
   }
@@ -299,6 +317,22 @@ export class FakeWorker {
       }))
       return Promise.resolve({ threads } as QueryResult<Q>)
     }
+    if (params.q === 'attachments.forMessage') {
+      const msg = this.findMessage(params.message_id)
+      const fileIds = msg?.file_ids ?? []
+      const files: FileRow[] = []
+      const pending_file_ids: string[] = []
+      for (const id of fileIds) {
+        const row = this.files.get(id)
+        if (row !== undefined) files.push(row)
+        else pending_file_ids.push(id)
+      }
+      return Promise.resolve({
+        message_id: params.message_id,
+        files,
+        pending_file_ids,
+      } as QueryResult<Q>)
+    }
     // messages.list — newest-first, paginated by created_seq, `limit+1` has_more.
     const list = this.messages.get(params.stream_id) ?? []
     const limit = params.limit ?? 50
@@ -327,6 +361,7 @@ export class FakeWorker {
         text: params.text,
         created_seq: createdSeq,
         mention_user_ids: params.mentions ?? [],
+        ...(params.file_ids ? { file_ids: params.file_ids } : {}),
         ...(params.thread_root_id ? { thread_root_id: params.thread_root_id } : {}),
         state: 'pending',
       })

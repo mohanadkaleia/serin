@@ -45,6 +45,7 @@ describe.each([
       format: 'plain',
       thread_root_id: 'm_root',
       mention_user_ids: ['u_x', 'u_y'],
+      file_ids: [], // ENG-120: absent in the fixture body → default []
     })
     await db.close()
   })

@@ -14,6 +14,7 @@ function msg(i: number, ts: number): DisplayMessage {
     text: `m${i}`,
     format: 'plain',
     mention_user_ids: [],
+    file_ids: [],
     ts,
     mine: false,
   }

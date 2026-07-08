@@ -14,6 +14,7 @@ import { Outbox } from './outbox'
 import {
   applyEventsToProjection,
   getMessage,
+  listAttachments,
   listDirectory,
   listMessages,
   listReactions,
@@ -393,6 +394,8 @@ export class WorkerCore {
         })
       case 'messages.threads':
         return listThreadSummaries(this.db, params.root_message_ids)
+      case 'attachments.forMessage':
+        return listAttachments(this.db, params.message_id)
       default:
         // Exhaustive: a new QueryParams member without a case is a COMPILE error
         // here (params narrows to `never`). At runtime an out-of-contract `q`

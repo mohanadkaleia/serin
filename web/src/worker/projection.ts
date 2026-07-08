@@ -19,12 +19,16 @@
 // rebuild skip identically), so equivalence still holds. Do NOT "fix" the skip to
 // a throw.
 
+import { IdKind, isValidTypedId } from '../core/ids'
+
 import { computeStreamBadge } from './badges'
 import type {
+  AttachmentsResult,
   DirectoryListResult,
   DirectoryUser,
   EventBody,
   EventRow,
+  FileRow,
   MessageReactions,
   MessageRow,
   MessagesListResult,
@@ -72,6 +76,20 @@ export const HANDLERS: Record<string, MessageHandler> = {
   'message.created@1': applyMessageCreatedV1,
 }
 
+/** Builds a `FileRow` from a `file.uploaded` event + body, or `null` to skip (D9). */
+export type FileHandler = (event: EventRow, body: EventBody) => FileRow | null
+
+/**
+ * Projection dispatch for the ENG-120 `files` set, keyed `` `${type}@${version}` ``.
+ * SEPARATE from {@link HANDLERS} (which builds `MessageRow`s) purely for type
+ * safety — a `file.uploaded` builder returns a `FileRow`, a different shape. Like
+ * `HANDLERS` it is exported + mutable so a rebuild-pass-only teeth patch can swap
+ * a handler (the ENG-61 discipline). Only `file.uploaded` v1 projects a row.
+ */
+export const FILE_HANDLERS: Record<string, FileHandler> = {
+  'file.uploaded@1': applyFileUploadedV1,
+}
+
 /**
  * Materialize a `message.created` v1 event into a `MessageRow`, or skip (`null`)
  * on a malformed-known payload. Every field is a deterministic pure function of
@@ -105,12 +123,71 @@ export function applyMessageCreatedV1(event: EventRow, body: EventBody): Message
     mention_user_ids: Array.isArray(p.mentions)
       ? p.mentions.filter((m): m is string => typeof m === 'string')
       : [],
+    // ENG-120: the attachment linkage, projected VERBATIM from the body (default
+    // `[]` when absent/invalid). A pure per-event field — no cross-event state —
+    // so it is trivially order-independent. CLIENT-ONLY: deliberately kept OUT of
+    // `dumpMessages` (the ENG-83 cross-language surface); see `serializeRow`.
+    file_ids: Array.isArray(p.file_ids)
+      ? p.file_ids.filter((f): f is string => typeof f === 'string')
+      : [],
   }
   // `thread_root_id` is optional: present values are indexed, root messages omit it.
   if (typeof p.thread_root_id === 'string') {
     row.thread_root_id = p.thread_root_id
   }
   return row
+}
+
+/**
+ * Materialize a `file.uploaded` v1 event into a {@link FileRow}, or skip (`null`)
+ * on a malformed-known payload (D9: log + skip, NEVER throw). The five business
+ * fields come from the payload body; `stream_id` from the event ENVELOPE (the
+ * payload carries no stream_id).
+ *
+ * ORDER-INDEPENDENCE COMES FOR FREE (unlike the ENG-100 reactions/threads/edits
+ * handlers, which need seq-aware LWW / recompute-from-state to converge). A file
+ * is uploaded EXACTLY ONCE and its `file.uploaded` event is IMMUTABLE, so this is
+ * a pure keyed row builder: every field is a deterministic function of the single
+ * event, a re-derived row is byte-identical to the stored one (idempotent upsert =
+ * no-op), and delivery order does not matter — arriving before or after its
+ * referencing `message.created` changes nothing (the row is keyed by `file_id`;
+ * the attachments query reads whatever is present). Hence NO recompute is needed
+ * and client rebuild ≡ incremental holds trivially.
+ */
+export function applyFileUploadedV1(event: EventRow, body: EventBody): FileRow | null {
+  const payload = body.payload
+  const at = `${event.stream_id}#${event.server_sequence}`
+  if (payload === null || typeof payload !== 'object') {
+    console.warn(`projection: file.uploaded v1 with a non-object payload at ${at} — skipping`)
+    return null
+  }
+  const p = payload as Record<string, unknown>
+  const fileId = p.file_id
+  if (typeof fileId !== 'string' || !isValidTypedId(fileId, IdKind.FILE)) {
+    console.warn(`projection: file.uploaded v1 with missing/invalid file_id at ${at} — skipping`)
+    return null
+  }
+  // The remaining required fields must be well-typed (the server already
+  // format-validated them; this is the D9 defensive skip, not a re-validation).
+  if (
+    typeof p.sha256 !== 'string' ||
+    typeof p.name !== 'string' ||
+    typeof p.mime_type !== 'string' ||
+    typeof p.size_bytes !== 'number'
+  ) {
+    console.warn(
+      `projection: file.uploaded v1 (${fileId}) missing required fields at ${at} — skipping`,
+    )
+    return null
+  }
+  return {
+    file_id: fileId,
+    sha256: p.sha256,
+    name: p.name,
+    mime_type: p.mime_type,
+    size_bytes: p.size_bytes,
+    stream_id: event.stream_id, // from the ENVELOPE, not the payload
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +475,22 @@ async function applyMessageCreated(db: MsgDb, event: EventRow, body: EventBody):
 }
 
 /**
+ * `file.uploaded` v1 apply (ENG-120) — via the monkeypatchable {@link FILE_HANDLERS}
+ * registry, so the teeth pattern bites. Builds the row (or skips on malformed) and
+ * UPSERTS it by `file_id`. This is an IDEMPOTENT KEYED UPSERT: a duplicate delivery
+ * writes the byte-identical row (no-op on the dump), and because the row is keyed by
+ * `file_id` — independent of any `message.created` — it lands the same whether it
+ * arrives before OR after (even across a backfill boundary) the message that
+ * references it. No recompute / LWW is needed (contrast the M3 handlers).
+ */
+async function applyFileUploaded(db: MsgDb, event: EventRow, body: EventBody): Promise<void> {
+  const handler = FILE_HANDLERS['file.uploaded@1']
+  const row = handler ? handler(event, body) : null
+  if (row === null) return // malformed-known → skip (warned inside the builder)
+  await db.putFiles([row])
+}
+
+/**
  * Incrementally apply a per-stream batch of events into the derived projection
  * (`messages` + ENG-100's `reactions` / `thread_participants`) — the seam ENG-79
  * calls after it has written the events into `events` and advanced `cursors`.
@@ -438,6 +531,9 @@ export async function applyEventsToProjection(
       case 'message.deleted@1':
         await applyMessageDeleted(db, body)
         break
+      case 'file.uploaded@1':
+        await applyFileUploaded(db, event, body)
+        break
       default:
         break // D9: unknown type / v>=2 / meta → skip
     }
@@ -466,6 +562,15 @@ function serializeRow(row: MessageRow): string {
   // Explicit ordered projection — NEVER JSON.stringify(row) (field order is not
   // guaranteed). JSON.stringify preserves string-key insertion order and emits
   // compact output (= ENG-58's separators=(",",":")) and raw non-ASCII (= ensure_ascii=False).
+  //
+  // ENG-120: `MessageRow.file_ids` is INTENTIONALLY OMITTED here. This dump is the
+  // ENG-83 cross-language byte-equality surface (client-incremental == client-
+  // rebuild, asserted byte-for-byte against the FROZEN server dump). The SERVER has
+  // no message→attachment projection (ENG-117: `messages_proj` is search-only, no
+  // `file_ids`), so its dump has no such field; adding `file_ids` here would break
+  // parity. `file_ids` is a client-only display field (a pure per-event row-builder
+  // field, trivially order-independent) and the `files` set has its own rebuild≡
+  // incremental gate via {@link dumpFiles} — so leaving this dump unchanged is safe.
   const ordered = {
     message_id: row.message_id,
     stream_id: row.stream_id,
@@ -499,6 +604,39 @@ export async function dumpMessages(db: MsgDb): Promise<string> {
   return rows.map(serializeRow).join('\n')
 }
 
+/** Serialize one {@link FileRow} as a compact JSON object with a canonical key order. */
+function serializeFileRow(row: FileRow): string {
+  // Same discipline as `serializeRow`: explicit key order (never JSON.stringify(row)),
+  // compact + raw-non-ASCII. `name` is opaque user content — serialized verbatim.
+  const ordered = {
+    file_id: row.file_id,
+    stream_id: row.stream_id,
+    sha256: row.sha256,
+    name: row.name,
+    mime_type: row.mime_type,
+    size_bytes: row.size_bytes,
+  }
+  return JSON.stringify(ordered)
+}
+
+/**
+ * The canonical `files` serialization (ENG-120) — the NEW rebuild ≡ incremental
+ * surface for the client `file.uploaded` projection. All rows sorted by `file_id`
+ * (a total order — `file_id` is the PK), each a compact JSON object with fixed key
+ * order, `\n`-joined. The windowed invariant-6 gate asserts
+ * `dumpFiles(rebuilt) === dumpFiles(incremental)` on this. Because `file.uploaded`
+ * is an immutable keyed upsert, this holds trivially under any delivery order.
+ *
+ * NOTE: this is a CLIENT-INTERNAL rebuild surface, NOT a cross-language one — the
+ * server has no client-shaped `files` projection to compare against (contrast
+ * `dumpMessages`, whose byte form is frozen against the server dump).
+ */
+export async function dumpFiles(db: MsgDb): Promise<string> {
+  const rows = await db.getAllFiles()
+  rows.sort((a, b) => (a.file_id < b.file_id ? -1 : a.file_id > b.file_id ? 1 : 0))
+  return rows.map(serializeFileRow).join('\n')
+}
+
 // ---------------------------------------------------------------------------
 // Projection query helpers (Ruling 5) — the read surface the `query` RPC serves.
 // ---------------------------------------------------------------------------
@@ -526,6 +664,33 @@ export async function listMessages(
 /** A single projected message by id, or `null` on a miss (`message.get`). */
 export async function getMessage(db: MsgDb, messageId: string): Promise<MessageRow | null> {
   return (await db.getMessage(messageId)) ?? null
+}
+
+/**
+ * Resolve a message's ATTACHMENTS (ENG-120, `attachments.forMessage`) — the
+ * `FileRow`s for the message's `file_ids`, read from the local `files` projection.
+ * A pure LOCAL projection READ (zero network) — the client only holds data it is
+ * authorized for. Returns the resolved `files` in the SAME ORDER as the message's
+ * `file_ids` (stable UI), plus `pending_file_ids` for ids that have not yet
+ * projected (their `file.uploaded` has not been delivered/backfilled) — so the UI
+ * can show a pending placeholder. An unknown message or an empty `file_ids` yields
+ * both arrays empty. ENG-121 pairs each returned FileRow with a download/thumbnail
+ * handle via `client.files.download/thumbnail`.
+ */
+export async function listAttachments(db: MsgDb, messageId: string): Promise<AttachmentsResult> {
+  const message = await db.getMessage(messageId)
+  const fileIds = message?.file_ids ?? []
+  if (fileIds.length === 0) return { message_id: messageId, files: [], pending_file_ids: [] }
+  const rows = await db.getFilesByIds(fileIds)
+  const byId = new Map(rows.map((r) => [r.file_id, r]))
+  const files: FileRow[] = []
+  const pending_file_ids: string[] = []
+  for (const id of fileIds) {
+    const row = byId.get(id)
+    if (row !== undefined) files.push(row)
+    else pending_file_ids.push(id)
+  }
+  return { message_id: messageId, files, pending_file_ids }
 }
 
 /** Kinds excluded from the `#channel` autocomplete (DMs + infra). */
