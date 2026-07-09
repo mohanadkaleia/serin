@@ -12,6 +12,7 @@ import { createRouter, createMemoryHistory, type Router } from 'vue-router'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { useShellController } from '../../../src/composables/useShellController'
+import { useTheme } from '../../../src/composables/useTheme'
 import { setWorkerClient } from '../../../src/composables/useWorkerClient'
 import { useAuthStore } from '../../../src/stores/auth'
 import { useThreadStore } from '../../../src/stores/thread'
@@ -104,6 +105,88 @@ describe('useShellController (ENG-136 PR-B)', () => {
     expect(ctrl.paletteOpen.value).toBe(false)
     window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true }))
     expect(ctrl.paletteOpen.value).toBe(true)
+  })
+
+  // -- ENG-136 palette commands ----------------------------------------------
+
+  it('exposes the command registry and runs "create-channel" against the dialog flag', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const { ctrl } = await mountController(router)
+
+    const ids = (ctrl.paletteCommands.value as Array<{ id: string }>).map((c) => c.id)
+    expect(ids).toContain('create-channel')
+    expect(ids).toContain('start-dm')
+    expect(ids).toContain('browse-channels')
+    expect(ids).toContain('search-messages')
+    expect(ids).toContain('sign-out')
+
+    ctrl.paletteOpen.value = true
+    expect(ctrl.createChannelOpen.value).toBe(false)
+    ctrl.onPaletteCommand('create-channel')
+    // The seam fires AND the palette closes.
+    expect(ctrl.createChannelOpen.value).toBe(true)
+    expect(ctrl.paletteOpen.value).toBe(false)
+    expect(fake.fetch).not.toHaveBeenCalled()
+  })
+
+  it('"start-dm" / "browse-channels" / "search-messages" open their existing surfaces', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const { ctrl } = await mountController(router)
+
+    ctrl.onPaletteCommand('start-dm')
+    expect(ctrl.newDmOpen.value).toBe(true)
+    ctrl.onPaletteCommand('browse-channels')
+    expect(ctrl.channelBrowserOpen.value).toBe(true)
+    ctrl.onPaletteCommand('search-messages')
+    expect(ctrl.searchOpen.value).toBe(true)
+  })
+
+  it('"go-inbox" flips the main panel; "toggle-theme" cycles the preference', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const { ctrl } = await mountController(router)
+
+    ctrl.onPaletteCommand('go-inbox')
+    expect(ctrl.activeView.value).toBe('inbox')
+
+    const { theme, setTheme } = useTheme()
+    setTheme('light')
+    ctrl.onPaletteCommand('toggle-theme')
+    expect(theme.value).toBe('dark') // light → dark (useTheme's cycle order)
+    setTheme('system') // restore the default for other suites
+  })
+
+  it('"channel-notifications" is context-gated and opens the Details drawer', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const { ctrl } = await mountController(router)
+
+    const commandIds = (): string[] =>
+      (ctrl.paletteCommands.value as Array<{ id: string }>).map((c) => c.id)
+
+    // Available while a channel conversation is active…
+    expect(commandIds()).toContain('channel-notifications')
+    ctrl.onPaletteCommand('channel-notifications')
+    expect(ctrl.drawerMode.value).toBe('details')
+    ctrl.closeDetails()
+
+    // …hidden (and inert) away from a channel conversation.
+    ctrl.setActiveView('inbox')
+    expect(commandIds()).not.toContain('channel-notifications')
+    ctrl.onPaletteCommand('channel-notifications')
+    expect(ctrl.drawerMode.value).toBe('none')
+  })
+
+  it('"sign-out" runs the existing logout flow (redirect to /login)', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const { ctrl } = await mountController(router)
+
+    ctrl.onPaletteCommand('sign-out')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/login')
   })
 
   it('opens a thread and closes it when the stream changes', async () => {

@@ -126,6 +126,36 @@ describe('AppShell (ENG-136 PR-C)', () => {
     expect(wrapper.find('[data-testid="command-palette"]').exists()).toBe(true)
   })
 
+  it('palette "Create channel" command opens the EXISTING create-channel dialog (ENG-136)', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = mount(AppShell, {
+      attachTo: document.body,
+      global: {
+        plugins: [router],
+        stubs: {
+          MessageList: stubs.MessageList,
+          MessageComposer: stubs.MessageComposer,
+          ThreadPane: stubs.ThreadPane,
+        },
+      },
+    })
+    await flushPromises()
+
+    window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', metaKey: true }))
+    await wrapper.vm.$nextTick()
+    expect(wrapper.find('[data-testid="command-palette"]').exists()).toBe(true)
+    // The Commands group lists the action with its per-id testid.
+    expect(wrapper.find('[data-testid="create-channel"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="palette-command-create-channel"]').trigger('click')
+    await flushPromises()
+
+    // Palette closed; the SAME dialog the sidebar's `open-create-channel` opens.
+    expect(wrapper.find('[data-testid="command-palette"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="create-channel"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="create-channel-name"]').exists()).toBe(true)
+  })
+
   it('search jump closes the overlay and selects the hit stream (ENG-127)', async () => {
     fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
     fake.addStream({ stream_id: 's_b', name: 'beta', kind: 'channel' })

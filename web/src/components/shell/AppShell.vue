@@ -19,9 +19,11 @@
 import { computed, nextTick, ref } from 'vue'
 
 import AppSidebar from './AppSidebar.vue'
+import ChannelBrowser from './ChannelBrowser.vue'
 import ChannelHeader from './ChannelHeader.vue'
 import ChannelSettingsDialog from './ChannelSettingsDialog.vue'
 import CommandPalette from './CommandPalette.vue'
+import CreateChannelDialog from './CreateChannelDialog.vue'
 import InboxView from './InboxView.vue'
 import MessageComposer from './MessageComposer.vue'
 import MessageList from './MessageList.vue'
@@ -40,6 +42,10 @@ const {
   messages,
   activeView,
   paletteOpen,
+  createChannelOpen,
+  channelBrowserOpen,
+  newDmOpen,
+  searchOpen,
   editingMessageId,
   canAdmin,
   workspaceName,
@@ -60,12 +66,14 @@ const {
   scaffold,
   composerPlaceholder,
   quickItems,
+  paletteCommands,
   setActiveView,
   toggleDetails,
   closeDetails,
   onChannelLeft,
   openPalette,
   onPaletteSelect,
+  onPaletteCommand,
   onOpenStream,
   onSend,
   onEditLast,
@@ -78,15 +86,10 @@ const {
   onLogout,
 } = useShellController()
 
-/** TopBar compose → open a New DM (REAL: compose maps to "new direct message"). */
-const showCompose = ref(false)
-
-/**
- * TopBar search → the ENG-127 message-search overlay (server FTS through the
- * worker's `search` RPC). DISTINCT from the Cmd+K CommandPalette quick-switcher,
- * which stays keyboard-bound as-is.
- */
-const searchOpen = ref(false)
+// TopBar compose → the New DM dialog; TopBar search → the ENG-127 message-search
+// overlay. Both flags now live in the CONTROLLER (`newDmOpen` / `searchOpen`),
+// because the Cmd+K palette's "Start a direct message" / "Search messages"
+// commands open the SAME single-instance surfaces (ENG-136).
 
 /** The live MessageList, for the search jump's best-effort scroll-to-message. */
 const messageListRef = ref<InstanceType<typeof MessageList> | null>(null)
@@ -152,7 +155,7 @@ const gridCols = computed(() => {
 
     <!-- Right: a top-bar row spanning the main + drawer region, then the columns. -->
     <div class="flex min-w-0 flex-1 flex-col">
-      <TopBar @search="searchOpen = true" @compose="showCompose = true" />
+      <TopBar @search="searchOpen = true" @compose="newDmOpen = true" />
 
       <div class="grid min-h-0 flex-1" :class="gridCols">
         <!-- Main column. The Inbox brings its own header + tabs, so the shared
@@ -230,7 +233,9 @@ const gridCols = computed(() => {
     <CommandPalette
       :open="paletteOpen"
       :items="quickItems"
+      :commands="paletteCommands"
       @select="onPaletteSelect"
+      @run="onPaletteCommand"
       @close="paletteOpen = false"
     />
 
@@ -238,8 +243,14 @@ const gridCols = computed(() => {
          from the top-bar search field. Jump closes it + selects the hit's stream. -->
     <SearchOverlay :open="searchOpen" @close="searchOpen = false" @jump="onSearchJump" />
 
-    <!-- REAL compose target: a New DM dialog opened from the TopBar compose button. -->
-    <NewDmDialog v-if="showCompose" @close="showCompose = false" />
+    <!-- REAL compose target: a New DM dialog, opened from the TopBar compose
+         button OR the palette's "Start a direct message" command. -->
+    <NewDmDialog v-if="newDmOpen" @close="newDmOpen = false" />
+
+    <!-- Palette command targets (ENG-136): the EXISTING create-channel dialog +
+         channel browser, shell-mounted so Cmd+K actions work from any view. -->
+    <CreateChannelDialog v-if="createChannelOpen" @close="createChannelOpen = false" />
+    <ChannelBrowser v-if="channelBrowserOpen" @close="channelBrowserOpen = false" />
 
     <!-- The Details drawer's Members row reuses the existing settings dialog. -->
     <ChannelSettingsDialog v-if="settingsFor" :stream="settingsFor" @close="settingsFor = null" />
