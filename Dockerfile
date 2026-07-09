@@ -23,19 +23,30 @@ ENV UV_COMPILE_BYTECODE=1 \
 
 WORKDIR /app
 
-# Copy the full workspace needed to build both members as wheels. `--no-editable`
-# (below) builds real wheels, so the source of both members must be present.
+# Copy the workspace source needed to resolve + build. `github-notifier`
+# (plugins/) is an OUT-OF-PROCESS external plugin (D12): it must NOT ship inside
+# the runtime image, but it IS a workspace member (so the repo-root ruff/mypy/
+# pytest gates cover it), and `[tool.uv.sources]` maps it to the workspace — so
+# uv must still SEE its directory at resolve time or the locked sync aborts with
+# "references a workspace ... but is not a workspace member". Its source is
+# copied into the builder ONLY (never into the runtime stage below) and is
+# excluded from the venv install just below, so nothing plugin-related crosses
+# the stage boundary. `--no-editable` builds real wheels, so msgd + msgctl source
+# must be present.
 COPY pyproject.toml uv.lock .python-version ./
 COPY server/ server/
 COPY cli/ cli/
+COPY plugins/ plugins/
 
 # --no-dev  drops the pytest/mypy/testcontainers group (never ships).
 # --no-editable installs msgd + msgctl as built wheels (not .pth shims), so the
 #   runtime venv is self-contained and independent of the source tree; the
-#   msgctl console script lands at /app/.venv/bin/msgctl. Both workspace members
-#   install because the root workspace resolves both.
+#   msgctl console script lands at /app/.venv/bin/msgctl.
+# --no-install-package github-notifier  resolves the plugin as a workspace member
+#   (keeping --locked honest) but keeps its wheel OUT of /app/.venv, so the
+#   runtime image stays plugin-free (D12 — the notifier runs as its own process).
 # --locked  fails if uv.lock is stale (reproducible builds).
-RUN uv sync --locked --no-dev --no-editable
+RUN uv sync --locked --no-dev --no-editable --no-install-package github-notifier
 
 # ── web build ────────────────────────────────────────────────────────────────
 # Builds the Vue SPA (web/) to web/dist so the runtime image can serve it

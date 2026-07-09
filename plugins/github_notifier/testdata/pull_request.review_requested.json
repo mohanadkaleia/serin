@@ -1,0 +1,40 @@
+{
+  "action": "review_requested",
+  "number": 43,
+  "pull_request": {
+    "number": 43,
+    "title": "Extract the blob store behind an interface",
+    "html_url": "https://github.com/example-org/example-repo/pull/43",
+    "state": "open",
+    "draft": false,
+    "merged": false,
+    "user": {
+      "login": "alice",
+      "type": "User"
+    },
+    "head": {
+      "ref": "refactor/blob-store-interface",
+      "sha": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "cafebabecafebabecafebabecafebabecafebabe"
+    },
+    "created_at": "2026-07-02T08:45:00Z",
+    "merged_at": null,
+    "merged_by": null
+  },
+  "requested_reviewer": {
+    "login": "carol",
+    "type": "User"
+  },
+  "repository": {
+    "full_name": "example-org/example-repo",
+    "html_url": "https://github.com/example-org/example-repo",
+    "private": false
+  },
+  "sender": {
+    "login": "alice",
+    "type": "User"
+  }
+}
