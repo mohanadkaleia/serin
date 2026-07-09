@@ -25,6 +25,8 @@ import {
   type FileUploadParams,
   type FromWorker,
   type LoginCredentials,
+  type MeProfile,
+  type MeUpdateParams,
   type MsgDb,
   type MutateParams,
   type MutateResult,
@@ -202,6 +204,14 @@ export function makeWorkerClient(clientId: string, transport: Transport): Worker
             params,
           }) as Promise<AdminInviteRevokeResult>,
       },
+    },
+    // Self-profile (`/v1/me`): HTTP pass-through mirroring `admin` — the tab
+    // sees plain profile data only (no token/URL crosses here), and the server
+    // is structurally self-only (no user_id parameter exists on this surface).
+    me: {
+      get: () => caller.request({ method: 'me.get', params: {} }) as Promise<MeProfile>,
+      update: (params: MeUpdateParams) =>
+        caller.request({ method: 'me.update', params }) as Promise<MeProfile>,
     },
     // Read-state (ENG-126): `mark` clears the unread/mention badge (optimistic +
     // monotonic worker-side; the `{kind:'stream'}` push re-derives the badge).

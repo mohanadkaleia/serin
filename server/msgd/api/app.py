@@ -28,6 +28,7 @@ from msgd.api.routers import (
     events_upload,
     files,
     health,
+    me,
     prefs,
     read_state,
     search,
@@ -113,6 +114,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(admin.router)
+    app.include_router(me.router)  # self-profile: GET/PATCH /v1/me (structurally self-only)
     app.include_router(events_upload.router)
     app.include_router(events_read.router)
     app.include_router(files.router)  # ENG-116: /v1/files (initiate + blob + download)

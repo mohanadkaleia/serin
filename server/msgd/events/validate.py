@@ -84,6 +84,26 @@ _WRITE_MATRIX_TYPES = frozenset(
     }
 )
 
+#: Meta event types that are ONLY ever produced SERVER-SIDE via ``emit_event``
+#: (workspace setup, accept-invite, leave, and the ``PATCH /v1/me`` self-rename).
+#: A client must NEVER be able to upload one of these through ``/v1/events/batch``:
+#: they carry an authority the client does not have (renaming a member, granting/
+#: revoking membership). The server's own ``emit_event`` path bypasses this upload
+#: validator (``events_upload`` calls ``emit_event`` only for items validate_event
+#: already Accepted), so gating them here does not affect legitimate server emits.
+#: SECURITY (PR #91 review): ``user.profile_updated`` fell to the D9 ``can_read``
+#: else-branch below, so a member could forge a cross-user rename; rejecting the
+#: whole server-authored family on upload closes that vector and its latent
+#: siblings (``workspace.created`` / ``user.joined`` / ``user.left``).
+SERVER_AUTHORED_EVENT_TYPES = frozenset(
+    {
+        "workspace.created",
+        "user.joined",
+        "user.left",
+        "user.profile_updated",
+    }
+)
+
 #: ``reaction.*`` types — gated by ``can_write`` (== read access, ENG-97) at step
 #: iii and by the §3.2 message-referential check at step vi (:func:`_check_referential`).
 _REACTION_TYPES = frozenset({"reaction.added", "reaction.removed"})
@@ -113,6 +133,10 @@ _LIFECYCLE_TYPES = frozenset(
 #: code+detail for a forbidden existing stream vs. a non-existent one, so this
 #: string must NOT vary with which case occurred.
 _STREAM_DENIED_DETAIL = "not permitted to write to this stream"
+
+#: Detail for a client trying to upload a server-authored meta type (§ security
+#: hardening): these events are only ever produced by the server via ``emit_event``.
+_SERVER_AUTHORED_DENIED_DETAIL = "event type is server-authored and cannot be uploaded"
 
 #: Uniform detail for a reaction whose target message is absent OR lives in a
 #: different (possibly unreadable) stream than the reaction is homed in. Like
@@ -382,6 +406,20 @@ async def validate_event(db: AsyncSession, *, ctx: AuthContext, item: Any) -> Ac
     sid = sid if isinstance(sid, str) else ""
     event_type = raw_body.get("type")
     event_type = event_type if isinstance(event_type, str) else ""
+
+    # SECURITY (PR #91 review): reject any server-authored meta type on the client
+    # upload path. These are ONLY ever produced server-side via ``emit_event``
+    # (setup / accept-invite / leave / ``PATCH /v1/me``); a client uploading one is
+    # forging authority it does not have. Without this, ``user.profile_updated`` (not
+    # in ``_WRITE_MATRIX_TYPES``) fell to the D9 ``can_read`` else-branch below and a
+    # member could rename ANY user by naming them in ``payload.user_id``. The server's
+    # own ``emit_event`` bypasses this validator, so legit self-renames are unaffected.
+    if event_type in SERVER_AUTHORED_EVENT_TYPES:
+        return Rejected(
+            event_id=event_id,
+            code="permission_denied",
+            detail=_SERVER_AUTHORED_DENIED_DETAIL,
+        )
 
     if event_type in _WRITE_MATRIX_TYPES:
         allowed = await can_write(db, ctx=ctx, stream_id=sid, event_type=event_type)

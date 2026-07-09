@@ -16,6 +16,7 @@ import { AuthManager } from './auth'
 import { checkProjectionVersion } from './db'
 import { FileManager } from './files'
 import { createHttpClient, type HttpClient } from './http'
+import { getMe, updateMe } from './me'
 import { MetaAuthor } from './meta'
 import { Outbox } from './outbox'
 import { EphemeralState } from './presence'
@@ -48,6 +49,7 @@ import {
   type AuthResult,
   type BackfillResult,
   type FileFetchResult,
+  type MeProfile,
   type MessageSink,
   type MsgDb,
   type MutateParams,
@@ -104,6 +106,9 @@ export interface RpcResultMap {
   'admin.invites.list': AdminInvitesResult
   'admin.invites.create': AdminInviteCreateResult
   'admin.invites.revoke': AdminInviteRevokeResult
+  // Self-profile HTTP pass-through (`/v1/me`) — structurally self-only.
+  'me.get': MeProfile
+  'me.update': MeProfile
 }
 
 /** A handler typed to exactly one method's request variant and result. */
@@ -270,6 +275,7 @@ export class WorkerCore {
     this.registerFiles()
     this.registerSignals()
     this.registerAdmin()
+    this.registerMe()
   }
 
   /**
@@ -622,6 +628,19 @@ export class WorkerCore {
     this.register('admin.invites.list', () => listAdminInvites(this.http))
     this.register('admin.invites.create', (req) => createAdminInvite(this.http, req.params))
     this.register('admin.invites.revoke', (req) => revokeAdminInvite(this.http, req.params))
+  }
+
+  // -- Self-profile handlers -------------------------------------------------
+  // HTTP pass-through over the shared authed http client (me.ts), mirroring
+  // the admin arms: live server truth, structurally self-only server-side,
+  // NOTHING persisted locally. The rename a successful `me.update` causes
+  // reaches the local directory via the normal sync path (the server appends
+  // `user.profile_updated` to workspace-meta). A 401/422 surfaces as a coded
+  // RPC error.
+
+  private registerMe(): void {
+    this.register('me.get', () => getMe(this.http))
+    this.register('me.update', (req) => updateMe(this.http, req.params))
   }
 }
 

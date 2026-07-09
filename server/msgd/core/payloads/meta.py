@@ -41,6 +41,7 @@ __all__ = [
     "DmCreatedV1",
     "build_workspace_created_body",
     "build_user_joined_body",
+    "build_user_profile_updated_body",
     "build_channel_created_body",
     "build_channel_member_added_body",
     "build_dm_created_body",
@@ -270,6 +271,47 @@ def build_user_joined_body(
         workspace_id=workspace_id,
         stream_id=stream_id,
         type="user.joined",
+        type_version=1,
+        author_user_id=author_user_id,
+        author_device_id=author_device_id,
+        client_created_at=client_created_at,
+        payload=payload.model_dump(mode="json"),
+    )
+    dumped: dict[str, Any] = body.model_dump(mode="json")
+    return dumped
+
+
+def build_user_profile_updated_body(
+    *,
+    workspace_id: str,
+    stream_id: str,
+    author_user_id: str,
+    author_device_id: str,
+    client_created_at: str,
+    user_id: str,
+    display_name: str,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Assemble a server-authored ``user.profile_updated`` v1 body dict (§2.2).
+
+    Mirrors :func:`build_user_joined_body`: the acting user authors their own
+    profile update (``author_user_id == payload.user_id`` — ``PATCH /v1/me`` is
+    structurally self-only). ``display_name`` rides the payload's
+    ``extra="allow"`` surface (the model requires only ``user_id``; changed
+    profile fields are additive by design) — the web directory fold reads it to
+    rename the member. The model is the source of truth, so
+    ``hash_event(returned dict) == event_hash`` holds by construction (D2).
+    """
+    # `display_name` rides the model's `extra="allow"` surface (changed profile
+    # fields are additive), so construct via model_validate rather than kwargs.
+    payload = UserProfileUpdatedV1.model_validate(
+        {"user_id": user_id, "display_name": display_name}
+    )
+    body = Body(
+        event_id=event_id if event_id is not None else ids.new_event_id(),
+        workspace_id=workspace_id,
+        stream_id=stream_id,
+        type="user.profile_updated",
         type_version=1,
         author_user_id=author_user_id,
         author_device_id=author_device_id,

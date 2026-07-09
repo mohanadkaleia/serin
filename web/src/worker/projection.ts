@@ -745,6 +745,10 @@ async function buildUserDirectory(
       const userId = typeof p.user_id === 'string' ? p.user_id : undefined
       if (userId === undefined) continue
       const displayName = typeof p.display_name === 'string' ? p.display_name : undefined
+      const authorUserId =
+        typeof event.envelope?.body?.author_user_id === 'string'
+          ? event.envelope.body.author_user_id
+          : undefined
       switch (event.type) {
         case 'user.joined':
           byId.set(userId, displayName ?? userId)
@@ -753,8 +757,15 @@ async function buildUserDirectory(
           byId.delete(userId)
           break
         case 'user.profile_updated':
-          // A rename only applies to a still-present member; ignore if they left.
-          if (byId.has(userId) && displayName !== undefined) byId.set(userId, displayName)
+          // SECURITY (PR #91 review) — defense-in-depth behind the server upload-path
+          // reject: a user may only rename THEMSELVES, so apply a profile_updated
+          // rename ONLY when the author IS the subject. Any event whose
+          // author_user_id !== payload.user_id (a forged cross-user rename, whether
+          // already stored or future) is ignored. A rename also only applies to a
+          // still-present member; ignore if they left. This is a pure filter on
+          // author==subject, so the fold stays deterministic + rebuild ≡ incremental.
+          if (authorUserId === userId && byId.has(userId) && displayName !== undefined)
+            byId.set(userId, displayName)
           break
       }
     }
