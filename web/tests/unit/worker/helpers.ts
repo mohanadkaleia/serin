@@ -14,6 +14,7 @@ import type {
   AdminMember,
   EventBody,
   FromWorker,
+  MeProfile,
   MessageSink,
   SearchResult,
   StoredEvent,
@@ -313,6 +314,12 @@ export class FakeSyncServer {
   adminInvites: AdminInvite[] = []
   /** When set, EVERY admin call fails with this error (403 gate / 422 model). */
   adminError: ApiError | undefined
+
+  // -- self-profile model (`/v1/me`; HTTP pass-through like admin) ----------
+  /** The caller's own profile served by `GET /v1/me` (tests seed it). */
+  meProfile: MeProfile | undefined
+  /** When set, EVERY `/v1/me` call fails with this error (401 / 422 model). */
+  meError: ApiError | undefined
 
   // -- ENG-119 Files API model --------------------------------------------
   /** `file_id` → the reserved file row (models the server `files` table). */
@@ -648,6 +655,39 @@ export class FakeSyncServer {
     return { ok: true, value: { ...row } }
   }
 
+  // -- self-profile responders (mirror routers/me.py semantics) -------------
+
+  /** `GET /v1/me` — the caller's own profile (self-only by construction). */
+  respondMe(): ApiResult<MeProfile> {
+    if (this.meError) return { ok: false, error: this.meError }
+    if (!this.meProfile) {
+      return {
+        ok: false,
+        error: { status: 401, code: 'unauthenticated', title: 'Unauthenticated' },
+      }
+    }
+    return { ok: true, value: { ...this.meProfile } }
+  }
+
+  /** `PATCH /v1/me` — apply `display_name` to the seeded profile and echo it. */
+  respondPatchMe(body: { display_name?: string }): ApiResult<MeProfile> {
+    if (this.meError) return { ok: false, error: this.meError }
+    if (!this.meProfile) {
+      return {
+        ok: false,
+        error: { status: 401, code: 'unauthenticated', title: 'Unauthenticated' },
+      }
+    }
+    if (typeof body.display_name !== 'string' || body.display_name.length === 0) {
+      return {
+        ok: false,
+        error: { status: 422, code: 'validation-error', title: 'Request validation failed' },
+      }
+    }
+    this.meProfile = { ...this.meProfile, display_name: body.display_name }
+    return { ok: true, value: { ...this.meProfile } }
+  }
+
   /** `GET /v1/admin/invites` — the pending invites (`id` = sha256 token_hash). */
   respondAdminInvites(): ApiResult<{ invites: AdminInvite[] }> {
     if (this.adminError) return { ok: false, error: this.adminError }
@@ -684,6 +724,7 @@ export class FakeSyncServer {
     if (path.startsWith('/v1/search')) return this.respondSearch()
     if (path.startsWith('/v1/admin/members')) return this.respondAdminMembers()
     if (path.startsWith('/v1/admin/invites')) return this.respondAdminInvites()
+    if (path === '/v1/me') return this.respondMe()
     if (path.startsWith('/v1/read-state')) return this.respondGetReadState()
     if (path.startsWith('/v1/prefs')) return this.respondGetPrefs()
     if (path.startsWith('/v1/sync')) {
@@ -825,6 +866,11 @@ export class FakeHttpClient implements HttpClient {
       const userId = decodeURIComponent(path.slice('/v1/admin/members/'.length))
       return Promise.resolve(
         this.server.respondAdminPatchMember(userId, body as { role?: string; active?: boolean }),
+      ) as Promise<ApiResult<T>>
+    }
+    if (path === '/v1/me') {
+      return Promise.resolve(
+        this.server.respondPatchMe(body as { display_name?: string }),
       ) as Promise<ApiResult<T>>
     }
     return Promise.resolve({ ok: true, value: undefined as T })

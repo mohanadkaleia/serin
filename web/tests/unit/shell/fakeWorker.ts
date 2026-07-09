@@ -17,6 +17,8 @@ import type {
   DmParticipants,
   FileRow,
   FileUploadParams,
+  MeProfile,
+  MeUpdateParams,
   MessageRow,
   MutateParams,
   MutateResult,
@@ -108,6 +110,21 @@ export class FakeWorker {
   private adminUpdateError: RpcCodedError | null = null
   private adminRevokeError: RpcCodedError | null = null
 
+  // -- self-profile (`me.*`) surface ----------------------------------------
+  // A seedable own-profile served by the `me.get`/`me.update` facade; `update`
+  // mutates the seed like the server would, or rejects with a queued coded error.
+  readonly meGetSpy = vi.fn()
+  readonly meUpdateSpy = vi.fn<(params: MeUpdateParams) => void>()
+  private meProfile: MeProfile = {
+    user_id: 'u_me',
+    display_name: 'Me',
+    email: 'me@example.com',
+    role: 'member',
+    is_bot: false,
+  }
+  private meGetError: RpcCodedError | null = null
+  private meUpdateError: RpcCodedError | null = null
+
   // -- setup helpers -------------------------------------------------------
 
   setMyUserId(id: string): this {
@@ -142,6 +159,24 @@ export class FakeWorker {
   /** Make the NEXT `admin.invites.revoke` reject with the coded error `code`. */
   failNextAdminRevoke(code: string): this {
     this.adminRevokeError = new RpcCodedError(code, code)
+    return this
+  }
+
+  /** Seed the own-profile the `me.get` facade serves. */
+  setMeProfile(profile: Partial<MeProfile>): this {
+    this.meProfile = { ...this.meProfile, ...profile }
+    return this
+  }
+
+  /** Make the NEXT `me.get` reject with the coded error `code`. */
+  failNextMeGet(code: string): this {
+    this.meGetError = new RpcCodedError(code, code)
+    return this
+  }
+
+  /** Make the NEXT `me.update` reject with the coded error `code`. */
+  failNextMeUpdate(code: string): this {
+    this.meUpdateError = new RpcCodedError(code, code)
     return this
   }
 
@@ -782,6 +817,29 @@ export class FakeWorker {
             }
             return Promise.resolve({ ok: true as const })
           },
+        },
+      },
+      // Self-profile (`/v1/me`): a seedable own-profile; `update` mutates the
+      // seed like the server, or rejects with a queued coded error.
+      me: {
+        get: () => {
+          this.meGetSpy()
+          if (this.meGetError) {
+            const err = this.meGetError
+            this.meGetError = null
+            return Promise.reject(err)
+          }
+          return Promise.resolve({ ...this.meProfile })
+        },
+        update: (params: MeUpdateParams) => {
+          this.meUpdateSpy(params)
+          if (this.meUpdateError) {
+            const err = this.meUpdateError
+            this.meUpdateError = null
+            return Promise.reject(err)
+          }
+          this.meProfile = { ...this.meProfile, display_name: params.display_name }
+          return Promise.resolve({ ...this.meProfile })
         },
       },
       // ENG-129: a REAL-shaped prefs surface — `get` returns the seeded snapshot,

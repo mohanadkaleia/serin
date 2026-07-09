@@ -29,4 +29,11 @@ describe('UserCard (ENG-136 PR-3)', () => {
     const wrapper = mount(UserCard, { props: { name: 'Sam' } })
     expect(wrapper.find('[data-testid="user-card"]').exists()).toBe(true)
   })
+
+  it('emits open-profile when the card is clicked (the profile affordance)', async () => {
+    const wrapper = mount(UserCard, { props: { name: 'Sam' } })
+    expect(wrapper.find('[data-testid="open-profile"]').exists()).toBe(true)
+    await wrapper.get('[data-testid="user-card"]').trigger('click')
+    expect(wrapper.emitted('openProfile')).toHaveLength(1)
+  })
 })

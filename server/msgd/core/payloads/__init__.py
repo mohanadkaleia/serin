@@ -45,6 +45,7 @@ from msgd.core.payloads.meta import (
     build_channel_member_added_body,
     build_dm_created_body,
     build_user_joined_body,
+    build_user_profile_updated_body,
     build_workspace_created_body,
 )
 from msgd.core.payloads.reaction import (
@@ -79,6 +80,7 @@ __all__ = [
     "build_message_created_body",
     "build_workspace_created_body",
     "build_user_joined_body",
+    "build_user_profile_updated_body",
     "build_channel_created_body",
     "build_channel_member_added_body",
     "build_dm_created_body",

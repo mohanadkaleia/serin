@@ -86,6 +86,9 @@ export {
   type AdminInvite,
   type AdminInvitesResult,
   type AdminInviteRevokeResult,
+  // Self-profile (`/v1/me`) — the Profile UI reads these; worker-authed.
+  type MeProfile,
+  type MeUpdateParams,
 } from './types'
 
 // ENG-80 projection functions — the ENG-79 apply seam + the ENG-83 dump surface.

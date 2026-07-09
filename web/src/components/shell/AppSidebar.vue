@@ -55,6 +55,7 @@ import NewButton from './NewButton.vue'
 import NewDmDialog from './NewDmDialog.vue'
 import UserCard from './UserCard.vue'
 import WorkspaceSwitcher from './WorkspaceSwitcher.vue'
+import ProfileDialog from '../profile/ProfileDialog.vue'
 
 import type { ActiveView } from '../../composables/useShellController'
 import type { PresenceStatus } from '../../worker'
@@ -89,6 +90,8 @@ const showCreateChannel = ref(false)
 const showChannelBrowser = ref(false)
 const showNewDm = ref(false)
 const settingsFor = ref<SidebarStream | null>(null)
+/** The current user's own profile dialog (view + edit display name). */
+const showProfile = ref(false)
 
 /** REAL total unread across every channel + DM — the Inbox badge (0 = no badge). */
 const totalUnread = computed(() =>
@@ -392,7 +395,7 @@ function dmStatus(stream: SidebarStream): PresenceStatus | undefined {
     <!-- Pinned footer: the signed-in user card with a REAL presence dot, plus a
          one-line local-first note (sync-store-derived, ENG-152). -->
     <div class="border-t border-subtle p-2">
-      <UserCard :name="myName" :status="myStatus" />
+      <UserCard :name="myName" :status="myStatus" @open-profile="showProfile = true" />
       <p class="px-2 pt-1 text-[11px] text-muted" data-testid="local-first-note">
         {{ localFirstNote }}
       </p>
@@ -403,4 +406,5 @@ function dmStatus(stream: SidebarStream): PresenceStatus | undefined {
   <ChannelBrowser v-if="showChannelBrowser" @close="showChannelBrowser = false" />
   <NewDmDialog v-if="showNewDm" @close="showNewDm = false" />
   <ChannelSettingsDialog v-if="settingsFor" :stream="settingsFor" @close="settingsFor = null" />
+  <ProfileDialog v-if="showProfile" @close="showProfile = false" />
 </template>

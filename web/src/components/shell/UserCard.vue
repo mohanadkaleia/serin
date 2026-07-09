@@ -1,7 +1,9 @@
 <script setup lang="ts">
 // UserCard — ENG-136 "Ranin" sidebar footer (PR-3). The signed-in user's card:
 // an avatar (initial) with a presence dot, the REAL display name, a presence
-// label, and a `chevron-down` (SCAFFOLD account menu — no-op for now).
+// label, and a `chevron-down`. Clicking the card opens the user's own profile
+// (view + edit display name) — it emits `open-profile`, which the sidebar wires
+// to the ProfileDialog.
 //
 // The presence dot color is REAL: it reflects the current user's status from the
 // ENG-126 presence snapshot (via the presence store), `bg-success` when online and
@@ -18,6 +20,8 @@ const props = withDefaults(defineProps<{ name: string; status?: PresenceStatus }
   status: 'online',
 })
 
+const emit = defineEmits<{ openProfile: [] }>()
+
 const initial = computed(() => (props.name.trim()[0] ?? '?').toUpperCase())
 const online = computed(() => props.status === 'online')
 const statusLabel = computed(() => (online.value ? 'Online' : 'Offline'))
@@ -30,6 +34,8 @@ const dotStatus = computed<PresenceStatus>(() => props.status ?? 'online')
     type="button"
     class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-surface-hover focus:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-1 focus-visible:ring-offset-background"
     data-testid="user-card"
+    aria-label="Open your profile"
+    @click="emit('openProfile')"
   >
     <span class="relative shrink-0">
       <span
@@ -46,6 +52,8 @@ const dotStatus = computed<PresenceStatus>(() => props.status ?? 'online')
       <span class="block truncate text-[13px] font-medium text-primary">{{ name }}</span>
       <span class="block text-xs text-muted">{{ statusLabel }}</span>
     </span>
-    <Icon name="chevron-down" :size="16" class="shrink-0 text-muted" />
+    <span data-testid="open-profile" class="shrink-0">
+      <Icon name="chevron-down" :size="16" class="text-muted" />
+    </span>
   </button>
 </template>

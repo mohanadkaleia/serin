@@ -1194,6 +1194,35 @@ export interface AdminInviteRevokeResult {
   ok: true
 }
 
+// ---------------------------------------------------------------------------
+// Self-profile (`/v1/me`) — HTTP pass-through RPCs like `admin.*`: the worker
+// attaches the bearer and returns the server response verbatim; nothing is
+// persisted locally. Structurally SELF-ONLY: no params carry a user_id — the
+// server resolves the target from the session. Shapes mirror
+// `server/msgd/api/schemas/me.py` field-for-field.
+// ---------------------------------------------------------------------------
+
+/**
+ * The caller's own profile (`GET /v1/me` / the `PATCH /v1/me` echo, server
+ * `MeResponse`). `email` is the caller's OWN address (it never appears in the
+ * client-facing `directory.list` projection for anyone else).
+ */
+export interface MeProfile {
+  user_id: string
+  display_name: string
+  email: string
+  role: string
+  is_bot: boolean
+}
+
+/**
+ * `me.update` params — `PATCH /v1/me`. Display name only (the one editable
+ * profile field); the server enforces the signup bounds (1..200 chars, 422).
+ */
+export interface MeUpdateParams {
+  display_name: string
+}
+
 /** Live-presence status for a workspace user (ENG-125), ephemeral (memory-only). */
 export type PresenceStatus = 'online' | 'offline'
 
@@ -1249,6 +1278,10 @@ export type RpcRequest =
   | { method: 'admin.members.update'; params: AdminMemberUpdateParams }
   | { method: 'admin.invites.list'; params: Record<string, never> }
   | { method: 'admin.invites.revoke'; params: { id: string } }
+  // Self-profile — HTTP pass-through over `/v1/me` (token worker-side;
+  // structurally self-only; a 401/422 surfaces as a coded error).
+  | { method: 'me.get'; params: Record<string, never> }
+  | { method: 'me.update'; params: MeUpdateParams }
   | { method: 'readState.mark'; params: { stream_id: string; last_read_seq: number } }
   | { method: 'prefs.get'; params: Record<string, never> }
   | { method: 'prefs.set'; params: { stream_id: string; level: PrefLevel } }
@@ -1418,6 +1451,19 @@ export interface WorkerClient {
       list(): Promise<AdminInvitesResult>
       revoke(params: { id: string }): Promise<AdminInviteRevokeResult>
     }
+  }
+
+  /**
+   * Self-profile namespace (`/v1/me`). HTTP pass-through over the worker's
+   * authed client, mirroring `admin` — structurally self-only (no user_id on
+   * any param), live server truth, nothing persisted locally. The rename a
+   * successful `update` triggers reaches the UI via the normal sync path: the
+   * server appends `user.profile_updated` to workspace-meta and the local
+   * directory fold renames the member.
+   */
+  me: {
+    get(): Promise<MeProfile>
+    update(params: MeUpdateParams): Promise<MeProfile>
   }
 
   /**
