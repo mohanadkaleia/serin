@@ -16,8 +16,10 @@ import { computed, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
 
-import type { QuickItem } from '../components/shell/CommandPalette.vue'
+import type { CommandItem, QuickItem } from '../components/shell/CommandPalette.vue'
 import { resolveWorkerClient } from './useWorkerClient'
+import { useTheme } from './useTheme'
+import { buildCommands } from '../lib/commands'
 import { dmDisplayName, dmOtherUserId } from '../lib/dm'
 import { useAuthStore } from '../stores/auth'
 import { useMessagesStore } from '../stores/messages'
@@ -73,6 +75,13 @@ export function useShellController() {
   const { isOpen: threadOpen } = storeToRefs(thread)
 
   const paletteOpen = ref(false)
+  /** Palette-triggered dialog/overlay flags (ENG-136 command actions). The
+   * TopBar's search/compose route through the SAME flags, so each surface stays
+   * single-instance regardless of which entry point opened it. */
+  const createChannelOpen = ref(false)
+  const channelBrowserOpen = ref(false)
+  const newDmOpen = ref(false)
+  const searchOpen = ref(false)
   /** The message currently in inline edit (ENG-102); null = none. */
   const editingMessageId = ref<string | null>(null)
   /** Which main panel is active: the conversation timeline vs a scaffold section. */
@@ -306,6 +315,55 @@ export function useShellController() {
     paletteOpen.value = false
   }
 
+  // -- Palette commands (ENG-136) --------------------------------------------
+  //
+  // The registry (lib/commands.ts) is pure; every seam below is an EXISTING
+  // shell behavior — dialog flags, view flips, useTheme, the logout flow. The
+  // palette only ever sees display descriptors + emits `run(id)` back here.
+
+  /**
+   * "Channel notification settings": open the Details drawer (its Notifications
+   * area, ENG-129) for the active channel. Gated by `available()` below, but
+   * defensively re-checked here.
+   */
+  function openChannelNotifications(): void {
+    if (activeView.value !== 'conversation' || !selectedStream.value) return
+    thread.close()
+    detailsOpen.value = true
+  }
+
+  const { cycleTheme } = useTheme()
+
+  const commands = buildCommands({
+    openCreateChannel: () => (createChannelOpen.value = true),
+    openNewDm: () => (newDmOpen.value = true),
+    openChannelBrowser: () => (channelBrowserOpen.value = true),
+    openSearch: () => (searchOpen.value = true),
+    cycleTheme,
+    goToInbox: () => setActiveView('inbox'),
+    openChannelNotifications,
+    hasActiveChannel: () =>
+      activeView.value === 'conversation' && selectedStream.value?.kind === 'channel',
+    signOut: () => void onLogout(),
+  })
+
+  /** The palette's Commands group: display descriptors for AVAILABLE commands
+   * (context-gated ones — e.g. channel notifications — drop out reactively). */
+  const paletteCommands = computed<CommandItem[]>(() =>
+    commands
+      .filter((c) => c.available?.() ?? true)
+      .map(({ id, title, icon, keywords }) => ({ id, title, icon, keywords })),
+  )
+
+  /** Run a palette command by id (Enter/click on a Commands row): close the
+   * palette, then fire the seam. Unknown/unavailable ids are a no-op. */
+  function onPaletteCommand(id: string): void {
+    const command = commands.find((c) => c.id === id)
+    if (!command || !(command.available?.() ?? true)) return
+    paletteOpen.value = false
+    command.run()
+  }
+
   /**
    * Open a stream (Inbox triage row, search jump, toast click — ENG-136/129):
    * select it + flip the main panel to the conversation. Explicit `activeView`
@@ -410,6 +468,10 @@ export function useShellController() {
     // reactive state
     activeView,
     paletteOpen,
+    createChannelOpen,
+    channelBrowserOpen,
+    newDmOpen,
+    searchOpen,
     editingMessageId,
     canAdmin,
     workspaceName,
@@ -436,6 +498,7 @@ export function useShellController() {
     scaffold,
     composerPlaceholder,
     quickItems,
+    paletteCommands,
     // handlers
     setActiveView,
     toggleDetails,
@@ -443,6 +506,7 @@ export function useShellController() {
     onChannelLeft,
     openPalette,
     onPaletteSelect,
+    onPaletteCommand,
     onOpenStream,
     onSend,
     onEditLast,
