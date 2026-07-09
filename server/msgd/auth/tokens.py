@@ -29,6 +29,14 @@ def mint_token() -> tuple[str, str]:
     """Mint a fresh opaque token; return ``(raw, token_hash)``.
 
     The raw string is the bearer credential (returned once); the hash is stored.
+
+    ENG-148: never mint a token starting with ``-`` or ``_``. A leading ``-``
+    makes argparse treat the token as an option flag (``msgctl login
+    --invite-token -20KX…`` blows up), so re-mint until the first char is
+    alphanumeric. Rejection rate is ~2/64 per attempt — entropy loss is
+    negligible and the alphabet/length are unchanged.
     """
-    raw = secrets.token_urlsafe(_TOKEN_BYTES)
-    return raw, hash_token(raw)
+    while True:
+        raw = secrets.token_urlsafe(_TOKEN_BYTES)
+        if raw[0] not in "-_":
+            return raw, hash_token(raw)
