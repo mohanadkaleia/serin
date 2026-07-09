@@ -2,17 +2,18 @@
 name = "msg-workspace"
 version = "0"
 requires-python = ">=3.12"
-dependencies = ["msgd", "msgctl"]
+dependencies = ["msgd", "msgctl", "github-notifier"]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-members = ["server", "cli"]
+members = ["server", "cli", "plugins/github_notifier"]
 
 [tool.uv.sources]
 msgd = { workspace = true }
 msgctl = { workspace = true }
+github-notifier = { workspace = true }
 
 [dependency-groups]
 # httpx drives the in-process ASGI test client; testcontainers runs the
@@ -39,7 +40,7 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["server/msgd", "server/tests", "cli/msgctl", "cli/tests"]
+files = ["server/msgd", "server/tests", "cli/msgctl", "cli/tests", "plugins/github_notifier"]
 # server/tests/ and cli/tests/ each hold a top-level `conftest.py`; mypy would
 # map both to the module name `conftest` and abort with "duplicate module".
 # They cannot be disambiguated by package: making a `tests/` dir a package would
@@ -50,7 +51,7 @@ files = ["server/msgd", "server/tests", "cli/msgctl", "cli/tests"]
 exclude = ["^server/tests/conftest\\.py$"]
 
 [tool.pytest.ini_options]
-testpaths = ["server/tests", "cli/tests"]
+testpaths = ["server/tests", "cli/tests", "plugins/github_notifier/tests"]
 addopts = "-q"
 asyncio_mode = "auto"
 markers = [

@@ -1,0 +1,39 @@
+{
+  "action": "closed",
+  "number": 41,
+  "pull_request": {
+    "number": 41,
+    "title": "Fix flaky WebSocket heartbeat test",
+    "html_url": "https://github.com/example-org/example-repo/pull/41",
+    "state": "closed",
+    "draft": false,
+    "merged": true,
+    "user": {
+      "login": "alice",
+      "type": "User"
+    },
+    "head": {
+      "ref": "fix/ws-heartbeat-flake",
+      "sha": "1122334455667788990011223344556677889900"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "99887766554433221100998877665544332211ff"
+    },
+    "created_at": "2026-06-28T14:02:00Z",
+    "merged_at": "2026-07-01T10:30:00Z",
+    "merged_by": {
+      "login": "bob",
+      "type": "User"
+    }
+  },
+  "repository": {
+    "full_name": "example-org/example-repo",
+    "html_url": "https://github.com/example-org/example-repo",
+    "private": false
+  },
+  "sender": {
+    "login": "bob",
+    "type": "User"
+  }
+}
