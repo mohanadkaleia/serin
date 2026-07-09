@@ -16,6 +16,24 @@ import { useWorkspaceStore } from '../../../src/stores/workspace'
 import { FakeWorker } from './fakeWorker'
 import type { PresenceStatus } from '../../../src/worker'
 
+// This env's window.localStorage is a bare object with no methods; NavGroup
+// (ENG-152 group restyle) persists collapse state through it, so install a
+// working in-memory Storage per test (same pattern as useTheme.spec).
+function installLocalStorage(): void {
+  const store = new Map<string, string>()
+  const mock: Pick<Storage, 'getItem' | 'setItem' | 'removeItem' | 'clear'> = {
+    getItem: (k) => store.get(k) ?? null,
+    setItem: (k, v) => void store.set(k, String(v)),
+    removeItem: (k) => void store.delete(k),
+    clear: () => store.clear(),
+  }
+  Object.defineProperty(window, 'localStorage', {
+    value: mock,
+    configurable: true,
+    writable: true,
+  })
+}
+
 async function mountSidebar(): Promise<ReturnType<typeof mount>> {
   const store = useWorkspaceStore()
   await store.load()
@@ -182,6 +200,7 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
   let fake: FakeWorker
 
   beforeEach(() => {
+    installLocalStorage()
     setActivePinia(createPinia())
     fake = new FakeWorker()
   })
@@ -229,6 +248,71 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
     expect(at('nav-group-workspace')).toBeLessThan(at('nav-files'))
     expect(at('nav-group-workspace')).toBeLessThan(at('nav-apps'))
     expect(at('nav-group-workspace')).toBeLessThan(at('nav-search'))
+  })
+
+  it('indents each group under a thin border-subtle connector rule (group restyle)', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    // One indented item block per group (Messages + Workspace), each carrying
+    // the single vertical connector line in the subtle border token.
+    const blocks = wrapper.findAll('[data-testid="nav-group-items"]')
+    expect(blocks).toHaveLength(2)
+    for (const block of blocks) {
+      expect(block.classes()).toContain('border-l')
+      expect(block.classes()).toContain('border-subtle')
+      expect(block.classes()).toContain('pl-2')
+    }
+    // The items live INSIDE the indented blocks.
+    expect(blocks[0]!.find('[data-testid="nav-inbox"]').exists()).toBe(true)
+    expect(blocks[0]!.find('[data-testid="sidebar-channel"]').exists()).toBe(true)
+    expect(blocks[1]!.find('[data-testid="nav-files"]').exists()).toBe(true)
+    expect(blocks[1]!.find('[data-testid="nav-search"]').exists()).toBe(true)
+  })
+
+  it('collapses a group from its header, tracking aria-expanded, and persists (group restyle)', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    const header = wrapper.get('[data-testid="nav-group-messages"]')
+    const block = wrapper.findAll('[data-testid="nav-group-items"]')[0]!.element as HTMLElement
+
+    // Default EXPANDED (the E2E flows click sidebar rows without toggling).
+    expect(header.attributes('aria-expanded')).toBe('true')
+    expect(block.style.display).not.toBe('none')
+
+    // Collapse: aria flips, the item block hides (v-show), state persists.
+    await header.trigger('click')
+    expect(header.attributes('aria-expanded')).toBe('false')
+    expect(block.style.display).toBe('none')
+    expect(window.localStorage.getItem('msg:nav-group:messages')).toBe('collapsed')
+    // The OTHER group is untouched.
+    expect(wrapper.get('[data-testid="nav-group-workspace"]').attributes('aria-expanded')).toBe(
+      'true',
+    )
+
+    // Expand again: visible + persisted back.
+    await header.trigger('click')
+    expect(header.attributes('aria-expanded')).toBe('true')
+    expect(block.style.display).not.toBe('none')
+    expect(window.localStorage.getItem('msg:nav-group:messages')).toBe('expanded')
+  })
+
+  it('restores a persisted collapsed group on mount (group restyle)', async () => {
+    window.localStorage.setItem('msg:nav-group:workspace', 'collapsed')
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar()
+
+    expect(wrapper.get('[data-testid="nav-group-workspace"]').attributes('aria-expanded')).toBe(
+      'false',
+    )
+    // Messages (no stored state) stays expanded.
+    expect(wrapper.get('[data-testid="nav-group-messages"]').attributes('aria-expanded')).toBe(
+      'true',
+    )
   })
 
   it('shows the "+ New" button and wires its menu to the REAL create flows', async () => {

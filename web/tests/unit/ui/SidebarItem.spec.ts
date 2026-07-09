@@ -72,6 +72,14 @@ describe('ui/SidebarItem', () => {
     expect(wrapper.text()).toContain('3')
   })
 
+  it('right-aligns the trailing badge slot (ml-auto — ENG-152 group restyle)', () => {
+    const wrapper = mount(SidebarItem, {
+      slots: { default: 'general', trailing: '<span data-testid="count">3</span>' },
+    })
+    const holder = wrapper.get('[data-testid="count"]').element.parentElement!
+    expect(holder.className).toContain('ml-auto')
+  })
+
   it('renders the optional leading slot before the label (aria-hidden wrapper)', () => {
     const wrapper = mount(SidebarItem, {
       slots: { default: 'general', leading: '<svg data-testid="lead-icon" />' },

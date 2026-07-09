@@ -34,6 +34,12 @@
 // is unchanged. Unread rows get an accent-subtle count pill (mention rows keep
 // the danger `mention-badge`).
 //
+// ENG-152 group restyle: the two headers are now ui/NavGroup — collapsible
+// (chevron, aria-expanded, per-group localStorage persistence, default
+// expanded) — and each group's items render INDENTED under a single thin
+// `border-subtle` connector rule. Same items, routes, labels, and test-ids;
+// `nav-group-messages` / `nav-group-workspace` now address the header buttons.
+//
 // SECURITY: stream names + the user's display name are other users' input —
 // rendered via text interpolation only.
 import { computed, ref } from 'vue'
@@ -45,6 +51,7 @@ import { usePresenceStore } from '../../stores/presence'
 import { useSyncStore } from '../../stores/sync'
 import { useWorkspaceStore, type SidebarStream } from '../../stores/workspace'
 import Icon from '../ui/Icon.vue'
+import NavGroup from '../ui/NavGroup.vue'
 import NavSection from '../ui/NavSection.vue'
 import PresenceDot from '../ui/PresenceDot.vue'
 import SidebarItem from '../ui/SidebarItem.vue'
@@ -194,126 +201,68 @@ function dmStatus(stream: SidebarStream): PresenceStatus | undefined {
          navigation landmark, so this stays a plain div to avoid a nested,
          unlabeled second nav landmark. -->
     <div class="mt-2 flex-1 space-y-2 overflow-y-auto px-2 pb-3">
-      <!-- MESSAGES group: Inbox + the real DM/channel lists (ENG-152 PR-c). -->
-      <p
-        class="px-2 pt-1 text-[11px] font-semibold uppercase tracking-wide text-secondary"
-        data-testid="nav-group-messages"
-      >
-        Messages
-      </p>
+      <!-- MESSAGES group: Inbox + the real DM/channel lists (ENG-152 PR-c) —
+           collapsible, items indented under the connector rule (group restyle). -->
+      <NavGroup title="Messages" storage-key="messages" data-testid="nav-group-messages">
+        <template #icon><Icon name="message-square" :size="14" /></template>
 
-      <!-- Feed-first: Inbox with a REAL total-unread count. -->
-      <SidebarItem
-        :active="activeView === 'inbox'"
-        data-testid="nav-inbox"
-        @click="emit('selectView', 'inbox')"
-      >
-        <template #leading><Icon name="mail" :size="16" /></template>
-        Inbox
-        <template v-if="totalUnread > 0" #trailing>
-          <span
-            class="rounded-full bg-accent-subtle px-1.5 text-xs font-medium text-accent"
-            data-testid="inbox-unread"
-            >{{ totalUnread }}</span
-          >
-        </template>
-      </SidebarItem>
-
-      <!-- REAL Direct Messages (ENG-80 projection). -->
-      <NavSection title="DMs">
-        <template #icon><Icon name="users" :size="16" /></template>
-        <template #action>
-          <button
-            type="button"
-            class="rounded px-1 text-sm leading-none text-muted transition-colors hover:text-primary"
-            aria-label="New direct message"
-            title="New direct message"
-            data-testid="open-new-dm"
-            @click="showNewDm = true"
-          >
-            +
-          </button>
-        </template>
+        <!-- Feed-first: Inbox with a REAL total-unread count. -->
         <SidebarItem
-          v-for="stream in dms"
-          :key="stream.stream_id"
-          :active="isActive(stream)"
-          :unread="stream.unread > 0"
-          data-testid="sidebar-dm"
-          :data-stream-id="stream.stream_id"
-          :data-unread="stream.unread"
-          @click="select(stream)"
+          :active="activeView === 'inbox'"
+          data-testid="nav-inbox"
+          @click="emit('selectView', 'inbox')"
         >
-          <template #leading>
-            <span class="relative">
-              <span
-                class="grid h-4 w-4 place-items-center rounded-full bg-accent-subtle text-[10px] font-semibold text-accent"
-                >{{ dmInitial(stream) }}</span
-              >
-              <!-- REAL presence for the DM counterpart (ENG-149/ENG-128). -->
-              <PresenceDot
-                v-if="dmStatus(stream) !== undefined"
-                size="sm"
-                :status="dmStatus(stream)!"
-                class="absolute -bottom-0.5 -right-0.5 border border-surface"
-              />
-            </span>
-          </template>
-          {{ labelFor(stream) }}
-          <template v-if="stream.mention" #trailing>
+          <template #leading><Icon name="mail" :size="16" /></template>
+          Inbox
+          <template v-if="totalUnread > 0" #trailing>
             <span
-              class="rounded-full bg-danger px-1.5 text-xs font-semibold text-danger-fg"
-              data-testid="mention-badge"
-              >{{ stream.unread }}</span
-            >
-          </template>
-          <template v-else-if="stream.unread > 0" #trailing>
-            <span
-              class="rounded-full bg-accent-subtle px-1.5 text-xs font-semibold text-accent"
-              data-testid="unread-badge"
-              >{{ stream.unread }}</span
+              class="rounded-full bg-accent-subtle px-1.5 text-xs font-medium text-accent"
+              data-testid="inbox-unread"
+              >{{ totalUnread }}</span
             >
           </template>
         </SidebarItem>
-      </NavSection>
 
-      <!-- REAL Channels (ENG-80 projection). -->
-      <NavSection title="Channels">
-        <template #icon><Icon name="hash" :size="16" /></template>
-        <template #action>
-          <span class="flex items-center gap-0.5">
+        <!-- REAL Direct Messages (ENG-80 projection). -->
+        <NavSection title="DMs">
+          <template #icon><Icon name="users" :size="16" /></template>
+          <template #action>
             <button
               type="button"
               class="rounded px-1 text-sm leading-none text-muted transition-colors hover:text-primary"
-              aria-label="Browse channels"
-              title="Browse channels"
-              data-testid="open-channel-browser"
-              @click="showChannelBrowser = true"
-            >
-              ⌕
-            </button>
-            <button
-              type="button"
-              class="rounded px-1 text-sm leading-none text-muted transition-colors hover:text-primary"
-              aria-label="Create a channel"
-              title="Create a channel"
-              data-testid="open-create-channel"
-              @click="showCreateChannel = true"
+              aria-label="New direct message"
+              title="New direct message"
+              data-testid="open-new-dm"
+              @click="showNewDm = true"
             >
               +
             </button>
-          </span>
-        </template>
-        <div v-for="stream in channels" :key="stream.stream_id" class="group/row relative">
+          </template>
           <SidebarItem
+            v-for="stream in dms"
+            :key="stream.stream_id"
             :active="isActive(stream)"
             :unread="stream.unread > 0"
-            data-testid="sidebar-channel"
+            data-testid="sidebar-dm"
             :data-stream-id="stream.stream_id"
             :data-unread="stream.unread"
             @click="select(stream)"
           >
-            <template #leading><Icon name="hash" :size="16" /></template>
+            <template #leading>
+              <span class="relative">
+                <span
+                  class="grid h-4 w-4 place-items-center rounded-full bg-accent-subtle text-[10px] font-semibold text-accent"
+                  >{{ dmInitial(stream) }}</span
+                >
+                <!-- REAL presence for the DM counterpart (ENG-149/ENG-128). -->
+                <PresenceDot
+                  v-if="dmStatus(stream) !== undefined"
+                  size="sm"
+                  :status="dmStatus(stream)!"
+                  class="absolute -bottom-0.5 -right-0.5 border border-surface"
+                />
+              </span>
+            </template>
             {{ labelFor(stream) }}
             <template v-if="stream.mention" #trailing>
               <span
@@ -330,63 +279,119 @@ function dmStatus(stream: SidebarStream): PresenceStatus | undefined {
               >
             </template>
           </SidebarItem>
-          <button
-            type="button"
-            class="absolute right-1 top-1/2 hidden -translate-y-1/2 rounded px-1 text-xs text-muted transition-colors hover:text-primary group-hover/row:block"
-            title="Channel settings"
-            data-testid="open-channel-settings"
-            :data-stream-id="stream.stream_id"
-            @click.stop="settingsFor = stream"
+        </NavSection>
+
+        <!-- REAL Channels (ENG-80 projection). -->
+        <NavSection title="Channels">
+          <template #icon><Icon name="hash" :size="16" /></template>
+          <template #action>
+            <span class="flex items-center gap-0.5">
+              <button
+                type="button"
+                class="rounded px-1 text-sm leading-none text-muted transition-colors hover:text-primary"
+                aria-label="Browse channels"
+                title="Browse channels"
+                data-testid="open-channel-browser"
+                @click="showChannelBrowser = true"
+              >
+                ⌕
+              </button>
+              <button
+                type="button"
+                class="rounded px-1 text-sm leading-none text-muted transition-colors hover:text-primary"
+                aria-label="Create a channel"
+                title="Create a channel"
+                data-testid="open-create-channel"
+                @click="showCreateChannel = true"
+              >
+                +
+              </button>
+            </span>
+          </template>
+          <div v-for="stream in channels" :key="stream.stream_id" class="group/row relative">
+            <SidebarItem
+              :active="isActive(stream)"
+              :unread="stream.unread > 0"
+              data-testid="sidebar-channel"
+              :data-stream-id="stream.stream_id"
+              :data-unread="stream.unread"
+              @click="select(stream)"
+            >
+              <template #leading><Icon name="hash" :size="16" /></template>
+              {{ labelFor(stream) }}
+              <template v-if="stream.mention" #trailing>
+                <span
+                  class="rounded-full bg-danger px-1.5 text-xs font-semibold text-danger-fg"
+                  data-testid="mention-badge"
+                  >{{ stream.unread }}</span
+                >
+              </template>
+              <template v-else-if="stream.unread > 0" #trailing>
+                <span
+                  class="rounded-full bg-accent-subtle px-1.5 text-xs font-semibold text-accent"
+                  data-testid="unread-badge"
+                  >{{ stream.unread }}</span
+                >
+              </template>
+            </SidebarItem>
+            <button
+              type="button"
+              class="absolute right-1 top-1/2 hidden -translate-y-1/2 rounded px-1 text-xs text-muted transition-colors hover:text-primary group-hover/row:block"
+              title="Channel settings"
+              data-testid="open-channel-settings"
+              :data-stream-id="stream.stream_id"
+              @click.stop="settingsFor = stream"
+            >
+              ⚙
+            </button>
+          </div>
+        </NavSection>
+      </NavGroup>
+
+      <!-- WORKSPACE group: the non-messaging sections (ENG-152 PR-c) — same
+           collapsible + indented-connector treatment, behind a divider. -->
+      <div class="border-t border-subtle pt-2">
+        <NavGroup title="Workspace" storage-key="workspace" data-testid="nav-group-workspace">
+          <template #icon><Icon name="folder" :size="14" /></template>
+
+          <!-- SCAFFOLD single-row nav. -->
+          <SidebarItem
+            :active="activeView === 'files'"
+            data-testid="nav-files"
+            @click="emit('selectView', 'files')"
           >
-            ⚙
-          </button>
-        </div>
-      </NavSection>
+            <template #leading><Icon name="file" :size="16" /></template>
+            Files
+          </SidebarItem>
 
-      <!-- WORKSPACE group: the non-messaging sections (ENG-152 PR-c). -->
-      <p
-        class="border-t border-subtle px-2 pt-3 text-[11px] font-semibold uppercase tracking-wide text-secondary"
-        data-testid="nav-group-workspace"
-      >
-        Workspace
-      </p>
+          <SidebarItem
+            :active="activeView === 'apps'"
+            data-testid="nav-apps"
+            @click="emit('selectView', 'apps')"
+          >
+            <template #leading><Icon name="grid" :size="16" /></template>
+            Apps
+          </SidebarItem>
 
-      <!-- SCAFFOLD single-row nav. -->
-      <SidebarItem
-        :active="activeView === 'files'"
-        data-testid="nav-files"
-        @click="emit('selectView', 'files')"
-      >
-        <template #leading><Icon name="file" :size="16" /></template>
-        Files
-      </SidebarItem>
+          <SidebarItem data-testid="nav-search" @click="emit('openSwitcher')">
+            <template #leading><Icon name="search" :size="16" /></template>
+            Search
+          </SidebarItem>
 
-      <SidebarItem
-        :active="activeView === 'apps'"
-        data-testid="nav-apps"
-        @click="emit('selectView', 'apps')"
-      >
-        <template #leading><Icon name="grid" :size="16" /></template>
-        Apps
-      </SidebarItem>
-
-      <SidebarItem data-testid="nav-search" @click="emit('openSwitcher')">
-        <template #leading><Icon name="search" :size="16" /></template>
-        Search
-      </SidebarItem>
-
-      <!-- REAL Admin (ENG-151 PR-3) — expandable, role-gated, inside the
-           Workspace group; opens the members + pending-invites surface. -->
-      <NavSection v-if="canAdmin" title="Admin" :default-open="false">
-        <template #icon><Icon name="shield" :size="16" /></template>
-        <SidebarItem
-          :active="activeView === 'admin'"
-          data-testid="nav-admin"
-          @click="emit('selectView', 'admin')"
-        >
-          Members &amp; invites
-        </SidebarItem>
-      </NavSection>
+          <!-- REAL Admin (ENG-151 PR-3) — expandable, role-gated, inside the
+               Workspace group; opens the members + pending-invites surface. -->
+          <NavSection v-if="canAdmin" title="Admin" :default-open="false">
+            <template #icon><Icon name="shield" :size="16" /></template>
+            <SidebarItem
+              :active="activeView === 'admin'"
+              data-testid="nav-admin"
+              @click="emit('selectView', 'admin')"
+            >
+              Members &amp; invites
+            </SidebarItem>
+          </NavSection>
+        </NavGroup>
+      </div>
     </div>
 
     <!-- Pinned footer: the signed-in user card with a REAL presence dot, plus a
