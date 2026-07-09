@@ -13,8 +13,10 @@ the transaction's commit — §12 invariant 6 by construction).
 Correctness pins (each locked by a test):
 
 * **Fresh-instance only.** The emptiness guard refuses unless ``workspaces``,
-  ``users``, ``streams``, ``events``, and ``files`` are ALL empty.
-  Merge-import is out of scope (§9: "import into an empty server").
+  ``users``, ``streams``, ``events``, ``files``, and ``invites`` are ALL empty
+  (``invites`` has no FK anchoring it to the others, so a leftover row could
+  otherwise outlive the import). Merge-import is out of scope (§9: "import into
+  an empty server").
 * **Verbatim log.** :func:`import_event` preserves ``server_sequence``,
   ``server_received_at``, ``event_hash``, ``payload_redacted`` and the
   ``body`` JSONB exactly as exported — it never routes through
@@ -79,7 +81,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from msgd.blobs.store import BlobStore, BlobStoreError
 from msgd.core.hashing import hash_event
 from msgd.core.jcs import JCSError
-from msgd.db.models import Event, File, Stream, User, Workspace
+from msgd.db.models import Event, File, Invite, Stream, User, Workspace
 from msgd.events.reducers import apply_reducer
 from msgd.projections.apply import apply_projection
 from msgd.projections.dump import (
@@ -293,6 +295,11 @@ async def _assert_instance_empty(session: AsyncSession) -> None:
         (Stream, "streams"),
         (Event, "events"),
         (File, "files"),
+        # `invites` carries NO FK back to the tables above (its workspace_id /
+        # created_by are bare Text), so a leftover invite row can survive an
+        # otherwise-"empty" instance and silently outlive the imported workspace.
+        # Check it too, so a fresh instance is fresh on every restored surface.
+        (Invite, "invites"),
     ):
         row = (await session.execute(select(model).limit(1))).first()
         if row is not None:
@@ -551,28 +558,47 @@ async def import_workspace(
     # that the reducer-derived row agrees with the manifest.
     for sid in replay_order:
         entry = manifest_streams[sid]
-        result = await session.execute(
-            update(Stream)
-            .where(Stream.stream_id == sid)
-            .values(
-                head_seq=head_seqs[sid],
-                archived_at=_opt_ts(entry.get("archived_at"), field=f"streams[{sid}].archived_at"),
+        # Read the REDUCER-DERIVED row BEFORE the pin below overwrites archived_at:
+        # kind/name/visibility must equal the manifest, and the derived archive
+        # state (archived_at set vs None) must AGREE with the manifest's — the
+        # reducer can only stamp now() on channel.archived, so we trust the
+        # manifest's operational timestamp, but a resealed manifest must not
+        # silently FLIP a stream between archived and live.
+        derived_row = (
+            await session.execute(
+                select(Stream.kind, Stream.name, Stream.visibility, Stream.archived_at).where(
+                    Stream.stream_id == sid
+                )
             )
-            .returning(Stream.kind, Stream.name, Stream.visibility)
-        )
-        row = result.first()
-        if row is None:
+        ).first()
+        if derived_row is None:
             raise RestoreError(
                 f"stream {sid} is in the manifest but no event bootstrapped it — "
                 "a §9 bundle's streams are all reducer-created; refusing to import"
             )
-        derived = {"kind": row[0], "name": row[1], "visibility": row[2]}
+        derived = {"kind": derived_row[0], "name": derived_row[1], "visibility": derived_row[2]}
         declared = {k: entry.get(k) for k in ("kind", "name", "visibility")}
         if derived != declared:
             raise RestoreError(
                 f"stream {sid}: replayed state {derived} disagrees with the manifest "
                 f"{declared} — bundle is internally inconsistent"
             )
+        manifest_archived_at = _opt_ts(
+            entry.get("archived_at"), field=f"streams[{sid}].archived_at"
+        )
+        if (derived_row[3] is None) != (manifest_archived_at is None):
+            derived_state = "live" if derived_row[3] is None else "archived"
+            manifest_state = "live" if manifest_archived_at is None else "archived"
+            raise RestoreError(
+                f"stream {sid}: replayed state is {derived_state} but the manifest "
+                f"declares {manifest_state} — a resealed manifest must not flip a "
+                "stream's archive state; bundle is internally inconsistent"
+            )
+        await session.execute(
+            update(Stream)
+            .where(Stream.stream_id == sid)
+            .values(head_seq=head_seqs[sid], archived_at=manifest_archived_at)
+        )
 
     for f in files:
         try:

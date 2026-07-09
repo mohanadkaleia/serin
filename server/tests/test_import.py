@@ -25,6 +25,7 @@ import hashlib
 import json
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +47,7 @@ from msgd.core.hashing import hash_event
 from msgd.core.payloads import build_message_created_body
 from msgd.core.payloads.meta import build_user_joined_body, build_workspace_created_body
 from msgd.core.time import now_rfc3339, to_rfc3339
-from msgd.db.models import Event, File, Stream, StreamMember, User, Workspace
+from msgd.db.models import Event, File, Invite, Stream, StreamMember, User, Workspace
 from msgd.events.emit import emit_event
 from msgd.events.insert import insert_event
 from msgd.events.permissions import readable_streams_predicate
@@ -678,6 +679,130 @@ async def test_refuses_non_empty_instance(db_session: AsyncSession, tmp_path: Pa
     assert not (tmp_path / "b-blobs").exists()
 
 
+async def test_refuses_when_invites_table_not_empty(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    """A leftover `invites` row makes the target NOT fresh — import must refuse.
+
+    `invites` carries no FK back to the tables the guard already checks (its
+    `workspace_id` / `created_by` are bare Text), so a stray invite can survive
+    an otherwise-empty database. The hardened guard rejects it before any write,
+    so an imported workspace can never inherit an orphaned join token.
+    """
+    seeded = await _seed_and_export(db_session, tmp_path)
+    await db_session.execute(text(_RESET))
+    # A stray, un-anchored invite is the ONLY row in an otherwise-empty instance.
+    db_session.add(
+        Invite(
+            token_hash="leftover-token-hash",
+            workspace_id=ids.new_workspace_id(),
+            created_by=ids.new_user_id(),
+            role="member",
+            expires_at=datetime.now(UTC) + timedelta(days=1),
+        )
+    )
+    await db_session.flush()
+
+    with pytest.raises(RestoreError, match="invites has rows"):
+        await import_workspace(
+            db_session, LocalDiskBlobStore(tmp_path / "b-blobs"), seeded.bundle_dir
+        )
+
+    # The guard fired before any write (blobs included) — nothing but the invite.
+    await db_session.rollback()
+    assert not (tmp_path / "b-blobs").exists()
+
+
+async def test_imports_bundle_with_zero_event_channel(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    """A PUBLIC channel with no messages exports as an empty `streams/<id>/` dir
+    (head_seq 0, no month files) whose stream row is bootstrapped by the
+    meta-homed `channel.created`; import must accept the zero-event stream and
+    restore it as a live, empty channel."""
+    await db_session.execute(text(_RESET))
+    ws = ids.new_workspace_id()
+    db_session.add(Workspace(workspace_id=ws, name="Acme", file_quota_bytes=1))
+    await db_session.flush()
+    owner = ids.new_user_id()
+    db_session.add(
+        User(
+            user_id=owner,
+            workspace_id=ws,
+            email="alice@example.com",
+            password_hash=SECRET_HASH,
+            display_name="Alice",
+            role="owner",
+            is_bot=False,
+        )
+    )
+    await db_session.flush()
+    a_owner = _auth(ws, owner)
+
+    meta = ids.new_stream_id()
+    await emit_event(
+        db_session,
+        home_stream_id=meta,
+        body=build_workspace_created_body(
+            workspace_id=ws,
+            stream_id=meta,
+            author_user_id=owner,
+            author_device_id=a_owner["device_id"],
+            client_created_at=now_rfc3339(),
+            name="Acme",
+        ),
+    )
+    await emit_event(
+        db_session,
+        home_stream_id=meta,
+        body=build_user_joined_body(
+            workspace_id=ws,
+            stream_id=meta,
+            author_user_id=owner,
+            author_device_id=a_owner["device_id"],
+            client_created_at=now_rfc3339(),
+            user_id=owner,
+            display_name="Alice",
+        ),
+    )
+    # A public channel created but NEVER posted to: its own stream stays at
+    # head_seq 0 (the genesis event homes in workspace-meta, §2.2).
+    empty = ids.new_stream_id()
+    await emit_event(
+        db_session,
+        home_stream_id=meta,
+        body=channel_created_body(
+            auth=a_owner, home_stream_id=meta, channel_stream_id=empty, name="empty-room"
+        ),
+    )
+    await db_session.flush()
+
+    store = LocalDiskBlobStore(tmp_path / "a-blobs")
+    bundle = tmp_path / "bundle"
+    await export_workspace(db_session, store, bundle, exported_at=EXPORTED_AT, tool=TOOL)
+
+    # The zero-event channel exported as a dir with NO month files, head_seq 0.
+    empty_dir = bundle / "streams" / empty
+    assert empty_dir.is_dir()
+    assert list(empty_dir.glob("*.ndjson")) == []
+    manifest = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["streams"][empty]["head_seq"] == 0
+    assert manifest["streams"][empty]["event_count"] == 0
+    assert manifest["streams"][empty]["files"] == {}
+
+    await db_session.execute(text(_RESET))
+    result = await import_workspace(db_session, LocalDiskBlobStore(tmp_path / "b-blobs"), bundle)
+    assert result.head_seqs[empty] == 0
+
+    row = (
+        (await db_session.execute(select(Stream).where(Stream.stream_id == empty))).scalars().one()
+    )
+    assert row.head_seq == 0
+    assert row.name == "empty-room"
+    assert row.visibility == "public"
+    assert row.archived_at is None
+
+
 async def test_rerun_of_completed_import_fails_cleanly(
     db_session: AsyncSession, tmp_path: Path
 ) -> None:
@@ -773,6 +898,33 @@ async def test_manifest_head_seq_disagreement_aborts(
     await db_session.execute(text(_RESET))
 
     with pytest.raises(RestoreError, match="event_count|head_seq"):
+        await import_workspace(
+            db_session, LocalDiskBlobStore(tmp_path / "b-blobs"), seeded.bundle_dir
+        )
+    await db_session.rollback()
+    await _assert_all_empty(db_session)
+
+
+async def test_resealed_manifest_flipping_archive_state_aborts(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    """A manifest that clears a truly-archived stream's `archived_at` is refused.
+
+    The reducer can only stamp `now()` on `channel.archived`, so import trusts
+    the manifest's operational `archived_at` timestamp — but the archive STATE
+    (archived vs live) is reducer-derived and must agree, or a resealed manifest
+    could silently un-archive a channel. The private channel in the seed is
+    archived; blanking its `archived_at` in the manifest must abort.
+    """
+    seeded = await _seed_and_export(db_session, tmp_path)
+    manifest_path = seeded.bundle_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["streams"][seeded.private_id]["archived_at"] is not None
+    manifest["streams"][seeded.private_id]["archived_at"] = None
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    await db_session.execute(text(_RESET))
+
+    with pytest.raises(RestoreError, match="archive state"):
         await import_workspace(
             db_session, LocalDiskBlobStore(tmp_path / "b-blobs"), seeded.bundle_dir
         )
