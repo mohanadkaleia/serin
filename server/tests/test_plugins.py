@@ -364,6 +364,66 @@ async def test_scope_matrix(client: AsyncClient, db_session: AsyncSession) -> No
     assert human_post.status_code == 200 and len(human_post.json()["accepted"]) == 1
 
 
+async def test_patch_me_is_events_write_scoped(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """PATCH /v1/me is a bot-reachable event-log write (it emits
+    user.profile_updated), so it carries the events:write verb gate (security
+    review, invariant-8).
+
+    Non-vacuous: an events:read-only bot 403s AND appends ZERO meta events (so
+    it cannot rename itself repeatedly to flood the log); an events:write bot
+    succeeds and emits EXACTLY ONE user.profile_updated; a human (scopes=None)
+    still self-renames unaffected. The zero-event assertion is measured against
+    a per-bot count so a shared meta stream cannot mask a leak.
+    """
+    owner = await do_setup(client)
+    channel = await bootstrap_channel(client, db_session, owner)
+    read_bot = await _provision_bot(
+        client, owner, stream_ids=[channel], token_scopes=["events:read"]
+    )
+    write_bot = await _provision_bot(
+        client, owner, stream_ids=[channel], token_scopes=["events:write"]
+    )
+    meta = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta is not None
+
+    def _renames_of(events: list[Any], user_id: str) -> list[Any]:
+        return [
+            e
+            for e in _meta_events_of_type(events, "user.profile_updated")
+            if e.body["payload"]["user_id"] == user_id
+        ]
+
+    # events:read-only bot → 403 and NOT ONE appended user.profile_updated.
+    denied = await client.patch(
+        "/v1/me", json={"display_name": "Sneaky Bee"}, headers=auth_header(read_bot["token"])
+    )
+    assert denied.status_code == 403
+    assert denied.json()["type"] == "/problems/forbidden"
+    events = await fetch_stream_events(db_session, meta)
+    assert _renames_of(events, read_bot["user_id"]) == []
+    # ...and the users row was not renamed either.
+    row = await db_session.get(User, read_bot["user_id"])
+    assert row is not None and row.display_name == "Helper Bee"
+
+    # events:write bot → succeeds, emitting EXACTLY ONE user.profile_updated.
+    ok = await client.patch(
+        "/v1/me", json={"display_name": "Busy Bee"}, headers=auth_header(write_bot["token"])
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["display_name"] == "Busy Bee"
+    events = await fetch_stream_events(db_session, meta)
+    assert len(_renames_of(events, write_bot["user_id"])) == 1
+
+    # A human session (scopes=None) self-renames unaffected by the gate.
+    human = await client.patch(
+        "/v1/me", json={"display_name": "Renamed Owner"}, headers=auth_header(owner["token"])
+    )
+    assert human.status_code == 200
+    assert human.json()["display_name"] == "Renamed Owner"
+
+
 # --- WS connect: scope + revocation ------------------------------------------------
 
 
