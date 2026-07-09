@@ -34,8 +34,11 @@ from msgd.api.schemas.auth import CreateInviteRequest, InviteResponse
 from msgd.auth.context import AuthContext
 from msgd.auth.sessions import utcnow
 from msgd.auth.tokens import mint_token
+from msgd.core.payloads import build_bot_removed_body
+from msgd.core.time import now_rfc3339
 from msgd.db.engine import get_session
-from msgd.db.models import Invite, Session, User
+from msgd.db.models import BotToken, Invite, Session, Stream, User
+from msgd.events.emit import emit_event
 
 router = APIRouter(prefix="/v1/admin", tags=["admin"])
 
@@ -203,6 +206,18 @@ async def update_member(
     ``events`` and touches no projection. Membership/role are server-operational
     state (like ``sessions``), distinct from the hashed, replayable message log
     — so this path deliberately does not ``emit_event``.
+
+    ONE M5 exception (ENG-159): deactivating a BOT is the §2.2 bot-removal
+    path, so the active→inactive TRANSITION of a bot additionally (a)
+    bulk-deletes its ``bot_tokens`` in this same transaction (the bearer dies
+    NOW, mirroring the session bulk-revoke) and (b) emits the server-authored
+    ``bot.removed`` meta event (authored by the acting admin) — the client
+    roster fold needs it, exactly as ``bot.installed`` announced the bot.
+    Idempotent: re-deactivating an already-inactive bot deletes zero token rows
+    and emits NO second event (the transition guard). Reactivating a bot only
+    clears ``deactivated_at``; it deliberately does NOT re-emit
+    ``bot.installed`` (flagged — re-install via /v1/plugins is the supported
+    path) and its tokens stay gone (mint new ones).
     """
     target = await db.scalar(
         select(User)
@@ -227,9 +242,38 @@ async def update_member(
         if req.active:
             target.deactivated_at = None
         else:
+            was_active = target.deactivated_at is None
             target.deactivated_at = utcnow()
             # Bulk-revoke: the deactivated user's open sessions die NOW.
             await db.execute(delete(Session).where(Session.user_id == target.user_id))
+            if target.is_bot:
+                # ENG-159: a bot's bearer credentials are bot_tokens, not
+                # sessions — hard-delete them in the SAME transaction so every
+                # outstanding bot token 401s on its next request.
+                await db.execute(delete(BotToken).where(BotToken.bot_user_id == target.user_id))
+                if was_active:
+                    # §2.2 bot removal: announce it in the meta log ONCE per
+                    # transition (server-authored; a forged client upload of
+                    # this type is rejected by SERVER_AUTHORED_EVENT_TYPES).
+                    meta_stream_id = await db.scalar(
+                        select(Stream.stream_id).where(
+                            Stream.workspace_id == ctx.workspace_id,
+                            Stream.kind == "workspace-meta",
+                        )
+                    )
+                    assert meta_stream_id is not None  # setup always creates it
+                    await emit_event(
+                        db,
+                        home_stream_id=meta_stream_id,
+                        body=build_bot_removed_body(
+                            workspace_id=ctx.workspace_id,
+                            stream_id=meta_stream_id,
+                            author_user_id=ctx.user_id,
+                            author_device_id=ctx.device_id,
+                            client_created_at=now_rfc3339(),
+                            bot_user_id=target.user_id,
+                        ),
+                    )
 
     await db.commit()
     return _member_info(target)

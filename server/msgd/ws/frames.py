@@ -55,6 +55,7 @@ class WSCloseCode(IntEnum):
     """
 
     UNAUTHENTICATED = 4401  # missing/unknown/expired token or deactivated user
+    FORBIDDEN = 4403  # authenticated bot token lacking the events:read scope (ENG-159)
     TOO_MANY_CONNECTIONS = 4029  # over the per-user connection cap (§5)
     HEARTBEAT_TIMEOUT = 4408  # missed the server heartbeat ping (§7)
 

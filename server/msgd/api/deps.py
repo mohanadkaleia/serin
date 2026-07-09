@@ -24,6 +24,7 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msgd.api import problems
+from msgd.auth.bot_tokens import bump_bot_token, lookup_bot_token
 from msgd.auth.context import AuthContext
 from msgd.auth.ratelimit import RateLimiter, client_ip
 from msgd.auth.sessions import bump_session, lookup_session, utcnow
@@ -174,18 +175,26 @@ async def require_auth(
     db: Annotated[AsyncSession, Depends(get_session)],
     settings: AppSettings,
 ) -> AuthContext:
-    """Authenticate a request → :class:`AuthContext` (D5).
+    """Authenticate a request → :class:`AuthContext` (D5, + the ENG-159 bot branch).
 
     Uniform 401 on every failure path (missing/malformed header, unknown token,
-    expired session, deactivated user) — never reveal which check failed. On
+    expired session, revoked bot token, deactivated user) — never reveal which
+    check failed, and never reveal WHICH credential family the token would have
+    belonged to (a bad session token and a bad bot token 401 identically). On
     success, perform the throttled rolling bump (D4) and return the context.
+
+    The bot branch is ADDITIVE: a session lookup MISS falls through to the
+    ``bot_tokens`` table keyed by the SAME sha256 ``token_hash``. One context
+    type, one lookup path — every downstream ``validate_event`` / ``can_read``
+    / ``can_write`` consumer works unchanged; only ``ctx.scopes`` is new
+    (``None`` = human = unscoped; see :func:`require_scope`).
     """
     token = _parse_bearer(request)
     token_hash = hash_token(token)
 
     loaded = await lookup_session(db, token_hash)
     if loaded is None:
-        raise problems.unauthenticated()
+        return await _bot_token_auth(db, token_hash, settings=settings)
     session, user, device = loaded
 
     now = utcnow()
@@ -206,6 +215,42 @@ async def require_auth(
         user=user,
         device=device,
         session=session,
+    )
+
+
+async def _bot_token_auth(db: AsyncSession, token_hash: str, *, settings: Settings) -> AuthContext:
+    """The bot-token half of :func:`require_auth` (ENG-159) — 401s or returns a context.
+
+    Every failure — unknown hash, revoked token, deactivated bot — raises the
+    IDENTICAL ``problems.unauthenticated()`` a bad session raises (no oracle for
+    which family or which check). On success the context carries the bot's user
+    + provisioned device (so the step-ii author binding in ``validate_event``
+    pins uploads to exactly this bot) and ``scopes`` as a frozen set; the
+    throttled ``last_used_at`` bump mirrors ``bump_session``.
+    """
+    loaded = await lookup_bot_token(db, token_hash)
+    if loaded is None:
+        raise problems.unauthenticated()
+    bot_token, user, device = loaded
+
+    if bot_token.revoked_at is not None:
+        raise problems.unauthenticated()
+    if user.deactivated_at is not None:
+        raise problems.unauthenticated()
+
+    if await bump_bot_token(db, bot_token, settings=settings):
+        await db.commit()
+
+    return AuthContext(
+        user_id=user.user_id,
+        workspace_id=user.workspace_id,
+        role=user.role,
+        device_id=device.device_id,
+        session_token_hash=bot_token.token_hash,
+        user=user,
+        device=device,
+        session=None,
+        scopes=frozenset(bot_token.scopes),
     )
 
 
@@ -310,6 +355,27 @@ def require_role(*roles: str) -> Callable[[AuthContext], Awaitable[AuthContext]]
     async def dependency(ctx: CurrentAuth) -> AuthContext:
         if ctx.role not in roles:
             raise problems.forbidden(f"requires role in {roles}")
+        return ctx
+
+    return dependency
+
+
+def require_scope(scope: str) -> Callable[[AuthContext], Awaitable[AuthContext]]:
+    """Dependency factory: a BOT credential must carry ``scope``, else 403 (ENG-159).
+
+    The thin verb gate for endpoints whose verb is statically known:
+    ``events:write`` on ``POST /v1/events/batch``, ``events:read`` on the pull/
+    sync surfaces, ``files:write`` on the upload surfaces. A HUMAN session
+    (``ctx.scopes is None``) bypasses — humans are unscoped; their authority is
+    role + membership. A scope failure is an honest 403 (the caller's own
+    credential is the subject — nothing about any resource is disclosed);
+    per-STREAM restriction is deliberately NOT a scope concern: it stays the
+    membership / ``can_write`` path with its uniform ``permission_denied``.
+    """
+
+    async def dependency(ctx: CurrentAuth) -> AuthContext:
+        if ctx.scopes is not None and scope not in ctx.scopes:
+            raise problems.forbidden(f"requires scope {scope}")
         return ctx
 
     return dependency

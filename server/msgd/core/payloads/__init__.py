@@ -31,6 +31,8 @@ from msgd.core.payloads.message import (
     MessageEditedV1,
 )
 from msgd.core.payloads.meta import (
+    BotInstalledV1,
+    BotRemovedV1,
     ChannelArchivedV1,
     ChannelCreatedV1,
     ChannelMemberAddedV1,
@@ -41,8 +43,11 @@ from msgd.core.payloads.meta import (
     UserLeftV1,
     UserProfileUpdatedV1,
     WorkspaceCreatedV1,
+    build_bot_installed_body,
+    build_bot_removed_body,
     build_channel_created_body,
     build_channel_member_added_body,
+    build_channel_member_removed_body,
     build_dm_created_body,
     build_user_joined_body,
     build_user_profile_updated_body,
@@ -76,6 +81,8 @@ __all__ = [
     "ChannelMemberAddedV1",
     "ChannelMemberRemovedV1",
     "DmCreatedV1",
+    "BotInstalledV1",
+    "BotRemovedV1",
     "get_payload_model",
     "build_message_created_body",
     "build_workspace_created_body",
@@ -83,7 +90,10 @@ __all__ = [
     "build_user_profile_updated_body",
     "build_channel_created_body",
     "build_channel_member_added_body",
+    "build_channel_member_removed_body",
     "build_dm_created_body",
+    "build_bot_installed_body",
+    "build_bot_removed_body",
 ]
 
 #: Registry of every known ``(type, type_version)`` payload model.
@@ -104,6 +114,8 @@ PAYLOAD_MODELS: dict[tuple[str, int], type[BaseModel]] = {
     ("channel.member_removed", 1): ChannelMemberRemovedV1,
     ("dm.created", 1): DmCreatedV1,
     ("file.uploaded", 1): FileUploadedV1,
+    ("bot.installed", 1): BotInstalledV1,
+    ("bot.removed", 1): BotRemovedV1,
 }
 
 

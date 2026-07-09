@@ -376,3 +376,38 @@ class Invite(Base):
     role: Mapped[str] = mapped_column(Text, nullable=False, server_default=sa_text("'member'"))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_by: Mapped[str | None] = mapped_column(Text, nullable=True)  # single-use
+
+
+class BotToken(Base):
+    """A scoped bot bearer credential (M5, ENG-159).
+
+    Same token discipline as ``sessions`` / ``invites`` (D2): the PK is the
+    sha256 hex of the raw ``secrets.token_urlsafe(32)`` token, which is returned
+    exactly once at mint time and never persisted. Unlike a session there is no
+    ``expires_at`` — a bot credential lives until it is REVOKED (``revoked_at``,
+    kept as an auditable tombstone by the per-token revoke endpoint) or its bot
+    is DEACTIVATED (which hard-deletes every row, mirroring the session
+    bulk-revoke). ``scopes`` is the JSONB list of verb scopes this credential
+    carries (``events:read`` / ``events:write`` / ``files:write``, §10);
+    ``require_auth`` surfaces it as ``AuthContext.scopes``. ``last_used_at`` is
+    a throttled observability bump (the ``bump_session`` pattern), never an
+    authorization input.
+    """
+
+    __tablename__ = "bot_tokens"
+    # Non-PK lookup paths: the deactivation bulk-revoke + the plugins listing
+    # both filter by bot_user_id (the sessions ``ix_sessions_user_id`` precedent).
+    __table_args__ = (Index("ix_bot_tokens_bot_user_id", "bot_user_id"),)
+
+    token_hash: Mapped[str] = mapped_column(  # sha256 of the opaque token
+        Text, primary_key=True
+    )
+    bot_user_id: Mapped[str] = mapped_column(Text, ForeignKey("users.user_id"), nullable=False)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    created_by: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -50,6 +50,7 @@ from fastapi import APIRouter, Depends, WebSocket
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.websockets import WebSocketDisconnect
 
+from msgd.auth.bot_tokens import bump_bot_token, lookup_bot_token
 from msgd.auth.sessions import bump_session, lookup_session, utcnow
 from msgd.auth.tokens import hash_token
 from msgd.db.engine import get_session
@@ -193,11 +194,13 @@ async def _authenticate(
     if not token:
         await websocket.close(code=WSCloseCode.UNAUTHENTICATED)
         return None
+    token_hash = hash_token(token)
 
-    loaded = await lookup_session(db, hash_token(token))
+    loaded = await lookup_session(db, token_hash)
     if loaded is None:
-        await websocket.close(code=WSCloseCode.UNAUTHENTICATED)
-        return None
+        # ENG-159: a session MISS falls through to the bot-token family, exactly
+        # like require_auth — same hash, same uniform 4401 for every failure.
+        return await _authenticate_bot(websocket, db, settings, token_hash)
     session, user, device = loaded
 
     now = utcnow()
@@ -209,6 +212,48 @@ async def _authenticate(
     # get_session is savepoint-isolated in tests, so a bump-commit lands on a
     # savepoint, not the outer per-test transaction (R8).
     if await bump_session(db, session, settings=settings, now=now):
+        await db.commit()
+
+    return Connection(
+        websocket=websocket,
+        user_id=user.user_id,
+        role=user.role,
+        workspace_id=user.workspace_id,
+        device_id=device.device_id,
+    )
+
+
+async def _authenticate_bot(
+    websocket: WebSocket, db: AsyncSession, settings: Settings, token_hash: str
+) -> Connection | None:
+    """The bot-token half of WS auth (ENG-159) — mirrors ``deps._bot_token_auth``.
+
+    Every authentication failure (unknown hash, revoked token, deactivated bot)
+    is the SAME pre-accept ``4401`` a bad session gets — no oracle for which
+    credential family the token would have belonged to. A VALID bot token that
+    lacks the ``events:read`` scope is an authorization failure over the
+    caller's own credential, so it closes ``4403`` (the WS mirror of the HTTP
+    403 scope gate on pull/sync) — still pre-accept, still resource-blind. The
+    throttled ``last_used_at`` bump mirrors the session-bump parity above.
+    """
+    loaded = await lookup_bot_token(db, token_hash)
+    if loaded is None:
+        await websocket.close(code=WSCloseCode.UNAUTHENTICATED)
+        return None
+    bot_token, user, device = loaded
+
+    if bot_token.revoked_at is not None or user.deactivated_at is not None:
+        await websocket.close(code=WSCloseCode.UNAUTHENTICATED)
+        return None
+
+    # The WS surface is a read surface (fanout): the events:read verb gate,
+    # exactly like GET /v1/events and GET /v1/sync (humans bypass — they never
+    # reach this branch).
+    if "events:read" not in set(bot_token.scopes):
+        await websocket.close(code=WSCloseCode.FORBIDDEN)
+        return None
+
+    if await bump_bot_token(db, bot_token, settings=settings):
         await db.commit()
 
     return Connection(

@@ -38,7 +38,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from msgd.api import problems
-from msgd.api.deps import CurrentAuth, event_rate_limit
+from msgd.api.deps import CurrentAuth, event_rate_limit, require_scope
 from msgd.api.problems import ProblemException
 from msgd.api.schemas.events import AcceptedEvent, BatchUploadResponse, RejectedEvent
 from msgd.core.time import to_rfc3339
@@ -131,7 +131,9 @@ async def _read_body_capped(request: Request) -> bytes:
 @router.post(
     "/events/batch",
     response_model=BatchUploadResponse,
-    dependencies=[Depends(event_rate_limit)],
+    # ENG-159: the events:write verb gate runs FIRST (a scope-less bot 403s
+    # before consuming a rate-limit slot); humans (scopes=None) bypass it.
+    dependencies=[Depends(require_scope("events:write")), Depends(event_rate_limit)],
 )
 async def upload_batch(request: Request, ctx: CurrentAuth, db: DbSession) -> BatchUploadResponse:
     """Validate, sequence, and idempotently store a batch of client events (§3.2).
