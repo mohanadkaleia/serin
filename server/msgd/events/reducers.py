@@ -14,8 +14,11 @@ reconstructs the full membership/stream state from event bodies alone — the
 required replay property (D4).
 
 ``message.created`` has **no reducer** in ENG-65 (message projection is ENG-66+).
-``bot.installed`` / ``bot.removed`` are M5 — not registered.  Types with no
-reducer are dispatched as no-ops so the table is total.
+``bot.installed`` / ``bot.removed`` (M5, ENG-159) are explicit no-ops: the bot's
+``users`` row + ``bot_tokens`` are operational state authored by the plugins
+router (like ``user.joined``'s users row), and its stream grants arrive as
+ordinary ``channel.member_added`` events.  Types with no reducer are dispatched
+as no-ops so the table is total.
 """
 
 from __future__ import annotations
@@ -218,6 +221,11 @@ REDUCERS: dict[str, Reducer] = {
     "channel.member_added": _reduce_channel_member_added,
     "channel.member_removed": _reduce_channel_member_removed,
     "dm.created": _reduce_dm_created,
+    # ENG-159: bot lifecycle events touch no streams/stream_members state — the
+    # bot's users/devices/bot_tokens rows are handler-authored operational state
+    # (the user.joined precedent) and grants flow through channel.member_added.
+    "bot.installed": _reduce_noop,
+    "bot.removed": _reduce_noop,
 }
 
 

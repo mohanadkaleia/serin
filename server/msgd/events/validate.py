@@ -95,12 +95,19 @@ _WRITE_MATRIX_TYPES = frozenset(
 #: else-branch below, so a member could forge a cross-user rename; rejecting the
 #: whole server-authored family on upload closes that vector and its latent
 #: siblings (``workspace.created`` / ``user.joined`` / ``user.left``).
+#: SECURITY (ENG-159): ``bot.installed`` / ``bot.removed`` join the family IN THE
+#: SAME PR that registers their payload models — otherwise (not being in
+#: ``_WRITE_MATRIX_TYPES``) they would fall to the D9 ``can_read`` else-branch and
+#: any member who can read workspace-meta could forge a bot install/removal into
+#: the roster fold (the exact ``user.profile_updated`` bug class).
 SERVER_AUTHORED_EVENT_TYPES = frozenset(
     {
         "workspace.created",
         "user.joined",
         "user.left",
         "user.profile_updated",
+        "bot.installed",
+        "bot.removed",
     }
 )
 

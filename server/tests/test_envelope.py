@@ -172,6 +172,8 @@ def _sample_payload(type_: str) -> dict[str, Any]:
         "channel.member_added": {"channel_stream_id": s, "user_id": u},
         "channel.member_removed": {"channel_stream_id": s, "user_id": u},
         "dm.created": {"dm_stream_id": s, "member_user_ids": [u]},
+        "bot.installed": {"bot_user_id": u, "name": "Bee", "scopes": ["events:write"]},
+        "bot.removed": {"bot_user_id": u},
         "file.uploaded": {
             "file_id": ids.new_file_id(),
             "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

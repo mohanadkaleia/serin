@@ -53,7 +53,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from msgd.api.deps import CurrentAuth, require_readable_stream
+from msgd.api.deps import CurrentAuth, require_readable_stream, require_scope
 from msgd.api.problems import ProblemException
 from msgd.api.schemas.events_read import (
     MAX_LIMIT,
@@ -91,7 +91,12 @@ def _invalid_cursor() -> ProblemException:
 _serialize_event = serialize_stored_event
 
 
-@router.get("/events", response_model=EventsPage)
+# ENG-159: decorator dependencies run before the signature's param dependencies,
+# so a scope-less bot gets the honest 403 about its OWN credential before the
+# readable-stream resolution could 404 (no interleaving with the existence gate).
+@router.get(
+    "/events", response_model=EventsPage, dependencies=[Depends(require_scope("events:read"))]
+)
 async def get_events(
     ctx: CurrentAuth,
     db: DbSession,

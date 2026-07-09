@@ -1,0 +1,17 @@
+{
+  "$id": "https://msg.dev/schemas/bot.removed.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``bot.removed`` v1 (\u00a72.2, M5/ENG-159) \u2014 bot deactivation.",
+  "properties": {
+    "bot_user_id": {
+      "title": "Bot User Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "bot_user_id"
+  ],
+  "title": "msg bot.removed payload (v1)",
+  "type": "object"
+}

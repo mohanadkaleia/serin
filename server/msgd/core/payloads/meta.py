@@ -39,12 +39,17 @@ __all__ = [
     "ChannelMemberAddedV1",
     "ChannelMemberRemovedV1",
     "DmCreatedV1",
+    "BotInstalledV1",
+    "BotRemovedV1",
     "build_workspace_created_body",
     "build_user_joined_body",
     "build_user_profile_updated_body",
     "build_channel_created_body",
     "build_channel_member_added_body",
+    "build_channel_member_removed_body",
     "build_dm_created_body",
+    "build_bot_installed_body",
+    "build_bot_removed_body",
 ]
 
 
@@ -212,6 +217,41 @@ class DmCreatedV1(BaseModel):
         for uid in value:
             _require_user_id(uid)
         return value
+
+
+class BotInstalledV1(BaseModel):
+    """Payload for ``bot.installed`` v1 (§2.2, M5/ENG-159) — bot provisioning.
+
+    ``scopes`` is the verb-scope list the admin named at install time (§10:
+    ``events:read`` / ``events:write`` / ``files:write``). Format-validation
+    only, like every meta payload: the CLOSED scope vocabulary is enforced at
+    the HTTP boundary (:mod:`msgd.api.schemas.plugins`), not here — an unknown
+    scope string in a replayed log must not crash a reader (D9 tolerance).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    bot_user_id: str
+    name: str
+    scopes: list[str]
+
+    @field_validator("bot_user_id")
+    @classmethod
+    def _check_bot_user_id(cls, value: str) -> str:
+        return _require_user_id(value)
+
+
+class BotRemovedV1(BaseModel):
+    """Payload for ``bot.removed`` v1 (§2.2, M5/ENG-159) — bot deactivation."""
+
+    model_config = ConfigDict(extra="allow")
+
+    bot_user_id: str
+
+    @field_validator("bot_user_id")
+    @classmethod
+    def _check_bot_user_id(cls, value: str) -> str:
+        return _require_user_id(value)
 
 
 # --- server-authored body builders (ENG-65 D2) -------------------------------
@@ -433,6 +473,115 @@ def build_dm_created_body(
         workspace_id=workspace_id,
         stream_id=dm_stream_id,
         type="dm.created",
+        type_version=1,
+        author_user_id=author_user_id,
+        author_device_id=author_device_id,
+        client_created_at=client_created_at,
+        payload=payload.model_dump(mode="json"),
+    )
+    dumped: dict[str, Any] = body.model_dump(mode="json")
+    return dumped
+
+
+def build_channel_member_removed_body(
+    *,
+    workspace_id: str,
+    stream_id: str,
+    author_user_id: str,
+    author_device_id: str,
+    client_created_at: str,
+    channel_stream_id: str,
+    user_id: str,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Assemble a ``channel.member_removed`` v1 body dict (§2.2).
+
+    Mirror of :func:`build_channel_member_added_body`: §2.2 homing is the
+    CALLER's choice (public channel → workspace-meta; private channel → the
+    channel's own stream), ``payload.channel_stream_id`` is the channel whose
+    ``stream_members`` row the reducer deletes, and ``payload.user_id`` is the
+    removed member. Used by the ``/v1/plugins`` stream-revoke endpoint
+    (ENG-159, server-authored). The model is the source of truth, so
+    ``hash_event(returned dict) == event_hash`` holds by construction (D2).
+    """
+    payload = ChannelMemberRemovedV1(channel_stream_id=channel_stream_id, user_id=user_id)
+    body = Body(
+        event_id=event_id if event_id is not None else ids.new_event_id(),
+        workspace_id=workspace_id,
+        stream_id=stream_id,
+        type="channel.member_removed",
+        type_version=1,
+        author_user_id=author_user_id,
+        author_device_id=author_device_id,
+        client_created_at=client_created_at,
+        payload=payload.model_dump(mode="json"),
+    )
+    dumped: dict[str, Any] = body.model_dump(mode="json")
+    return dumped
+
+
+def build_bot_installed_body(
+    *,
+    workspace_id: str,
+    stream_id: str,
+    author_user_id: str,
+    author_device_id: str,
+    client_created_at: str,
+    bot_user_id: str,
+    name: str,
+    scopes: list[str],
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Assemble a server-authored ``bot.installed`` v1 body dict (§2.2, ENG-159).
+
+    Authored by the ACTING owner/admin (the installer), not the bot — unlike
+    ``user.joined`` (which the joining principal self-authors), installing a bot
+    is an administrative act by an existing member. Homed in ``workspace-meta``
+    (``stream_id``). ``bot.installed`` is in ``SERVER_AUTHORED_EVENT_TYPES``, so
+    this builder + ``emit_event`` is the ONLY way the event ever enters the log
+    — a client upload of this type is rejected ``permission_denied``. The model
+    is the source of truth, so ``hash_event(returned dict) == event_hash`` holds
+    by construction (D2).
+    """
+    payload = BotInstalledV1(bot_user_id=bot_user_id, name=name, scopes=scopes)
+    body = Body(
+        event_id=event_id if event_id is not None else ids.new_event_id(),
+        workspace_id=workspace_id,
+        stream_id=stream_id,
+        type="bot.installed",
+        type_version=1,
+        author_user_id=author_user_id,
+        author_device_id=author_device_id,
+        client_created_at=client_created_at,
+        payload=payload.model_dump(mode="json"),
+    )
+    dumped: dict[str, Any] = body.model_dump(mode="json")
+    return dumped
+
+
+def build_bot_removed_body(
+    *,
+    workspace_id: str,
+    stream_id: str,
+    author_user_id: str,
+    author_device_id: str,
+    client_created_at: str,
+    bot_user_id: str,
+    event_id: str | None = None,
+) -> dict[str, Any]:
+    """Assemble a server-authored ``bot.removed`` v1 body dict (§2.2, ENG-159).
+
+    Mirror of :func:`build_bot_installed_body` — authored by the acting
+    owner/admin who deactivates the bot, homed in ``workspace-meta``, and only
+    ever emitted server-side (``SERVER_AUTHORED_EVENT_TYPES`` rejects a client
+    upload of this type).
+    """
+    payload = BotRemovedV1(bot_user_id=bot_user_id)
+    body = Body(
+        event_id=event_id if event_id is not None else ids.new_event_id(),
+        workspace_id=workspace_id,
+        stream_id=stream_id,
+        type="bot.removed",
         type_version=1,
         author_user_id=author_user_id,
         author_device_id=author_device_id,

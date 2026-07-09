@@ -1,0 +1,30 @@
+{
+  "$id": "https://msg.dev/schemas/bot.installed.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "description": "Payload for ``bot.installed`` v1 (\u00a72.2, M5/ENG-159) \u2014 bot provisioning.\n\n``scopes`` is the verb-scope list the admin named at install time (\u00a710:\n``events:read`` / ``events:write`` / ``files:write``). Format-validation\nonly, like every meta payload: the CLOSED scope vocabulary is enforced at\nthe HTTP boundary (:mod:`msgd.api.schemas.plugins`), not here \u2014 an unknown\nscope string in a replayed log must not crash a reader (D9 tolerance).",
+  "properties": {
+    "bot_user_id": {
+      "title": "Bot User Id",
+      "type": "string"
+    },
+    "name": {
+      "title": "Name",
+      "type": "string"
+    },
+    "scopes": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Scopes",
+      "type": "array"
+    }
+  },
+  "required": [
+    "bot_user_id",
+    "name",
+    "scopes"
+  ],
+  "title": "msg bot.installed payload (v1)",
+  "type": "object"
+}

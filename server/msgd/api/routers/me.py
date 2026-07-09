@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from msgd.api.deps import CurrentAuth
+from msgd.api.deps import CurrentAuth, require_scope
 from msgd.api.schemas.me import MeResponse, UpdateMeRequest
 from msgd.core.payloads import build_user_profile_updated_body
 from msgd.core.time import now_rfc3339
@@ -58,7 +58,16 @@ async def get_me(ctx: CurrentAuth) -> MeResponse:
     return _me_response(ctx.user)
 
 
-@router.patch("/me", response_model=MeResponse)
+# ENG-159 (security review): PATCH /v1/me is a bot-reachable EVENT-LOG WRITE — it
+# emits a server-authored ``user.profile_updated`` meta event — so it carries the
+# same ``events:write`` verb gate as ``POST /v1/events/batch``. Without it a bot
+# holding only ``events:read`` (or no write scope) could rename itself repeatedly
+# and append unbounded meta events (the invariant-8 scope contract). Humans
+# (``scopes is None``) bypass, so the self-rename golden path is unaffected. GET
+# /v1/me stays ungated — it is a pure read of the caller's own identity.
+@router.patch(
+    "/me", response_model=MeResponse, dependencies=[Depends(require_scope("events:write"))]
+)
 async def update_me(req: UpdateMeRequest, ctx: CurrentAuth, db: DbSession) -> MeResponse:
     """Update the caller's own display name; return the updated profile.
 

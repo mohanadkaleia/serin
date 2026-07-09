@@ -29,6 +29,7 @@ from msgd.api.routers import (
     files,
     health,
     me,
+    plugins,
     prefs,
     read_state,
     search,
@@ -114,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(auth.router)
     app.include_router(admin.router)
+    app.include_router(plugins.router)  # ENG-159: /v1/plugins (bots + bot tokens, owner/admin)
     app.include_router(me.router)  # self-profile: GET/PATCH /v1/me (structurally self-only)
     app.include_router(events_upload.router)
     app.include_router(events_read.router)

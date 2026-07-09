@@ -68,6 +68,7 @@ from msgd.api.deps import (
     file_rate_limit,
     get_blob_store,
     get_thumbnail_executor,
+    require_scope,
 )
 from msgd.api.schemas.files import (
     FileBlobResponse,
@@ -157,7 +158,9 @@ def _content_disposition(name: str) -> str:
 @router.post(
     "/files/initiate",
     response_model=FileInitiateResponse,
-    dependencies=[Depends(file_rate_limit)],
+    # ENG-159: files:write verb gate first (a scope-less bot 403s before
+    # consuming a rate-limit slot); humans (scopes=None) bypass it.
+    dependencies=[Depends(require_scope("files:write")), Depends(file_rate_limit)],
 )
 async def initiate_file(
     req: FileInitiateRequest,
@@ -310,7 +313,8 @@ async def initiate_file(
 @router.put(
     "/files/{file_id}/blob",
     response_model=FileBlobResponse,
-    dependencies=[Depends(file_rate_limit)],
+    # ENG-159: same files:write verb gate as initiate (the other write edge).
+    dependencies=[Depends(require_scope("files:write")), Depends(file_rate_limit)],
 )
 async def upload_blob(
     file_id: str,

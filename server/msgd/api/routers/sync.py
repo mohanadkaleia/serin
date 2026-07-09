@@ -52,7 +52,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from msgd.api.deps import CurrentAuth
+from msgd.api.deps import CurrentAuth, require_scope
 from msgd.api.schemas.events_read import SyncResponse, SyncStream
 from msgd.db.engine import get_session
 from msgd.db.models import Stream, StreamMember
@@ -63,7 +63,11 @@ router = APIRouter(prefix="/v1", tags=["sync"])
 DbSession = Annotated[AsyncSession, Depends(get_session)]
 
 
-@router.get("/sync", response_model=SyncResponse)
+# ENG-159: /v1/sync is the read-surface bootstrap, so it shares the events:read
+# verb gate with GET /v1/events (humans — scopes=None — bypass).
+@router.get(
+    "/sync", response_model=SyncResponse, dependencies=[Depends(require_scope("events:read"))]
+)
 async def get_sync(ctx: CurrentAuth, db: DbSession) -> SyncResponse:
     """Return every stream the caller may read + its ``head_seq`` (see module docstring).
 
