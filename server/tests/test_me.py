@@ -21,7 +21,10 @@ from authutil import (
     fetch_stream_events,
     join_token,
 )
+from eventsutil import post_batch, wire_item
 from httpx import AsyncClient
+from msgd.core import ids
+from msgd.core.time import now_rfc3339
 from msgd.db.models import User
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -173,3 +176,121 @@ async def test_patch_me_has_no_cross_user_vector(
         f"/v1/me/{owner['user_id']}", json={"display_name": "Nope"}, headers=h
     )
     assert resp.status_code in (404, 405)
+
+
+# --- forged meta-event upload (PR #91 security review) -------------------------
+
+
+def _meta_body(
+    *,
+    auth: dict[str, Any],
+    home_stream_id: str,
+    type: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """A server-authored meta body forged by a CLIENT (author = the session).
+
+    ``author_user_id`` / ``author_device_id`` / ``workspace_id`` are the caller's
+    own (so the §3.2 session binding passes), but ``type`` is a server-authored
+    meta type a client must never be able to upload.
+    """
+    return {
+        "event_id": ids.new_event_id(),
+        "workspace_id": auth["workspace_id"],
+        "stream_id": home_stream_id,
+        "type": type,
+        "type_version": 1,
+        "author_user_id": auth["user_id"],
+        "author_device_id": auth["device_id"],
+        "client_created_at": now_rfc3339(),
+        "payload": payload,
+    }
+
+
+async def test_forged_profile_updated_upload_is_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A member forging ``user.profile_updated`` to rename the OWNER is rejected.
+
+    This is the impersonation vector from the PR #91 review: the event passes the
+    §3.2 session binding (the member authors it as themselves) but names the owner
+    in ``payload.user_id``. The server MUST reject it (``permission_denied``), append
+    NO event, and leave the owner's name unchanged. Without the server-authored-type
+    guard this returned 200 accepted and renamed the owner on every client.
+    """
+    owner = await do_setup(client)
+    member = await _seed_member(client, owner["token"])
+    meta_stream_id = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta_stream_id is not None
+    before = await fetch_stream_events(db_session, meta_stream_id)
+
+    forged = _meta_body(
+        auth=member,
+        home_stream_id=meta_stream_id,
+        type="user.profile_updated",
+        payload={"user_id": owner["user_id"], "display_name": "PWNED"},
+    )
+    resp = await post_batch(client, member["token"], [wire_item(forged)])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["accepted"] == []
+    assert len(body["rejected"]) == 1
+    assert body["rejected"][0]["code"] == "permission_denied"
+
+    # No event was appended and the victim's name is unchanged.
+    after = await fetch_stream_events(db_session, meta_stream_id)
+    assert len(after) == len(before)
+    owner_row = await db_session.get(User, owner["user_id"])
+    assert owner_row is not None and owner_row.display_name == "The Owner"
+
+
+async def test_forged_profile_updated_upload_by_guest_is_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A guest forging ``user.profile_updated`` is rejected too (whole-family guard)."""
+    owner = await do_setup(client)
+    inv = await create_invite(client, owner["token"], role="guest")
+    guest: dict[str, Any] = (
+        await accept_invite(client, join_token(inv.json()["url"]), email="guest@example.com")
+    ).json()
+    meta_stream_id = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta_stream_id is not None
+
+    forged = _meta_body(
+        auth=guest,
+        home_stream_id=meta_stream_id,
+        type="user.profile_updated",
+        payload={"user_id": owner["user_id"], "display_name": "PWNED"},
+    )
+    resp = await post_batch(client, guest["token"], [wire_item(forged)])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rejected"][0]["code"] == "permission_denied"
+    owner_row = await db_session.get(User, owner["user_id"])
+    assert owner_row is not None and owner_row.display_name == "The Owner"
+
+
+async def test_forged_user_joined_upload_is_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """The whole server-authored family is rejected on upload — e.g. ``user.joined``.
+
+    ``user.joined`` grants membership; a client uploading one is forging authority.
+    Same rejection shape as ``user.profile_updated``.
+    """
+    owner = await do_setup(client)
+    member = await _seed_member(client, owner["token"])
+    meta_stream_id = await fetch_meta_stream_id(db_session, owner["workspace_id"])
+    assert meta_stream_id is not None
+    before = await fetch_stream_events(db_session, meta_stream_id)
+
+    forged = _meta_body(
+        auth=member,
+        home_stream_id=meta_stream_id,
+        type="user.joined",
+        payload={"user_id": ids.new_user_id(), "display_name": "Ghost"},
+    )
+    resp = await post_batch(client, member["token"], [wire_item(forged)])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["rejected"][0]["code"] == "permission_denied"
+    after = await fetch_stream_events(db_session, meta_stream_id)
+    assert len(after) == len(before)

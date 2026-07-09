@@ -147,6 +147,7 @@ export function metaUserEvent(
   seq: number,
   type: 'user.joined' | 'user.left' | 'user.profile_updated',
   payload: { user_id: string; display_name?: string },
+  authorUserId?: string,
 ): EventRow {
   const eventId = `e_${streamId}_${seq}`
   return {
@@ -161,7 +162,9 @@ export function metaUserEvent(
         stream_id: streamId,
         type,
         type_version: 1,
-        author_user_id: payload.user_id,
+        // Defaults to the subject (self-authored, like user.joined); a test may
+        // override it to forge a cross-user rename (author != subject).
+        author_user_id: authorUserId ?? payload.user_id,
         author_device_id: 'd_test',
         client_created_at: '2026-01-01T00:00:00.000Z',
         payload,
