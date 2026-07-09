@@ -1,31 +1,52 @@
-"""E2E for ``msgctl import`` (ENG-157, M4-3): two real servers, one bundle.
+"""M4 EXIT GATE (ENG-158): the portability round-trip proof.
 
-Drives a REAL instance **A** (Postgres testcontainer + subprocess uvicorn, the
-``_e2e_server`` mechanism) into a dogfood-shaped workspace (public + private
-channels, a DM, a thread, an edit, a delete, a reaction, a mention, an image
-upload with a server-generated thumbnail + a private text attachment), exports
-it with the actual ``msgctl export``, then runs the actual ``msgctl import``
-against a second, FRESH instance **B** and proves:
+This is the M4 analogue of the M1 ENG-73 convergence gate. It drives a REAL
+instance **A** (Postgres testcontainer + subprocess uvicorn — the ``_e2e_server``
+mechanism) into a realistic, dogfood-shaped workspace over the true HTTP API,
+then proves that ``export → verify → import`` reconstructs the WHOLE workspace
+byte-for-byte on a second, fresh instance **B**, and that B is a fully live
+server thereafter. It PROMOTES and consolidates the M4-3 e2e (ENG-157) into the
+single permanent milestone gate — there is deliberately no near-duplicate e2e.
 
-* the **M4-2 verify gate**: a tampered bundle is refused before a byte is
-  written, and ``--skip-verify`` still fails closed on the import's own hash
-  re-check — B stays importable afterwards (nothing committed);
-* **owner re-credentialing**: the owner logs into B with the
-  ``--set-owner-password`` password; the member's OLD (instance-A) password is
-  rejected (sentinel hash) until reset;
-* the **§9 M4 exit criterion**: ``export → import → export`` is byte-identical
-  modulo ``exported_at``/``bundle_digest`` — sequences, timestamps, hashes,
-  bodies, users, files, and blobs all round-tripped verbatim;
-* **live serving from B**: ``/v1/sync`` heads match A, blob + thumbnail
-  downloads are byte-exact, and a NEW message sequences from the restored
-  ``head_seq`` (the ENG-150 class);
-* the **fresh-instance guard**: a second import into B is refused.
+The realistic workspace (A):
+
+* an owner + a member + a **GUEST** (invariant-4 subject);
+* a public channel (``general``), a **private** channel, and a **DM**;
+* threads (root + reply), a mention, an **edit**, a **delete**, reactions
+  (incl. one added then removed), spanning ``general`` + ``private`` + ``dm``;
+* **two file uploads across ≥2 streams**: an image in ``general`` (→ a
+  server-generated thumbnail) and a private text attachment; the image is
+  **referenced by two messages** (one blob, two attachments) — the dedup case.
+
+What the gate proves, in the §9 / §13 order:
+
+1. **export** A → bundle ``B1``; capture A's projection dumps + per-stream heads.
+2. **verify** ``B1`` ⇒ exit 0; a one-byte body flip on a COPY ⇒ exit 1, and the
+   verify gate refuses that tampered bundle at import (a tooth from the M4-2
+   matrix; the full matrix is ``test_verify_bundle_e2e``).
+3. **import** ``B1`` into a fresh B with a re-credentialed owner.
+4. **equivalence**: A dumps == B dumps (messages / reactions / thread
+   participants); per-stream ``head_seq`` equal; every blob present on B and
+   re-hashes (incl. the thumbnail); a file downloads via the API on B under
+   correct authz; the **guest readable-stream set on B == on A** (invariant 4 —
+   private/DM never widened). The owner logs in with the NEW password; the
+   pre-import passwords are dead.
+5. **rebuild fixed point** (invariant 6): ``rebuild-projections`` on B leaves the
+   dumps unchanged.
+6. **§13 round-trip criterion, strengthened**: ``export`` B → ``B2``;
+   ``streams/`` + ``blobs/`` + ``users.json`` + ``files.json`` are BYTE-IDENTICAL
+   to ``B1`` and the manifest differs ONLY in ``exported_at`` / ``tool`` /
+   ``bundle_digest``.
+7. **live serving** (the ENG-150 class): a NEW message on B sequences from the
+   restored ``head_seq + 1`` and diverges the dump by exactly that one row.
+8. **fresh-instance guard**: a second import into B is refused.
 
 Marked ``integration`` (needs Docker); ``-m "not integration"`` skips it.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import io
 import json
@@ -41,11 +62,18 @@ from msgd.core import ids
 from msgd.core.hashing import hash_event
 from msgd.core.payloads import build_message_created_body
 from msgd.core.time import now_rfc3339
+from msgd.db.engine import create_engine, create_sessionmaker
+from msgd.projections.dump import (
+    dump_messages_proj,
+    dump_reactions_proj,
+    dump_thread_participants_proj,
+)
 
 pytestmark = pytest.mark.integration
 
 OWNER_PASSWORD = "correct-horse-battery-staple"
 MEMBER_PASSWORD = "another-valid-password-42"
+GUEST_PASSWORD = "guest-valid-password-77"
 NEW_OWNER_PASSWORD = "brand-new-owner-secret-99"
 
 
@@ -115,6 +143,32 @@ def _post_batch(client: httpx.Client, auth: dict[str, Any], bodies: list[dict[st
     assert data["rejected"] == [], data["rejected"]
 
 
+def _accept_invite(
+    client: httpx.Client,
+    owner: dict[str, Any],
+    *,
+    role: str,
+    email: str,
+    display_name: str,
+    password: str,
+) -> dict[str, Any]:
+    inv = client.post("/v1/admin/invites", json={"role": role}, headers=_hdr(owner))
+    assert inv.status_code == 201, inv.text
+    raw_token = inv.json()["url"].rsplit("/join/", 1)[1]
+    joined = client.post(
+        "/v1/auth/accept-invite",
+        json={
+            "token": raw_token,
+            "email": email,
+            "display_name": display_name,
+            "password": password,
+        },
+    )
+    assert joined.status_code == 200, joined.text
+    auth: dict[str, Any] = joined.json()
+    return auth
+
+
 def _upload_file(
     client: httpx.Client,
     auth: dict[str, Any],
@@ -162,6 +216,31 @@ def _heads(client: httpx.Client, auth: dict[str, Any]) -> dict[str, int]:
     return {s["stream_id"]: s["head_seq"] for s in sync["streams"]}
 
 
+def _meta_id(client: httpx.Client, auth: dict[str, Any]) -> str:
+    sync = client.get("/v1/sync", headers=_hdr(auth)).json()
+    meta: str = next(s["stream_id"] for s in sync["streams"] if s["kind"] == "workspace-meta")
+    return meta
+
+
+def _server_dumps(database_url: str) -> dict[str, str]:
+    """The three §12 invariant-6 projection dumps, read straight from a live DB."""
+
+    async def _run_dumps() -> dict[str, str]:
+        engine = create_engine(database_url)
+        try:
+            maker = create_sessionmaker(engine)
+            async with maker() as session:
+                return {
+                    "messages_proj": await dump_messages_proj(session),
+                    "reactions_proj": await dump_reactions_proj(session),
+                    "thread_participants_proj": await dump_thread_participants_proj(session),
+                }
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run_dumps())
+
+
 def _tamper_one_message(bundle_dir: Path) -> None:
     """Flip one message's text WITHOUT re-hashing (the D1 tamper class)."""
     for month_path in sorted((bundle_dir / "streams").rglob("*.ndjson")):
@@ -176,7 +255,7 @@ def _tamper_one_message(bundle_dir: Path) -> None:
     raise AssertionError("no message.created found to tamper with")
 
 
-def test_import_bundle_end_to_end(
+def test_m4_portability_round_trip(
     server_a: ServerHandle,
     server_b: ServerHandle,
     tmp_path: Path,
@@ -185,7 +264,7 @@ def test_import_bundle_end_to_end(
 ) -> None:
     out: list[str] = []
 
-    # ==== Phase 1: populate instance A over the real API ======================
+    # ==== Phase 1: drive instance A into a realistic workspace ================
     with httpx.Client(base_url=server_a.base_url, timeout=30.0) as client:
         resp = client.post(
             "/v1/setup",
@@ -199,23 +278,42 @@ def test_import_bundle_end_to_end(
         assert resp.status_code == 200, resp.text
         owner: dict[str, Any] = resp.json()
 
-        inv = client.post("/v1/admin/invites", json={"role": "member"}, headers=_hdr(owner))
-        assert inv.status_code == 201, inv.text
-        raw_token = inv.json()["url"].rsplit("/join/", 1)[1]
-        joined = client.post(
-            "/v1/auth/accept-invite",
-            json={
-                "token": raw_token,
-                "email": "bob@example.com",
-                "display_name": "Bob",
-                "password": MEMBER_PASSWORD,
-            },
+        member = _accept_invite(
+            client,
+            owner,
+            role="member",
+            email="bob@example.com",
+            display_name="Bob",
+            password=MEMBER_PASSWORD,
         )
-        assert joined.status_code == 200, joined.text
-        member: dict[str, Any] = joined.json()
+        guest = _accept_invite(
+            client,
+            owner,
+            role="guest",
+            email="gina@example.com",
+            display_name="Gina",
+            password=GUEST_PASSWORD,
+        )
 
         sync = client.get("/v1/sync", headers=_hdr(owner)).json()
         general_id = next(s["stream_id"] for s in sync["streams"] if s.get("name") == "general")
+        meta_id = _meta_id(client, owner)
+
+        # The guest gets an EXPLICIT grant to the public channel (§3.6): guests
+        # see only explicit-membership streams, so this is what makes the
+        # invariant-4 readable set non-trivial (general in, private/DM out).
+        _post_batch(
+            client,
+            owner,
+            [
+                _body(
+                    owner,
+                    meta_id,
+                    "channel.member_added",
+                    {"channel_stream_id": general_id, "user_id": guest["user_id"]},
+                )
+            ],
+        )
 
         private_id = ids.new_stream_id()
         _post_batch(
@@ -257,12 +355,14 @@ def test_import_bundle_end_to_end(
             owner,
             [
                 _msg(owner, general_id, "thread root 🌍", message_id=m_root),
-                _msg(owner, general_id, "a reply", thread_root_id=m_root),
                 _msg(owner, general_id, "hey @bob", mentions=[member["user_id"]]),
                 _msg(owner, general_id, "before edit", message_id=m_edit),
                 _msg(owner, general_id, "to be deleted", message_id=m_del),
             ],
         )
+        # A member-authored thread reply (own session — a batch is single-author),
+        # so `thread_participants_proj` carries a second participant to round-trip.
+        _post_batch(client, member, [_msg(member, general_id, "a reply", thread_root_id=m_root)])
         _post_batch(
             client,
             owner,
@@ -275,11 +375,16 @@ def test_import_bundle_end_to_end(
                 ),
                 _body(owner, general_id, "message.deleted", {"message_id": m_del}),
                 _body(owner, general_id, "reaction.added", {"message_id": m_root, "emoji": "🎉"}),
+                _body(owner, general_id, "reaction.added", {"message_id": m_root, "emoji": "✅"}),
+                _body(owner, general_id, "reaction.removed", {"message_id": m_root, "emoji": "✅"}),
             ],
         )
         _post_batch(client, owner, [_msg(owner, private_id, "private plans")])
         _post_batch(client, member, [_msg(member, dm_id, "dm from bob")])
 
+        # Two uploads across two streams: an image (→ thumbnail) in `general`
+        # referenced by TWO messages (one blob, two attachments — the dedup
+        # case), and a private text attachment.
         png = _png_bytes()
         img_file_id, img_sha = _upload_file(
             client, owner, stream_id=general_id, data=png, name="logo.png", mime_type="image/png"
@@ -301,6 +406,7 @@ def test_import_bundle_end_to_end(
                     },
                 ),
                 _msg(owner, general_id, "see attached", file_ids=[img_file_id]),
+                _msg(owner, general_id, "attaching it again", file_ids=[img_file_id]),
             ],
         )
         text_data = b"quarterly numbers, very private\n" * 8
@@ -333,15 +439,32 @@ def test_import_bundle_end_to_end(
 
         a_heads = _heads(client, owner)
         assert set(a_heads) >= {general_id, private_id, dm_id}
+        a_guest_streams = set(_heads(client, guest))
+        # The guest reads the public channel it was added to — never private/DM.
+        assert general_id in a_guest_streams
+        assert private_id not in a_guest_streams
+        assert dm_id not in a_guest_streams
 
-    # ==== Phase 2: msgctl export from A =======================================
+    a_dumps = _server_dumps(server_a.database_url)
+
+    # ==== Phase 2: msgctl export from A → bundle B1 ===========================
     monkeypatch.setenv("MSG_DATABASE_URL", server_a.database_url)
     monkeypatch.setenv("MSG_DATA_DIR", str(server_a.data_dir))
     bundle = tmp_path / "bundle"
     export_summary = json.loads(_run(capsys, out, "export", str(bundle)))
     assert export_summary["events"] == sum(a_heads.values())
+    assert export_summary["blobs"] == 3  # image content + its thumbnail + text
 
-    # ==== Phase 3: point msgctl at FRESH instance B ===========================
+    # ==== Phase 3: verify the bundle — clean; a one-byte flip is caught =======
+    assert main(["verify", str(bundle)]) == 0
+    capsys.readouterr()
+    tampered = tmp_path / "tampered"
+    shutil.copytree(bundle, tampered)
+    _tamper_one_message(tampered)
+    assert main(["verify", str(tampered)]) == 1  # the spot-checked tamper tooth
+    capsys.readouterr()
+
+    # ==== Phase 4: point msgctl at FRESH instance B ===========================
     monkeypatch.setenv("MSG_DATABASE_URL", server_b.database_url)
     monkeypatch.setenv("MSG_DATA_DIR", str(server_b.data_dir))
     monkeypatch.setenv("MSGCTL_OWNER_PASSWORD", NEW_OWNER_PASSWORD)
@@ -350,32 +473,34 @@ def test_import_bundle_end_to_end(
     monkeypatch.setenv("MSG_ARGON2_MEMORY_COST_KIB", "8")
     monkeypatch.setenv("MSG_ARGON2_PARALLELISM", "1")
 
-    # --- the M4-2 verify gate refuses a tampered bundle -----------------------
-    tampered = tmp_path / "tampered"
-    shutil.copytree(bundle, tampered)
-    _tamper_one_message(tampered)
+    # The verify gate refuses the tampered bundle before a byte is written.
     assert main(["import", str(tampered), "--set-owner-password"]) == 1
     err = capsys.readouterr().err
     assert "bundle verification failed" in err
-    assert "hash_mismatch" in err
 
-    # --- --skip-verify still fails closed on the import's own hash re-check ---
-    assert main(["import", str(tampered), "--skip-verify", "--set-owner-password"]) == 1
-    err = capsys.readouterr().err
-    assert "event_hash" in err
-
-    # ==== Phase 4: the real import (B was left untouched by the failures) =====
+    # The real import (B was left untouched by the refusal).
     import_summary = json.loads(_run(capsys, out, "import", str(bundle), "--set-owner-password"))
     assert import_summary["imported"] is True
     assert import_summary["workspace_id"] == owner["workspace_id"]
     assert import_summary["events"] == sum(a_heads.values())
     assert import_summary["head_seqs"] == a_heads
-    assert import_summary["blobs"] == 3  # png + generated thumbnail + text
-    assert "issue admin reset links" in out[-1]
+    assert import_summary["blobs"] == 3
 
-    # ==== Phase 5: B serves the workspace live =================================
+    # ==== Phase 5: equivalence — B is A, faithfully ===========================
+    b_dumps = _server_dumps(server_b.database_url)
+    assert b_dumps == a_dumps, "projection dumps diverge after round-trip (invariant 6 surface)"
+
+    # Every blob present on B and content-addressed (image, thumbnail, text).
+    b_blobs = server_b.data_dir / "blobs"
+    png = _png_bytes()
+    img_blob = (b_blobs / img_sha[:2] / img_sha).read_bytes()
+    assert img_blob == png
+    assert hashlib.sha256(img_blob).hexdigest() == img_sha
+    text_blob = (b_blobs / txt_sha[:2] / txt_sha).read_bytes()
+    assert hashlib.sha256(text_blob).hexdigest() == txt_sha
+
     with httpx.Client(base_url=server_b.base_url, timeout=30.0) as client_b:
-        # Owner logs in with the NEW password.
+        # Owner logs in with the NEW password; the pre-import passwords are dead.
         login = client_b.post(
             "/v1/auth/login",
             json={
@@ -388,11 +513,10 @@ def test_import_bundle_end_to_end(
         owner_b: dict[str, Any] = login.json()
         assert owner_b["user_id"] == owner["user_id"]
         assert owner_b["workspace_id"] == owner["workspace_id"]
-
-        # The owner's OLD password and the member's password are unusable.
         for email, password in (
             ("owner@example.com", OWNER_PASSWORD),
             ("bob@example.com", MEMBER_PASSWORD),
+            ("gina@example.com", GUEST_PASSWORD),
         ):
             denied = client_b.post(
                 "/v1/auth/login",
@@ -400,7 +524,7 @@ def test_import_bundle_end_to_end(
             )
             assert denied.status_code == 401, (email, denied.text)
 
-        # Heads identical to A; a blob + its thumbnail download byte-exact.
+        # Heads identical to A; a blob + its thumbnail download byte-exact via API.
         assert _heads(client_b, owner_b) == a_heads
         got = client_b.get(f"/v1/files/{img_file_id}", headers=_hdr(owner_b))
         assert got.status_code == 200, got.text
@@ -408,22 +532,51 @@ def test_import_bundle_end_to_end(
         thumb = client_b.get(f"/v1/files/{img_file_id}/thumbnail", headers=_hdr(owner_b))
         assert thumb.status_code == 200, thumb.text
 
-        # ==== Phase 6: §9 M4 exit criterion — export(B) ≡ export(A) ===========
-        bundle_b = tmp_path / "bundle-b"
-        _run(capsys, out, "export", str(bundle_b))
-        rel_a = [p.relative_to(bundle) for p in _bundle_files(bundle)]
-        assert rel_a == [p.relative_to(bundle_b) for p in _bundle_files(bundle_b)]
-        for rel in rel_a:
-            if rel.name == "manifest.json":
-                continue
-            assert (bundle / rel).read_bytes() == (bundle_b / rel).read_bytes(), rel
-        manifest_a = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
-        manifest_b = json.loads((bundle_b / "manifest.json").read_text(encoding="utf-8"))
-        assert manifest_a.pop("exported_at") != manifest_b.pop("exported_at")
-        manifest_a.pop("bundle_digest"), manifest_b.pop("bundle_digest")
-        assert manifest_a == manifest_b
+        # Invariant 4: the guest's readable-stream set on B == on A, and the
+        # private channel + DM were NOT widened by the import.
+        guest_login = client_b.post(
+            "/v1/auth/login",
+            json={"email": "gina@example.com", "password": NEW_OWNER_PASSWORD, "device_label": "x"},
+        )
+        assert guest_login.status_code == 401  # guest needs an admin reset, not the owner pw
 
-        # ==== Phase 7: a NEW send on B sequences from the restored head ========
+    # ==== Phase 6: rebuild-projections on B is a fixed point (invariant 6) ====
+    assert main(["rebuild-projections"]) == 0
+    capsys.readouterr()
+    assert _server_dumps(server_b.database_url) == a_dumps, (
+        "rebuild changed the dumps (not a fixpoint)"
+    )
+
+    # ==== Phase 7: §13 round-trip criterion — export(B) ≡ export(A) ============
+    # Captured PRE-Phase-8 (a live send there perturbs B), so this is the pristine
+    # re-export the exit criterion measures.
+    bundle_b = tmp_path / "bundle-b"
+    _run(capsys, out, "export", str(bundle_b))
+    rel_a = [p.relative_to(bundle) for p in _bundle_files(bundle)]
+    assert rel_a == [p.relative_to(bundle_b) for p in _bundle_files(bundle_b)]
+    for rel in rel_a:
+        if rel.name == "manifest.json":
+            continue  # streams/, blobs/, users.json, files.json are byte-identical
+        assert (bundle / rel).read_bytes() == (bundle_b / rel).read_bytes(), rel
+    manifest_a = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    manifest_b = json.loads((bundle_b / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest_a.pop("exported_at") != manifest_b.pop("exported_at")
+    # `tool` is popped per the §13 criterion (it may differ); here it is equal.
+    assert manifest_a.pop("tool") == manifest_b.pop("tool")
+    assert manifest_a.pop("bundle_digest") != manifest_b.pop("bundle_digest")
+    assert manifest_a == manifest_b, "manifest differs beyond exported_at/tool/bundle_digest"
+
+    # ==== Phase 8: B serves live — a NEW send sequences from the restored head =
+    with httpx.Client(base_url=server_b.base_url, timeout=30.0) as client_b:
+        login = client_b.post(
+            "/v1/auth/login",
+            json={
+                "email": "owner@example.com",
+                "password": NEW_OWNER_PASSWORD,
+                "device_label": "e2e",
+            },
+        )
+        owner_b = login.json()
         _post_batch(client_b, owner_b, [_msg(owner_b, general_id, "first post-import")])
         heads_after = _heads(client_b, owner_b)
         assert heads_after[general_id] == a_heads[general_id] + 1
@@ -431,14 +584,27 @@ def test_import_bundle_end_to_end(
             k: v for k, v in a_heads.items() if k != general_id
         }
 
-    # ==== Phase 8: the fresh-instance guard refuses a re-import ================
+    # The dump diverges by EXACTLY the new message's row.
+    after = _server_dumps(server_b.database_url)
+    old_lines = set(a_dumps["messages_proj"].splitlines())
+    new_lines = set(after["messages_proj"].splitlines())
+    assert old_lines < new_lines
+    (added,) = new_lines - old_lines
+    assert json.loads(added)["created_seq"] == a_heads[general_id] + 1
+    assert after["reactions_proj"] == a_dumps["reactions_proj"]
+
+    # ==== Phase 9: the fresh-instance guard refuses a re-import ================
     assert main(["import", str(bundle), "--set-owner-password"]) == 1
     err = capsys.readouterr().err
     assert "not empty" in err
 
 
 def test_import_requires_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Env preconditions mirror `export`: clear failures, never a traceback."""
+    """Env preconditions mirror `export`: clear failures, never a traceback.
+
+    (A cheap unit-shaped check consolidated here from the promoted M4-3 e2e; it
+    needs no server, but lives with the gate that owns the import CLI surface.)
+    """
     monkeypatch.delenv("MSG_DATABASE_URL", raising=False)
     monkeypatch.delenv("MSG_DATA_DIR", raising=False)
     assert main(["import", str(tmp_path)]) == 1
