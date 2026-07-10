@@ -430,7 +430,10 @@ describe('FileManager — M6-3 offline blob tee (ENG-167)', () => {
       authStatus: () => AUTH,
       publishUpload: () => {},
       blobStore: store,
-      lookupFileSha: () => Promise.resolve(sha),
+      lookupFile: () =>
+        Promise.resolve(
+          sha !== undefined ? { sha256: sha, mimeType: 'application/octet-stream' } : undefined,
+        ),
     })
     return { server, manager, store }
   }
@@ -472,5 +475,121 @@ describe('FileManager — M6-3 offline blob tee (ENG-167)', () => {
     const res = await manager.fetch({ file_id: fileId, variant: 'blob' })
     expect(res.blob).not.toBeNull()
     await flush() // nothing to assert beyond "no crash" — no store exists
+  })
+})
+
+describe('FileManager — M6-4 offline degradation (ENG-168)', () => {
+  class MemoryBlobCache implements BlobCache {
+    readonly blobs = new Map<string, Uint8Array>()
+    put(sha256: string, bytes: Uint8Array): Promise<void> {
+      this.blobs.set(sha256, bytes)
+      return Promise.resolve()
+    }
+    get(sha256: string): Promise<Uint8Array | null> {
+      return Promise.resolve(this.blobs.get(sha256) ?? null)
+    }
+    has(sha256: string): Promise<boolean> {
+      return Promise.resolve(this.blobs.has(sha256))
+    }
+  }
+
+  function makeOffline(opts: { store?: MemoryBlobCache; sha?: string } = {}): {
+    manager: FileManager
+    http: FakeHttpClient
+  } {
+    const db = new MemoryDb()
+    const server = new FakeSyncServer()
+    const http = new FakeHttpClient(server)
+    // Model an unreachable server: every byte GET is a fetch reject (status 0).
+    http.getBlob = (path: string) => {
+      http.getBlobCalls.push(path)
+      return Promise.resolve({
+        ok: false as const,
+        error: { status: 0, code: 'network', title: 'Network error' },
+      })
+    }
+    const outbox = new Outbox({ db, http, authStatus: () => AUTH, publishStream: () => {} })
+    const manager = new FileManager({
+      http,
+      outbox,
+      authStatus: () => AUTH,
+      publishUpload: () => {},
+      ...(opts.store
+        ? {
+            blobStore: opts.store,
+            lookupFile: () =>
+              Promise.resolve(
+                opts.sha !== undefined ? { sha256: opts.sha, mimeType: 'text/plain' } : undefined,
+              ),
+          }
+        : {}),
+    })
+    return { manager, http }
+  }
+
+  it('serves a full blob from the offline store with NO network GET (desktop hit)', async () => {
+    const store = new MemoryBlobCache()
+    const sha = 'c'.repeat(64)
+    await store.put(sha, new Uint8Array([1, 2, 3]))
+    const { manager, http } = makeOffline({ store, sha })
+
+    const res = await manager.fetch({ file_id: 'f_hit', variant: 'blob' })
+
+    expect(res.blob).not.toBeNull()
+    expect(res.blob?.size).toBe(3)
+    expect(res.mime_type).toBe('text/plain')
+    expect(http.getBlobCalls).toHaveLength(0) // never touched the network
+  })
+
+  it('an offline-store hit is LRU-cached — a repeat fetch re-reads neither store nor net', async () => {
+    const store = new MemoryBlobCache()
+    const sha = 'c'.repeat(64)
+    await store.put(sha, new Uint8Array([7]))
+    const { manager, http } = makeOffline({ store, sha })
+
+    await manager.fetch({ file_id: 'f_hit', variant: 'blob' })
+    store.blobs.clear() // the LRU must answer the repeat, not the store
+    const res = await manager.fetch({ file_id: 'f_hit', variant: 'blob' })
+
+    expect(res.blob?.size).toBe(1)
+    expect(http.getBlobCalls).toHaveLength(0)
+  })
+
+  it('a local MISS while unreachable throws the coded `offline` error (desktop)', async () => {
+    const { manager } = makeOffline({ store: new MemoryBlobCache(), sha: 'd'.repeat(64) })
+    await expect(manager.fetch({ file_id: 'f_miss', variant: 'blob' })).rejects.toMatchObject({
+      code: 'offline',
+    })
+  })
+
+  it('thumbnails (never teed) throw the coded `offline` error while unreachable', async () => {
+    const store = new MemoryBlobCache()
+    const sha = 'c'.repeat(64)
+    await store.put(sha, new Uint8Array([1]))
+    const { manager } = makeOffline({ store, sha })
+    await expect(manager.fetch({ file_id: 'f_hit', variant: 'thumbnail' })).rejects.toMatchObject({
+      code: 'offline',
+    })
+  })
+
+  it('web (no store): unreachable throws `offline`; a plain 404 still folds to blob:null', async () => {
+    const { manager } = makeOffline()
+    await expect(manager.fetch({ file_id: 'f_any', variant: 'blob' })).rejects.toMatchObject({
+      code: 'offline',
+    })
+
+    // A server-spoken 404 (online) keeps the pre-M6-4 null-blob fold.
+    const db = new MemoryDb()
+    const server = new FakeSyncServer()
+    const http = new FakeHttpClient(server)
+    const outbox = new Outbox({ db, http, authStatus: () => AUTH, publishStream: () => {} })
+    const online = new FileManager({
+      http,
+      outbox,
+      authStatus: () => AUTH,
+      publishUpload: () => {},
+    })
+    const res = await online.fetch({ file_id: 'f_unknown', variant: 'blob' })
+    expect(res.blob).toBeNull()
   })
 })

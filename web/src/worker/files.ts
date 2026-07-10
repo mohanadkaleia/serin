@@ -34,18 +34,19 @@
 import { sha256Hex } from '../core'
 
 import { backoffDelay, OUTBOX_BASE_MS, OUTBOX_CAP_MS } from './backoff'
-import type { ApiError, HttpClient } from './http'
+import { isOfflineError, type ApiError, type HttpClient } from './http'
 import type { BlobCache } from './mirror/seams'
 import type { Outbox } from './outbox'
 import type { TimerId } from './sync'
-import type {
-  AuthStatus,
-  AvatarFetchResult,
-  FileFetchResult,
-  FileUploadParams,
-  UploadAck,
-  UploadPhase,
-  UploadProgress,
+import {
+  RpcCodedError,
+  type AuthStatus,
+  type AvatarFetchResult,
+  type FileFetchResult,
+  type FileUploadParams,
+  type UploadAck,
+  type UploadPhase,
+  type UploadProgress,
 } from './types'
 
 /** The `POST /v1/files/initiate` 200 body (server: schemas/files.py). */
@@ -89,13 +90,15 @@ export interface FileManagerDeps {
   cacheMaxBytes?: number
   /**
    * M6-3 (ENG-167, desktop): the content-addressed offline blob store. When
-   * present (with {@link lookupFileSha}), a fetched full blob is VERIFIED
-   * against its projected sha256 and teed in, best-effort — so attachments the
-   * user has viewed open offline. Absent on the web → inert.
+   * present (with {@link lookupFile}), a fetched full blob is VERIFIED against
+   * its projected sha256 and teed in, best-effort — so attachments the user has
+   * viewed open offline; M6-4 (ENG-168) also SERVES `file.fetch` from it (the
+   * bytes are verified-at-tee, content-addressed, immutable), which is the
+   * offline read path. Absent on the web → inert.
    */
   blobStore?: BlobCache
-  /** Resolve a `file_id` to its projected sha256 (the tee key + integrity check). */
-  lookupFileSha?: (fileId: string) => Promise<string | undefined>
+  /** Resolve a `file_id` to its projected sha256 + mime (tee key + offline serve). */
+  lookupFile?: (fileId: string) => Promise<{ sha256: string; mimeType: string } | undefined>
 }
 
 /**
@@ -119,7 +122,8 @@ export class FileManager {
   private readonly cacheMax: number
   private readonly cacheMaxBytes: number
   private readonly blobStore: BlobCache | undefined
-  private readonly lookupFileSha: ((fileId: string) => Promise<string | undefined>) | undefined
+  private readonly lookupFile:
+    ((fileId: string) => Promise<{ sha256: string; mimeType: string } | undefined>) | undefined
 
   /** Live jobs by tab-minted `upload_id`. Terminal `done` jobs are dropped; a
    *  `failed` job is KEPT so `file.retry` can restart it. */
@@ -141,7 +145,7 @@ export class FileManager {
     this.cacheMax = deps.cacheMax ?? BLOB_CACHE_MAX
     this.cacheMaxBytes = deps.cacheMaxBytes ?? BLOB_CACHE_MAX_BYTES
     this.blobStore = deps.blobStore
-    this.lookupFileSha = deps.lookupFileSha
+    this.lookupFile = deps.lookupFile
   }
 
   /** Count of live upload jobs (diagnostic/test read — not part of the RPC surface). */
@@ -203,9 +207,15 @@ export class FileManager {
   /**
    * Fetch a file's bytes (`file.fetch`) — the full blob or the server-generated
    * thumbnail. Served from a bounded worker-side LRU so repeated renders don't
-   * re-GET; a 404 (absent / unreadable / no thumbnail — the server's uniform
-   * not-found) returns a `null` blob and is NOT cached (a later upload can populate
-   * it). The token rides the worker-side bearer; only bytes cross back to the tab.
+   * re-GET; on the desktop a full blob is next served from the content-addressed
+   * offline store (M6-4 — the bytes were sha-VERIFIED at tee time and content
+   * addressing makes them immutable, so a local hit needs no revalidation and is
+   * the offline read path). A 404 (absent / unreadable / no thumbnail — the
+   * server's uniform not-found) returns a `null` blob and is NOT cached (a later
+   * upload can populate it). An UNREACHABLE server on a local miss throws the
+   * coded `offline` error (the ENG-168 degradation matrix — the UI renders
+   * "available when online", never an unhandled throw). The token rides the
+   * worker-side bearer; only bytes cross back to the tab.
    */
   async fetch(params: {
     file_id: string
@@ -215,12 +225,30 @@ export class FileManager {
     const cached = this.cacheGet(key)
     if (cached) return { blob: cached.blob, mime_type: cached.mimeType }
 
+    // M6-4: the offline store serves full blobs (thumbnails are never teed —
+    // their digest is server-side only, so they stay network-fetched).
+    if (params.variant === 'blob') {
+      const local = await this.fromBlobStore(params.file_id)
+      if (local) {
+        this.cachePut(key, local)
+        return { blob: local.blob, mime_type: local.mimeType }
+      }
+    }
+
     const path =
       params.variant === 'thumbnail'
         ? `/v1/files/${params.file_id}/thumbnail`
         : `/v1/files/${params.file_id}`
     const res = await this.http.getBlob(path)
-    if (!res.ok) return { blob: null }
+    if (!res.ok) {
+      if (isOfflineError(res.error)) {
+        throw new RpcCodedError(
+          'offline',
+          'file bytes are not cached locally; available when online',
+        )
+      }
+      return { blob: null }
+    }
     this.cachePut(key, res.value)
     // M6-3: tee the full blob (not thumbnails — their digest is server-side
     // only) into the offline store, fire-and-forget. Live verify does not
@@ -230,15 +258,36 @@ export class FileManager {
   }
 
   /**
+   * Read a full blob from the content-addressed offline store (M6-4, desktop):
+   * resolve the file's projected sha + mime, and serve the stored bytes when
+   * present. Best-effort — any failure is a miss (the network path follows),
+   * never an error. Inert on the web (no store configured).
+   */
+  private async fromBlobStore(
+    fileId: string,
+  ): Promise<{ blob: Blob; mimeType: string } | undefined> {
+    if (!this.blobStore || !this.lookupFile) return undefined
+    try {
+      const meta = await this.lookupFile(fileId)
+      if (!meta) return undefined
+      const bytes = await this.blobStore.get(meta.sha256)
+      if (!bytes) return undefined
+      return { blob: new Blob([bytes.slice().buffer]), mimeType: meta.mimeType }
+    } catch {
+      return undefined // best-effort — fall through to the network
+    }
+  }
+
+  /**
    * Verify a downloaded blob against its projected sha256 and store it
    * content-addressed (M6-3, desktop). Unverifiable or mismatching bytes are
    * NEVER stored (the on-disk store must stay `verify`-clean); every failure
    * is swallowed — an offline cache must not break the fetch path.
    */
   private async teeToBlobStore(fileId: string, blob: Blob): Promise<void> {
-    if (!this.blobStore || !this.lookupFileSha) return
+    if (!this.blobStore || !this.lookupFile) return
     try {
-      const sha = await this.lookupFileSha(fileId)
+      const sha = (await this.lookupFile(fileId))?.sha256
       if (!sha) return
       if (await this.blobStore.has(sha)) return
       const bytes = new Uint8Array(await blob.arrayBuffer())

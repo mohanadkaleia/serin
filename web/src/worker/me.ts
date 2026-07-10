@@ -18,11 +18,21 @@
 
 import { RpcCodedError, type MeProfile, type MeUpdateParams } from './types'
 
-import type { ApiResult, HttpClient } from './http'
+import { isOfflineError, type ApiResult, type HttpClient } from './http'
 
-/** Fold an `ApiResult` failure into a coded RPC error (admin.ts precedent). */
+/**
+ * Fold an `ApiResult` failure into a coded RPC error (admin.ts precedent).
+ * ENG-168 (M6-4): an unreachable server folds to the uniform `offline` code —
+ * `/v1/me` is live server truth with no local mirror, so the UI renders
+ * "available when online", never a crash.
+ */
 function unwrap<T>(res: ApiResult<T>): T {
-  if (!res.ok) throw new RpcCodedError(res.error.code, res.error.title)
+  if (!res.ok) {
+    if (isOfflineError(res.error)) {
+      throw new RpcCodedError('offline', 'available when online')
+    }
+    throw new RpcCodedError(res.error.code, res.error.title)
+  }
   return res.value
 }
 

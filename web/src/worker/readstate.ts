@@ -64,19 +64,50 @@ export class ReadStateManager {
   }
 
   /**
-   * Seed the local mirror from `GET /v1/read-state` (rising-edge-into-`live`).
-   * Monotonic-upsert each stream's `last_read_seq`; `head_seq`/`unread` are IGNORED
-   * (badges recompute unread locally off `streams.head_seq`). A failed fetch is a
-   * no-op — the next live edge retries. Publishes each stream whose value advanced.
+   * Reconcile the local mirror with `GET /v1/read-state` (rising-edge-into-
+   * `live`), in BOTH directions:
+   *
+   *   • PULL — monotonic-upsert each server stream's `last_read_seq` locally;
+   *     `head_seq`/`unread` are IGNORED (badges recompute unread locally off
+   *     `streams.head_seq`).
+   *   • RE-PUSH (ENG-168, M6-4) — any LOCAL marker strictly AHEAD of (or absent
+   *     from) the server snapshot is an offline `readState.mark` whose PUT never
+   *     landed: PUT it now so other devices' badges converge. STATELESS by
+   *     design — no dirty-set to persist or lose; the local-vs-server diff IS
+   *     the record, so it survives a full restart between the offline mark and
+   *     the reconnect. The server GREATEST-merges, so a racing higher mark from
+   *     another device still wins (the echoed effective value is adopted).
+   *
+   * A failed fetch is a no-op — the next live edge retries. Publishes each
+   * stream whose value advanced.
    */
   async bootstrap(): Promise<void> {
     const res = await this.http.get<ReadStateGetResponse>('/v1/read-state')
     if (!res.ok) return
+    const serverSeqs = new Map<string, number>()
     for (const row of res.value.streams) {
       if (typeof row.stream_id !== 'string' || typeof row.last_read_seq !== 'number') continue
+      serverSeqs.set(row.stream_id, row.last_read_seq)
       if (await this.upsertMonotonic(row.stream_id, row.last_read_seq)) {
         this.publishStream(row.stream_id)
       }
+    }
+    // Re-push locally-advanced markers (the offline-mark gap). Read the local
+    // rows AFTER the pull above so a stream the server already leads is never
+    // re-pushed (local == server there; strict `>` filters it out).
+    for (const local of await this.db.listReadState()) {
+      const server = serverSeqs.get(local.stream_id)
+      if (server !== undefined && local.last_read_seq <= server) continue
+      const put = await this.http.put<ReadStatePutResponse>('/v1/read-state', {
+        stream_id: local.stream_id,
+        last_read_seq: local.last_read_seq,
+      })
+      if (put.ok && typeof put.value.last_read_seq === 'number') {
+        if (await this.upsertMonotonic(local.stream_id, put.value.last_read_seq)) {
+          this.publishStream(local.stream_id)
+        }
+      }
+      // A failed PUT keeps the local value; the next live edge re-diffs + retries.
     }
   }
 

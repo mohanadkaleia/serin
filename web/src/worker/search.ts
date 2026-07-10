@@ -18,7 +18,7 @@
 
 import { RpcCodedError, type MsgDb, type SearchParams, type SearchResult } from './types'
 
-import type { HttpClient } from './http'
+import { isOfflineError, type HttpClient } from './http'
 
 /**
  * Run `GET /v1/search`, URL-encoding only the DEFINED params (`q` is always sent;
@@ -43,6 +43,12 @@ export async function searchMessages(
 
   const res = await http.get<SearchResult>(`/v1/search?${qs.toString()}`)
   if (!res.ok) {
+    // ENG-168 (M6-4): an unreachable server folds to the uniform `offline` code.
+    // Only the HTTP path can hit this — the SqliteDb (fts:true) route answers
+    // search locally and never touches the network.
+    if (isOfflineError(res.error)) {
+      throw new RpcCodedError('offline', 'available when online')
+    }
     throw new RpcCodedError(res.error.code, res.error.title)
   }
   return {

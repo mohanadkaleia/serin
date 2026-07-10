@@ -95,6 +95,62 @@ describe('ReadStateManager (ENG-126 synced-KV, monotonic)', () => {
   })
 })
 
+describe('ReadStateManager — offline read-marker RE-PUSH on reconnect (ENG-168, M6-4)', () => {
+  it('bootstrap re-pushes a locally-advanced marker the server missed (offline mark)', async () => {
+    const h = makeHarness(new MemoryDb())
+    // An offline `mark` advanced the local mirror to 9, but its PUT never landed;
+    // the server still holds 4 (stateless: this survives a full app restart).
+    await h.db.upsertReadStateMonotonic('s1', 9)
+    h.server.readState.set('s1', 4)
+
+    await h.mgr.bootstrap()
+
+    expect(h.http.putCalls).toContainEqual({
+      path: '/v1/read-state',
+      body: { stream_id: 's1', last_read_seq: 9 },
+    })
+    expect(h.server.readState.get('s1')).toBe(9) // server converged
+    expect((await h.db.getReadState('s1'))?.last_read_seq).toBe(9) // never rewound
+  })
+
+  it('bootstrap pushes a marker the server has never seen at all', async () => {
+    const h = makeHarness(new MemoryDb())
+    await h.db.upsertReadStateMonotonic('s_new', 3)
+
+    await h.mgr.bootstrap()
+
+    expect(h.server.readState.get('s_new')).toBe(3)
+  })
+
+  it('does NOT re-push when the server is ahead or equal (pull-only path)', async () => {
+    const h = makeHarness(new MemoryDb())
+    await h.db.upsertReadStateMonotonic('s1', 5) // server leads
+    await h.db.upsertReadStateMonotonic('s2', 7) // server equal
+    h.server.readState.set('s1', 12)
+    h.server.readState.set('s2', 7)
+
+    await h.mgr.bootstrap()
+
+    expect(h.http.putCalls).toHaveLength(0) // nothing to re-push
+    expect((await h.db.getReadState('s1'))?.last_read_seq).toBe(12) // pulled
+    expect((await h.db.getReadState('s2'))?.last_read_seq).toBe(7)
+  })
+
+  it('adopts the server GREATEST when the re-push races a higher remote mark', async () => {
+    const h = makeHarness(new MemoryDb())
+    await h.db.upsertReadStateMonotonic('s1', 9)
+    // Another device marks 15 between our GET and our PUT: model it as the
+    // server already holding 15 when the PUT lands (absent from the GET is not
+    // representable with this fake, so pre-set after crafting the local lead).
+    h.server.readState.set('s1', 15)
+    // The GET will pull 15 locally first (monotonic), so no push happens — the
+    // strict local>server diff is what makes the race benign either way.
+    await h.mgr.bootstrap()
+    expect((await h.db.getReadState('s1'))?.last_read_seq).toBe(15)
+    expect(h.server.readState.get('s1')).toBe(15)
+  })
+})
+
 describe.each([
   { name: 'MemoryDb', make: (): Promise<MsgDb> => Promise.resolve(new MemoryDb()) },
   { name: 'DexieDb', make: (): Promise<MsgDb> => openDb(fakeIdbOptions()) },

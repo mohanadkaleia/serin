@@ -30,6 +30,7 @@ import { EphemeralState } from './presence'
 import { PrefsManager, isPrefLevel } from './prefs'
 import { ReadStateManager } from './readstate'
 import { searchLocalMessages, searchMessages } from './search'
+import type { SecretStore } from './secret-store'
 import {
   applyEventsToProjection,
   getMessage,
@@ -189,9 +190,28 @@ export interface WorkerCoreOptions {
   mirror?: WorkspaceMirror
   /**
    * M6-3 (ENG-167) content-addressed offline blob store (desktop). `file.fetch`
-   * tees verified downloaded bytes into it so attachments open offline.
+   * tees verified downloaded bytes into it — and serves from it (M6-4) — so
+   * attachments open offline.
    */
   blobStore?: BlobCache
+  /**
+   * M6-4 (ENG-168): where the session token rests. Default: the Dexie-backed
+   * `MetaSecretStore` over this core's db — the SAME `meta` rows as before, so
+   * the WEB target is unchanged. Desktop cores MUST inject a platform store
+   * (OS keychain in M6-5; in-memory in tests) — the token must never live in
+   * `projections.sqlite3` inside the portable workspace folder, and
+   * `SqliteDb.metaPut` refuses it fail-closed if this is mis-wired.
+   */
+  secretStore?: SecretStore
+  /**
+   * M6-4 (ENG-168): connectivity snapshot for the sync engine (`navigator.
+   * onLine` semantics). When it reports `false` at start, the engine parks
+   * `degraded('offline')` WITHOUT dialing — the cold OFFLINE boot path: init
+   * still restores the session (SecretStore is local) and every query/search/
+   * send answers locally; {@link WorkerCore.notifyOnline} reconnects. Default
+   * assumes online (the web transports rely on WS backoff to ride out drops).
+   */
+  isOnline?: () => boolean
 }
 
 export class WorkerCore {
@@ -244,7 +264,10 @@ export class WorkerCore {
         },
       })
     this.http = http
-    this.auth = new AuthManager(db, http)
+    // M6-4 (ENG-168): the token's at-rest home rides the SecretStore seam —
+    // Dexie `meta` by default (web, unchanged), an injected platform store on
+    // the desktop (never inside the portable workspace folder).
+    this.auth = new AuthManager(db, http, options.secretStore)
     this.fullMirror = options.fullMirror ?? false
     this.mirror = options.mirror
     this.sync = new SyncEngine({
@@ -255,6 +278,9 @@ export class WorkerCore {
       // M6-3 (ENG-167): full-mirror + on-disk NDJSON mirror, desktop-only knobs.
       fullMirror: this.fullMirror,
       ...(this.mirror ? { mirror: this.mirror } : {}),
+      // M6-4 (ENG-168): connectivity snapshot — a cold OFFLINE boot parks the
+      // engine degraded without dialing; notifyOnline() reconnects.
+      ...(options.isOnline ? { isOnline: options.isOnline } : {}),
       // ENG-126: route the four signal frames OUT of the event-sync path. The
       // handler shape-validates each arm defensively (D9); a malformed frame is
       // ignored, never crashing the socket or entering the cursor machinery.
@@ -287,12 +313,16 @@ export class WorkerCore {
       // Fan an upload-progress frame to the tab that subscribed on this upload_id.
       publishUpload: (uploadId, progress) =>
         this.publish({ kind: 'upload', upload_id: uploadId }, progress),
-      // M6-3: tee verified downloaded bytes into the content-addressed offline
-      // blob store (desktop only; the sha lookup rides the `files` projection).
+      // M6-3/M6-4: tee verified downloaded bytes into — and serve `file.fetch`
+      // from — the content-addressed offline blob store (desktop only; the
+      // sha/mime lookup rides the `files` projection).
       ...(options.blobStore
         ? {
             blobStore: options.blobStore,
-            lookupFileSha: async (fileId: string) => (await this.db.getFile(fileId))?.sha256,
+            lookupFile: async (fileId: string) => {
+              const row = await this.db.getFile(fileId)
+              return row ? { sha256: row.sha256, mimeType: row.mime_type } : undefined
+            },
           }
         : {}),
     })
@@ -417,6 +447,21 @@ export class WorkerCore {
    */
   getToken(): string | null {
     return this.auth.getToken()
+  }
+
+  /**
+   * M6-4 (ENG-168) connectivity edges, delegated to the sync engine. The shell
+   * that owns this core (a transport's `online`/`offline` listener, or the
+   * desktop host) calls these; `notifyOnline` reconnects a degraded engine
+   * immediately, whose rising edge into `live` then drains the outbox and
+   * re-pushes locally-advanced read markers (onSyncStatus).
+   */
+  notifyOnline(): void {
+    this.sync.notifyOnline()
+  }
+
+  notifyOffline(): void {
+    this.sync.notifyOffline()
   }
 
   /**

@@ -57,6 +57,7 @@ import {
   type Body,
 } from '../../src/core'
 import { WorkerCore } from '../../src/worker/core'
+import { MemorySecretStore } from '../../src/worker/secret-store'
 import { NodeEventLog, NodeManifestStore } from '../../src/worker/mirror/node-fs'
 import { eventNdjsonLine } from '../../src/worker/mirror/serialize'
 import { WorkspaceMirror } from '../../src/worker/mirror/workspace-mirror'
@@ -136,6 +137,10 @@ const sMeta = newStreamId()
 const sGeneral = newStreamId()
 const sRandom = newStreamId()
 const FILE_SHA = 'a'.repeat(64)
+
+// M6-4 (ENG-168): the desktop session token rests in the SecretStore, NEVER in
+// projections.sqlite3 (SqliteDb.metaPut refuses it). The gate seeds it here.
+const secrets = new MemorySecretStore()
 
 /** Wrap a hashed body into the served wire envelope at (seq, received_at). */
 async function serve(body: Body, seq: number, receivedAt: string): Promise<WireEvent> {
@@ -351,6 +356,7 @@ async function bootDesktop(
     wsFactory: ws.wsFactory,
     fullMirror: true,
     mirror,
+    secretStore: secrets, // M6-4: token OUT of the workspace folder
   })
   await core.init() // restores the seeded session → sync.start()
   ws.last().open()
@@ -359,7 +365,7 @@ async function bootDesktop(
 
 async function seedSession(db: SqliteDb): Promise<void> {
   await db.metaPut(META_PROJECTION_VERSION, PROJECTION_VERSION)
-  await db.metaPut(META_SESSION_TOKEN, 'tok_secret')
+  await secrets.set(META_SESSION_TOKEN, 'tok_secret')
   await db.metaPut(META_MY_USER_ID, meUserId)
   await db.metaPut(META_WORKSPACE_ID, wsId)
   await db.metaPut(META_ROLE, 'member')

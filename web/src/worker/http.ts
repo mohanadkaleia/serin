@@ -357,6 +357,17 @@ function parseRetryAfter(header: string | null): number | undefined {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined
 }
 
+/**
+ * Whether an `ApiError` means the server was UNREACHABLE (a fetch reject:
+ * offline / DNS / connection drop) rather than a server-spoken failure. The
+ * ENG-168 degradation matrix maps this — and only this — to the UI-facing
+ * `offline` code ("available when online"); a `timeout` (server slow but
+ * reachable) and every HTTP-status error keep their own codes.
+ */
+export function isOfflineError(error: ApiError): boolean {
+  return error.status === 0 && error.code === 'network'
+}
+
 /** A fetch reject (offline / DNS / connection drop) — status 0, never a throw. */
 const NETWORK_ERROR: ApiError = { status: 0, code: 'network', title: 'Network error' }
 

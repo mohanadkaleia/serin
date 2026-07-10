@@ -21,21 +21,22 @@
 // holds for search: rebuild ≡ incremental). `capabilities.fts` is true here;
 // WorkerCore routes `search` to the local index on that flag.
 
-import type {
-  CursorRow,
-  EventRow,
-  FileRow,
-  FtsSearchOptions,
-  MessageRow,
-  MsgDb,
-  OutboxRow,
-  PrefsRow,
-  ReactionRow,
-  ReadStateRow,
-  SearchHit,
-  StreamRow,
-  TableName,
-  ThreadParticipantRow,
+import {
+  META_SESSION_TOKEN,
+  type CursorRow,
+  type EventRow,
+  type FileRow,
+  type FtsSearchOptions,
+  type MessageRow,
+  type MsgDb,
+  type OutboxRow,
+  type PrefsRow,
+  type ReactionRow,
+  type ReadStateRow,
+  type SearchHit,
+  type StreamRow,
+  type TableName,
+  type ThreadParticipantRow,
 } from '../types'
 
 import type { SqlDriver, SqlValue } from './driver'
@@ -188,6 +189,18 @@ export class SqliteDb implements MsgDb {
   }
 
   async metaPut(key: string, value: unknown): Promise<void> {
+    // ENG-168 (M6-4) fail-closed guard: this database file
+    // (`projections.sqlite3`) lives INSIDE the portable workspace folder — the
+    // folder users hand to `msgctl verify` / zip / sync. The bearer token must
+    // NEVER be written into it, not even by accident: the AuthManager routes
+    // the token through the SecretStore seam, and this guard makes any other
+    // path a loud error instead of a silent credential leak.
+    if (key === META_SESSION_TOKEN) {
+      throw new Error(
+        'SqliteDb.metaPut: refusing to store the session token in projections.sqlite3 ' +
+          '(it sits inside the portable workspace folder); route it through the SecretStore (ENG-168)',
+      )
+    }
     await this.driver.execute(`INSERT OR REPLACE INTO meta (key, data) VALUES (?, ?)`, [
       key,
       JSON.stringify({ v: value }),

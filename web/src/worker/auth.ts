@@ -1,13 +1,17 @@
 // worker/auth.ts — the AuthManager (ENG-78, R6): the single owner of the session
 // token, worker-side. It drives the server auth endpoints via the injected
-// HttpClient, persists the session + device_id in the Dexie `meta` table for
-// reload survival, and exposes the token ONLY worker-internally — to the HTTP
-// client (Authorization: Bearer) and, later, the ENG-79 WS connect.
+// HttpClient, persists the session identity in the `meta` table and the TOKEN
+// through the {@link SecretStore} seam (ENG-168, M6-4) for reload survival, and
+// exposes the token ONLY worker-internally — to the HTTP client
+// (Authorization: Bearer) and the ENG-79 WS connect.
 //
 // The token lives in exactly two places, both worker-side: this manager's
-// in-memory `session` and the `meta` KV rows. It is NEVER returned to a tab over
-// RPC, rendered, or logged (R1). `login/setup/acceptInvite/status` return
-// token-free results.
+// in-memory `session` and the SecretStore. On the WEB the default store is the
+// Dexie-backed {@link MetaSecretStore} — the SAME `meta` KV rows as before
+// M6-4, byte-for-byte. On the DESKTOP an injected platform store keeps it OUT
+// of the portable workspace folder (`SqliteDb.metaPut` additionally REFUSES the
+// token key, fail-closed). It is NEVER returned to a tab over RPC, rendered, or
+// logged (R1). `login/setup/acceptInvite/status` return token-free results.
 //
 // ── ENG-79 (sync engine, worker-side ONLY) — WS connect contract (R8, TDD §3.3):
 //     const token = auth.getToken()
@@ -16,6 +20,7 @@
 //   in ENG-78; this manager only exposes `getToken()` for that later path.
 
 import type { ApiError, HttpClient } from './http'
+import { MetaSecretStore, type SecretStore } from './secret-store'
 import {
   META_DEVICE_ID,
   META_MY_USER_ID,
@@ -53,18 +58,28 @@ interface SessionState {
 
 export class AuthManager {
   private session: SessionState | null = null
+  /** Where the token rests (ENG-168): Dexie `meta` on web, platform store on desktop. */
+  private readonly secrets: SecretStore
 
   constructor(
     private readonly db: MsgDb,
     private readonly http: HttpClient,
-  ) {}
+    secrets?: SecretStore,
+  ) {
+    // Default = the web adapter: token in the Dexie `meta` rows, exactly as
+    // before M6-4. Desktop cores MUST inject a platform store (SqliteDb.metaPut
+    // refuses the token key, so the default fails closed there — loudly).
+    this.secrets = secrets ?? new MetaSecretStore(db)
+  }
 
   /**
-   * Hydrate the in-memory session from `meta` (run in WorkerCore.init after the
-   * projection-version check). Enables reload persistence (R6).
+   * Hydrate the in-memory session from the SecretStore (token) + `meta`
+   * (identity), run in WorkerCore.init after the projection-version check.
+   * Enables reload persistence (R6). Fully LOCAL — no network round trip, so a
+   * cold OFFLINE boot still restores the session (M6-4).
    */
   async restore(): Promise<void> {
-    const token = await this.db.metaGet<string>(META_SESSION_TOKEN)
+    const token = await this.secrets.get(META_SESSION_TOKEN)
     if (!token) return
     const [myUserId, workspaceId, role, expiresAt] = await Promise.all([
       this.db.metaGet<string>(META_MY_USER_ID),
@@ -179,14 +194,15 @@ export class AuthManager {
   }
 
   /**
-   * Drop the in-memory token and the session `meta` rows. KEEPS `device_id`
-   * (browser-install identity, reused on next login). Wired as the HTTP client's
-   * `onUnauthorized` — a 401 on any authed call clears the session app-wide (R6).
+   * Drop the in-memory token, the SecretStore-held token, and the session
+   * `meta` rows. KEEPS `device_id` (browser-install identity, reused on next
+   * login). Wired as the HTTP client's `onUnauthorized` — a 401 on any authed
+   * call clears the session app-wide (R6).
    */
   async clearSession(): Promise<void> {
     this.session = null
     await Promise.all([
-      this.db.metaPut(META_SESSION_TOKEN, undefined),
+      this.secrets.delete(META_SESSION_TOKEN),
       this.db.metaPut(META_MY_USER_ID, undefined),
       this.db.metaPut(META_WORKSPACE_ID, undefined),
       this.db.metaPut(META_ROLE, undefined),
@@ -210,7 +226,11 @@ export class AuthManager {
       expiresAt: r.expires_at,
     }
     await Promise.all([
-      this.db.metaPut(META_SESSION_TOKEN, r.token),
+      // The token goes through the SecretStore seam (ENG-168) — NEVER metaPut,
+      // so on desktop it can never land inside the portable workspace folder.
+      // device_id stays in `meta` on purpose: a non-secret install identity the
+      // outbox/mirror read through MsgDb, kept across logout.
+      this.secrets.set(META_SESSION_TOKEN, r.token),
       this.db.metaPut(META_DEVICE_ID, r.device_id),
       this.db.metaPut(META_MY_USER_ID, r.user_id),
       this.db.metaPut(META_WORKSPACE_ID, r.workspace_id),

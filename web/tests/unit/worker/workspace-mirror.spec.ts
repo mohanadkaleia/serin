@@ -421,3 +421,74 @@ describe('SyncEngine full-mirror mode (M6-3)', () => {
     engine2.stop()
   })
 })
+
+// ---------------------------------------------------------------------------
+// M6-4 (ENG-168) — Low-2: appendApplied is serialized PER STREAM inside the
+// mirror itself. The engine's callers already serialize (withStreamLock / the
+// sequential catch-up loop), but that guarantee lived in the CALLER; these
+// tests pin the mirror-owned guard so a future pull-path refactor that fires
+// two concurrent appends can never double-write the log.
+// ---------------------------------------------------------------------------
+
+describe('WorkspaceMirror.appendApplied — per-stream serialization (M6-4, Low-2)', () => {
+  it('two CONCURRENT appends of the same run land exactly once (no double-append)', async () => {
+    const { mirror, log } = makeMirror()
+    const sid = newStreamId()
+    await mirror.registerStreams([meta(sid)])
+    const run = await rows(sid, [1, 2, 3])
+
+    // Without the internal queue, both calls read head=0 concurrently, both
+    // dedupe nothing, and both append 1..3 → six lines. The queue makes the
+    // second call observe head=3 and drop the whole (already-durable) run.
+    await Promise.all([mirror.appendApplied(sid, run), mirror.appendApplied(sid, run)])
+
+    const seqs = (await log.readAll(sid)).map(
+      (l) => (JSON.parse(l) as { server: { server_sequence: number } }).server.server_sequence,
+    )
+    expect(seqs).toEqual([1, 2, 3])
+    expect(log.appendCalls).toHaveLength(1) // the second append wrote nothing
+  })
+
+  it('concurrent CONTIGUOUS runs both land, in order (queue, not mutual exclusion-drop)', async () => {
+    const { mirror, log } = makeMirror()
+    const sid = newStreamId()
+    await mirror.registerStreams([meta(sid)])
+    const first = await rows(sid, [1, 2])
+    const second = await rows(sid, [3, 4])
+
+    await Promise.all([mirror.appendApplied(sid, first), mirror.appendApplied(sid, second)])
+
+    const seqs = (await log.readAll(sid)).map(
+      (l) => (JSON.parse(l) as { server: { server_sequence: number } }).server.server_sequence,
+    )
+    expect(seqs).toEqual([1, 2, 3, 4])
+  })
+
+  it('a REJECTED append (gap) does not wedge the stream queue', async () => {
+    const { mirror, log } = makeMirror()
+    const sid = newStreamId()
+    await mirror.registerStreams([meta(sid)])
+    await mirror.appendApplied(sid, await rows(sid, [1]))
+
+    await expect(mirror.appendApplied(sid, await rows(sid, [3]))).rejects.toThrow(/non-contiguous/)
+
+    // The queue survived the rejection — the next contiguous append lands.
+    await mirror.appendApplied(sid, await rows(sid, [2]))
+    expect(await log.readAll(sid)).toHaveLength(2)
+  })
+
+  it('streams do not serialize against EACH OTHER (per-stream, not global)', async () => {
+    const { mirror, log } = makeMirror()
+    const sidA = newStreamId()
+    const sidB = newStreamId()
+    await mirror.registerStreams([meta(sidA), meta(sidB)])
+
+    await Promise.all([
+      mirror.appendApplied(sidA, await rows(sidA, [1])),
+      mirror.appendApplied(sidB, await rows(sidB, [1])),
+    ])
+
+    expect(await log.readAll(sidA)).toHaveLength(1)
+    expect(await log.readAll(sidB)).toHaveLength(1)
+  })
+})
