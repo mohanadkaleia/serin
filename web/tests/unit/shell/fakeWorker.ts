@@ -151,9 +151,19 @@ export class FakeWorker {
     status_emoji: null,
     status_text: null,
     status_expires_at: null,
+    avatar_sha256: null,
   }
   private meGetError: RpcCodedError | null = null
   private meUpdateError: RpcCodedError | null = null
+  // -- ENG-152 avatars -------------------------------------------------------
+  readonly meUploadAvatarSpy = vi.fn<(blob: Blob) => void>()
+  readonly meClearAvatarSpy = vi.fn()
+  readonly userAvatarSpy = vi.fn<(userId: string, sha: string) => void>()
+  private avatarUploadError: RpcCodedError | null = null
+  /** Counter minting deterministic fake re-encode digests. */
+  private avatarSeq = 0
+  /** Seeded `user_id:sha → Blob` the `users.avatar` facade serves. */
+  private readonly avatarBlobs = new Map<string, Blob>()
 
   // -- setup helpers -------------------------------------------------------
 
@@ -237,6 +247,18 @@ export class FakeWorker {
   /** Make the NEXT `me.update` reject with the coded error `code`. */
   failNextMeUpdate(code: string): this {
     this.meUpdateError = new RpcCodedError(code, code)
+    return this
+  }
+
+  /** Make the NEXT `me.uploadAvatar`/`me.clearAvatar` reject with `code` (ENG-152). */
+  failNextAvatarUpload(code: string): this {
+    this.avatarUploadError = new RpcCodedError(code, code)
+    return this
+  }
+
+  /** Seed the avatar bytes `users.avatar` serves for `userId` + `sha` (ENG-152). */
+  setAvatarBlob(userId: string, sha: string, blob: Blob): this {
+    this.avatarBlobs.set(`${userId}:${sha}`, blob)
     return this
   }
 
@@ -1008,6 +1030,40 @@ export class FakeWorker {
           }
           this.meProfile = next
           return Promise.resolve({ ...this.meProfile })
+        },
+        // ENG-152: upload mints a fresh fake re-encode digest (the server's
+        // behavior modulo actual pixels); clear nulls it. Both echo the profile.
+        uploadAvatar: (blob: Blob) => {
+          this.meUploadAvatarSpy(blob)
+          if (this.avatarUploadError) {
+            const err = this.avatarUploadError
+            this.avatarUploadError = null
+            return Promise.reject(err)
+          }
+          this.avatarSeq++
+          const sha = `reencoded-sha-${this.avatarSeq}`.padEnd(64, '0')
+          this.meProfile = { ...this.meProfile, avatar_sha256: sha }
+          return Promise.resolve({ ...this.meProfile })
+        },
+        clearAvatar: () => {
+          this.meClearAvatarSpy()
+          if (this.avatarUploadError) {
+            const err = this.avatarUploadError
+            this.avatarUploadError = null
+            return Promise.reject(err)
+          }
+          this.meProfile = { ...this.meProfile, avatar_sha256: null }
+          return Promise.resolve({ ...this.meProfile })
+        },
+      },
+      // ENG-152: seeded avatar bytes by `userId:sha`; unseeded → `{ blob: null }`
+      // (the server's uniform 404 shape).
+      users: {
+        avatar: (userId: string, avatarSha256: string) => {
+          this.userAvatarSpy(userId, avatarSha256)
+          return Promise.resolve({
+            blob: this.avatarBlobs.get(`${userId}:${avatarSha256}`) ?? null,
+          })
         },
       },
       // ENG-129: a REAL-shaped prefs surface — `get` returns the seeded snapshot,

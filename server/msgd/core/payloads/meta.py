@@ -134,10 +134,14 @@ class UserProfileUpdatedV1(BaseModel):
     "cleared"; an ABSENT key means "not carried by this event" — the client
     fold leaves absent fields untouched). ``status_expires_at`` is an RFC 3339
     string; expiry is LAZY — readers treat an expired status as cleared at
-    render time. Format-validation only: bounds (title/description/status_text
-    lengths, the emoji byte cap) are enforced at the HTTP boundary
-    (:mod:`msgd.api.schemas.me`), never here — an out-of-bounds value in a
-    replayed log must not crash a reader (D9 tolerance).
+    render time. ``avatar_sha256`` (ENG-152) is the content-addressed digest of
+    the user's server-re-encoded profile picture (``null`` = no avatar); the
+    directory fold carries it so every client can render the avatar via the
+    workspace-readable serve endpoint. Format-validation only: bounds
+    (title/description/status_text lengths, the emoji byte cap) are enforced at
+    the HTTP boundary (:mod:`msgd.api.schemas.me`), never here — an
+    out-of-bounds value in a replayed log must not crash a reader (D9
+    tolerance).
     """
 
     model_config = ConfigDict(extra="allow")
@@ -149,6 +153,7 @@ class UserProfileUpdatedV1(BaseModel):
     status_emoji: str | None = None
     status_text: str | None = None
     status_expires_at: str | None = None
+    avatar_sha256: str | None = None
 
     @field_validator("user_id")
     @classmethod
@@ -416,6 +421,7 @@ def build_user_profile_updated_body(
     status_emoji: str | None = None,
     status_text: str | None = None,
     status_expires_at: str | None = None,
+    avatar_sha256: str | None = None,
     event_id: str | None = None,
 ) -> dict[str, Any]:
     """Assemble a server-authored ``user.profile_updated`` v1 body dict (§2.2).
@@ -428,8 +434,12 @@ def build_user_profile_updated_body(
     resulting values, dumped as explicit ``null`` when unset/cleared — the web
     directory fold applies every carried key (null clears) and the client
     treats an expired ``status_expires_at`` as cleared at render time (lazy
-    expiry, no job). The model is the source of truth, so
-    ``hash_event(returned dict) == event_hash`` holds by construction (D2).
+    expiry, no job). ``avatar_sha256`` (ENG-152) rides the same contract: every
+    emitter passes the RESULTING row value (the current avatar on a profile
+    PATCH, the new digest on an avatar upload, ``null`` on a clear), so a
+    carried ``null`` always genuinely means "no avatar". The model is the
+    source of truth, so ``hash_event(returned dict) == event_hash`` holds by
+    construction (D2).
     """
     payload = UserProfileUpdatedV1(
         user_id=user_id,
@@ -439,6 +449,7 @@ def build_user_profile_updated_body(
         status_emoji=status_emoji,
         status_text=status_text,
         status_expires_at=status_expires_at,
+        avatar_sha256=avatar_sha256,
     )
     body = Body(
         event_id=event_id if event_id is not None else ids.new_event_id(),

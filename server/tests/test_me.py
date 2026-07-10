@@ -60,6 +60,8 @@ async def test_get_me_returns_the_callers_own_profile(client: AsyncClient) -> No
         "status_emoji": None,
         "status_text": None,
         "status_expires_at": None,
+        # ENG-152 profile picture — null until uploaded.
+        "avatar_sha256": None,
     }
 
     resp = await client.get("/v1/me", headers=auth_header(member["token"]))

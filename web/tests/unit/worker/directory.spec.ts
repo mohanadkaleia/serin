@@ -179,6 +179,69 @@ describe('worker/projection — listDirectory (ENG-101 mention source)', () => {
     })
   })
 
+  // --- ENG-152: the avatar ref rides the same fold contract ------------------
+
+  it('folds avatar_sha256 (set → carried; explicit null → cleared; absent → untouched)', async () => {
+    const db = new MemoryDb()
+    await db.putStreams([stream({ stream_id: 's_meta', kind: 'workspace-meta', name: 'meta' })])
+    const sha = 'a'.repeat(64)
+    await db.putEvents([
+      metaUserEvent('s_meta', 1, 'user.joined', { user_id: 'u_dana', display_name: 'Dana' }),
+      // Upload: the event carries the re-encode's digest.
+      metaUserEvent('s_meta', 2, 'user.profile_updated', {
+        user_id: 'u_dana',
+        display_name: 'Dana',
+        avatar_sha256: sha,
+      }),
+      // An avatar-less (pre-ENG-152-shaped) update leaves the ref untouched.
+      metaUserEvent('s_meta', 3, 'user.profile_updated', {
+        user_id: 'u_dana',
+        display_name: 'Dana S.',
+      }),
+    ])
+
+    const dir = await listDirectory(db)
+    expect(dir.users[0]).toEqual({
+      user_id: 'u_dana',
+      display_name: 'Dana S.',
+      avatar_sha256: sha,
+    })
+
+    // Clear: an explicit null removes the key entirely.
+    await db.putEvents([
+      metaUserEvent('s_meta', 4, 'user.profile_updated', {
+        user_id: 'u_dana',
+        display_name: 'Dana S.',
+        avatar_sha256: null,
+      }),
+    ])
+    const cleared = await listDirectory(db)
+    expect(cleared.users[0]).toEqual({ user_id: 'u_dana', display_name: 'Dana S.' })
+  })
+
+  it('ignores a forged cross-user avatar update (author != subject)', async () => {
+    const db = new MemoryDb()
+    await db.putStreams([stream({ stream_id: 's_meta', kind: 'workspace-meta', name: 'meta' })])
+    await db.putEvents([
+      metaUserEvent('s_meta', 1, 'user.joined', { user_id: 'u_dana', display_name: 'Dana' }),
+      metaUserEvent('s_meta', 2, 'user.joined', { user_id: 'u_sam', display_name: 'Sam' }),
+      // FORGED: u_sam tries to hang an avatar on u_dana.
+      metaUserEvent(
+        's_meta',
+        3,
+        'user.profile_updated',
+        { user_id: 'u_dana', avatar_sha256: 'b'.repeat(64) },
+        'u_sam',
+      ),
+    ])
+
+    const dir = await listDirectory(db)
+    expect(dir.users.find((u) => u.user_id === 'u_dana')).toEqual({
+      user_id: 'u_dana',
+      display_name: 'Dana',
+    })
+  })
+
   it('displayNameOf resolves from the record map with a raw-id fallback', () => {
     const directory = new Map<string, DirectoryUser>([
       ['u_dana', { user_id: 'u_dana', display_name: 'Dana', title: 'Agent' }],

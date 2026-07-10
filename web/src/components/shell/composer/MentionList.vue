@@ -7,6 +7,8 @@
 // TipTap-provided `command` to insert the chip.
 import { nextTick, ref, watch } from 'vue'
 
+import UserAvatar from '../../ui/UserAvatar.vue'
+
 import type { MentionItem } from './mentions'
 
 const props = defineProps<{
@@ -27,12 +29,6 @@ watch(
 function commit(index: number): void {
   const item = props.items[index]
   if (item) props.command({ id: item.id, label: item.label })
-}
-
-/** First letter of a display name for the user avatar chip (safe-interpolated). */
-function initial(label: string): string {
-  const c = label.trim().charAt(0)
-  return c ? c.toUpperCase() : '?'
 }
 
 /** Keyboard nav delegated from the suggestion plugin. Returns true when handled. */
@@ -72,13 +68,16 @@ defineExpose({ onKeyDown })
       data-testid="mention-option"
       @mousedown.prevent="commit(index)"
     >
-      <!-- User rows carry an initials avatar (Ranin); channel rows keep the # glyph. -->
-      <span
+      <!-- User rows carry an avatar (image when set, initial otherwise, ENG-152);
+           channel rows keep the # glyph. -->
+      <UserAvatar
         v-if="item.kind === 'user'"
         class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent-subtle text-[10px] font-semibold text-accent"
         aria-hidden="true"
-        >{{ initial(item.label) }}</span
-      >
+        :user-id="item.id"
+        :name="item.label"
+        :sha="item.avatar_sha"
+      />
       <span v-else class="text-muted">#</span>
       <span class="truncate">{{ item.label }}</span>
     </button>

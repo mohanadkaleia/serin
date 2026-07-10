@@ -149,6 +149,19 @@ class Settings(BaseSettings):
     # transient decode memory is capped at ``thumbnail_max_concurrency × ~168 MB``.
     thumbnail_max_concurrency: int = 2
 
+    # --- Profile pictures (ENG-152, §6) ---------------------------------------
+    # Hard byte cap for an avatar upload, enforced with a streaming cap-and-abort
+    # read BEFORE any image decode (an over-cap body is rejected without being
+    # buffered past the cap). Deliberately far under ``file_max_size_bytes``: an
+    # avatar is a single small picture, and the decoded result is re-encoded to a
+    # fixed 256×256 anyway, so nothing legitimate needs more than a few MB.
+    avatar_max_size_bytes: int = 5_242_880  # 5 MiB
+    # Edge length (px) of the normalized square avatar the server re-encodes
+    # every accepted upload to (center-cropped WEBP). The decompression-bomb
+    # bound for the DECODE is the shared ``thumbnail_max_source_pixels`` — the
+    # avatar path reuses the ENG-118 untrusted-decode machinery wholesale.
+    avatar_px: int = 256
+
     # --- First-run defaults (ENG-109) ----------------------------------------
     # Name of the default public channel /v1/setup auto-creates so a fresh
     # workspace is usable out of the box (the web channel-creation UI is not

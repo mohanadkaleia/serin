@@ -954,10 +954,12 @@ def verify_bundle(root: Path | str, *, verbose: bool = False) -> VerifyReport:
                     f"event_count_total: manifest {total!r} != recomputed {recomputed_total}",
                 )
             )
-    file_entries = _check_sidecars(root, sidecar_digests, findings)
+    user_entries, file_entries = _check_sidecars(root, sidecar_digests, findings)
 
     # ---- Pass B: blobs (the # M4 SEAM pass) --------------------------------------
-    _verify_blobs(root, file_entries, uploaded_sha256s, blob_index, missing_blobs, findings)
+    _verify_blobs(
+        root, user_entries, file_entries, uploaded_sha256s, blob_index, missing_blobs, findings
+    )
 
     _fill_stream_counts(summaries, findings)
 
@@ -1208,13 +1210,15 @@ def _cross_check_bundle_streams(
 
 def _check_sidecars(
     root: Path, digests: dict[str, Any] | None, findings: list[Finding]
-) -> list[dict[str, Any]]:
-    """Verify both sidecars against their manifest digests; return files.json rows.
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Verify both sidecars against their manifest digests; return their rows.
 
-    ``digests`` is ``None`` in best-effort mode (malformed manifest): the digest
-    comparison is suppressed, but ``files.json`` is still parsed so the blob pass
-    keeps its reference set.
+    Returns ``(users.json rows, files.json rows)``. ``digests`` is ``None`` in
+    best-effort mode (malformed manifest): the digest comparison is suppressed,
+    but both sidecars are still parsed so the blob pass keeps its reference set
+    (files.json content/thumbnails + users.json avatars, ENG-152).
     """
+    user_entries: list[dict[str, Any]] = []
     file_entries: list[dict[str, Any]] = []
     for name in _SIDECAR_NAMES:
         path = root / name
@@ -1281,7 +1285,9 @@ def _check_sidecars(
             )
         elif name == "files.json":
             file_entries = parsed
-    return file_entries
+        elif name == "users.json":
+            user_entries = parsed
+    return user_entries, file_entries
 
 
 def _stream_sha256(path: Path) -> str:
@@ -1295,6 +1301,7 @@ def _stream_sha256(path: Path) -> str:
 
 def _verify_blobs(
     root: Path,
+    user_entries: list[dict[str, Any]],
     file_entries: list[dict[str, Any]],
     uploaded_sha256s: set[str],
     blob_index: dict[str, Any],
@@ -1306,7 +1313,8 @@ def _verify_blobs(
     * every file under ``blobs/**`` re-hashed against its path digest
       (``blob_hash_mismatch``);
     * every referenced digest — ``files.json`` ``sha256`` + ``thumbnail_sha256``,
-      every ``file.uploaded`` payload ``sha256``, and ``manifest.blobs.index`` —
+      ``users.json`` ``avatar_sha256`` (ENG-152 profile pictures), every
+      ``file.uploaded`` payload ``sha256``, and ``manifest.blobs.index`` —
       must exist on disk: ``blob_missing`` FAILURE, downgraded to a WARNING when
       the digest is declared in ``manifest.missing_blobs``;
     * a blob referenced by nothing is a ``blob_unreferenced`` WARNING;
@@ -1356,9 +1364,9 @@ def _verify_blobs(
                 )
             )
 
-    # References by CONTENT USE (files.json rows + file.uploaded payloads); the
-    # manifest index additionally REQUIRES presence but is not itself a "use", so
-    # an index-only blob still warns as unreferenced.
+    # References by CONTENT USE (files.json rows + users.json avatars +
+    # file.uploaded payloads); the manifest index additionally REQUIRES presence
+    # but is not itself a "use", so an index-only blob still warns as unreferenced.
     referenced: dict[str, str] = {}
     for entry in file_entries:
         fid = entry.get("file_id")
@@ -1368,6 +1376,10 @@ def _verify_blobs(
         thumb = entry.get("thumbnail_sha256")
         if isinstance(thumb, str):
             referenced.setdefault(thumb, f"files.json thumbnail of {fid!r}")
+    for entry in user_entries:
+        avatar = entry.get("avatar_sha256")
+        if isinstance(avatar, str):
+            referenced.setdefault(avatar, f"users.json avatar of {entry.get('user_id')!r}")
     for sha in sorted(uploaded_sha256s):
         referenced.setdefault(sha, "a file.uploaded event payload")
     required = dict(referenced)

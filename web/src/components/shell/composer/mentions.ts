@@ -21,6 +21,8 @@ export interface MentionItem {
   /** Display text (the chip label and what the query matches against). */
   label: string
   kind: 'user' | 'channel'
+  /** ENG-152: the user's avatar ref (user rows only) — image chip when set. */
+  avatar_sha?: string
 }
 
 /** Case-insensitive prefix-preferring filter over the in-memory candidate list. */

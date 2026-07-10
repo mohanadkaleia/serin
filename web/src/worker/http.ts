@@ -70,8 +70,12 @@ export interface HttpClient {
   patch<T>(path: string, body: unknown): Promise<ApiResult<T>>
   /** Authed GET returning parsed JSON. */
   get<T>(path: string): Promise<ApiResult<T>>
-  /** Authed DELETE expecting 204 No Content. */
-  del(path: string): Promise<ApiResult<void>>
+  /**
+   * Authed DELETE. Historically a 204-No-Content surface (`T = void`, the
+   * invite revoke); `T` is generic for DELETEs that echo a JSON body (ENG-152:
+   * `DELETE /v1/me/avatar` returns the updated profile).
+   */
+  del<T = void>(path: string): Promise<ApiResult<T>>
   /**
    * Authed PUT of RAW bytes (ENG-119). The `Blob`/`ArrayBuffer` is handed straight
    * to `fetch` (the browser chunk-streams it — NEVER JSON.stringify'd); the
@@ -83,6 +87,17 @@ export interface HttpClient {
     body: Blob | ArrayBuffer,
     opts?: BlobRequestOptions & { contentType?: string },
   ): Promise<ApiResult<void>>
+  /**
+   * Authed POST of RAW bytes returning parsed JSON (ENG-152: the avatar upload
+   * — `POST /v1/me/avatar` takes the image body and echoes the updated
+   * profile). Same raw-body discipline as {@link putBlob} (never JSON.stringify,
+   * `opts.contentType` honored) with {@link post}'s JSON response parsing.
+   */
+  postBlob<T>(
+    path: string,
+    body: Blob | ArrayBuffer,
+    opts?: BlobRequestOptions & { contentType?: string },
+  ): Promise<ApiResult<T>>
   /**
    * Authed GET of RAW bytes (ENG-119). On 2xx returns the response `Blob` + its
    * `Content-Type` (bypassing the JSON path entirely); a 404 folds through the
@@ -202,6 +217,30 @@ export function createHttpClient(deps: HttpClientDeps): HttpClient {
     }
   }
 
+  /** Shared 2xx JSON-body parser: 204/empty → undefined; non-JSON → typed error. */
+  async function parseJsonOk<T>(
+    res: Response,
+    foldReadError: () => ApiError,
+  ): Promise<ApiResult<T>> {
+    if (res.status === 204) return { ok: true, value: undefined as T }
+    let text: string
+    try {
+      text = await res.text()
+    } catch {
+      return { ok: false, error: foldReadError() }
+    }
+    if (!text) return { ok: true, value: undefined as T }
+    try {
+      return { ok: true, value: JSON.parse(text) as T }
+    } catch {
+      // A 2xx with a non-JSON body — surface a typed error, never throw.
+      return {
+        ok: false,
+        error: { status: res.status, code: 'invalid-response', title: 'Invalid response body' },
+      }
+    }
+  }
+
   function request<T>(
     method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
     path: string,
@@ -219,25 +258,7 @@ export function createHttpClient(deps: HttpClientDeps): HttpClient {
       },
       timeoutMs,
       undefined,
-      async (res, foldReadError) => {
-        if (res.status === 204) return { ok: true, value: undefined as T }
-        let text: string
-        try {
-          text = await res.text()
-        } catch {
-          return { ok: false, error: foldReadError() }
-        }
-        if (!text) return { ok: true, value: undefined as T }
-        try {
-          return { ok: true, value: JSON.parse(text) as T }
-        } catch {
-          // A 2xx with a non-JSON body — surface a typed error, never throw.
-          return {
-            ok: false,
-            error: { status: res.status, code: 'invalid-response', title: 'Invalid response body' },
-          }
-        }
-      },
+      (res, foldReadError) => parseJsonOk<T>(res, foldReadError),
     )
   }
 
@@ -247,7 +268,7 @@ export function createHttpClient(deps: HttpClientDeps): HttpClient {
     put: <T>(path: string, body: unknown) => request<T>('PUT', path, body, true),
     patch: <T>(path: string, body: unknown) => request<T>('PATCH', path, body, true),
     get: <T>(path: string) => request<T>('GET', path, undefined, true),
-    del: (path: string) => request<void>('DELETE', path, undefined, true),
+    del: <T = void>(path: string) => request<T>('DELETE', path, undefined, true),
 
     putBlob: (path, body, opts) =>
       send<void>(
@@ -263,6 +284,26 @@ export function createHttpClient(deps: HttpClientDeps): HttpClient {
         opts?.signal,
         // A successful blob upload has an empty (or ignorable) body — 2xx is enough.
         () => Promise.resolve({ ok: true, value: undefined }),
+      ),
+
+    postBlob: <T>(
+      path: string,
+      body: Blob | ArrayBuffer,
+      opts?: BlobRequestOptions & { contentType?: string },
+    ) =>
+      send<T>(
+        'POST',
+        path,
+        {
+          authed: true,
+          // NEVER application/json — raw bytes, streamed by the browser as-is.
+          headers: { 'Content-Type': opts?.contentType ?? 'application/octet-stream' },
+          body,
+        },
+        // An avatar-sized upload is small; the default JSON timeout is ample.
+        opts?.timeoutMs === undefined ? timeoutMs : opts.timeoutMs,
+        opts?.signal,
+        (res, foldReadError) => parseJsonOk<T>(res, foldReadError),
       ),
 
     getBlob: (path, opts) =>

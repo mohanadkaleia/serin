@@ -502,6 +502,17 @@ async def import_workspace(
 
     for u in users:
         recredential = owner_password_hash is not None and u.get("user_id") == owner_user_id
+        # ENG-152: a present avatar ref must be a blob-store digest (the same
+        # bare-hex form as every bundle blob key) or null/absent; anything else
+        # is a malformed sidecar — fail closed rather than store a ref the
+        # serve endpoint could never resolve (or a path-shaped string).
+        avatar_sha = u.get("avatar_sha256")
+        if avatar_sha is not None and (
+            not isinstance(avatar_sha, str) or not _BLOB_HEX_RE.fullmatch(avatar_sha)
+        ):
+            raise RestoreError(
+                f"users.json avatar_sha256 is not a sha256 hex digest or null: {avatar_sha!r}"
+            )
         try:
             session.add(
                 User(
@@ -530,6 +541,10 @@ async def import_workspace(
                     status_expires_at=_opt_ts(
                         u.get("status_expires_at"), field="users.json status_expires_at"
                     ),
+                    # ENG-152 profile picture — restored verbatim (validated
+                    # above); its blob was restored by _restore_blobs from the
+                    # manifest index, so ref + bytes arrive together.
+                    avatar_sha256=avatar_sha,
                 )
             )
         except KeyError as exc:

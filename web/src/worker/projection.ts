@@ -807,13 +807,14 @@ export function displayNameOf(
   return directory.get(userId)?.display_name ?? userId
 }
 
-/** The ENG-164 profile fields a `user.profile_updated` payload may carry. */
+/** The ENG-164/ENG-152 profile fields a `user.profile_updated` payload may carry. */
 const PROFILE_FIELDS = [
   'title',
   'description',
   'status_emoji',
   'status_text',
   'status_expires_at',
+  'avatar_sha256',
 ] as const
 
 /**

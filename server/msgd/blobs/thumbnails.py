@@ -45,6 +45,14 @@ and keeps the bound co-located with the decode it protects.
 
 The function is PURE and SYNCHRONOUS (CPU-bound decode/encode). The caller offloads it
 with ``asyncio.to_thread`` so a slow or adversarial decode never blocks the event loop.
+
+:func:`render_avatar` (ENG-152) is the profile-picture sibling: the SAME
+untrusted-decode discipline (pre-decode bomb check, containment, re-encode-never-
+pass-through — which also strips EXIF/metadata for privacy), but the output is a
+fixed square (center-crop + resize) and the CALLER treats ``None`` as a hard 400
+rather than best-effort (an avatar upload that isn't a decodable image is a client
+error, not a silently-missing preview). Both run on the dedicated bounded
+thumbnail executor, never the event loop's default pool.
 """
 
 from __future__ import annotations
@@ -53,7 +61,7 @@ import io
 
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-__all__ = ["render_thumbnail"]
+__all__ = ["render_avatar", "render_thumbnail"]
 
 # WEBP quality for the generated thumbnail. 80 is the usual quality/size sweet spot
 # for photographic content; the thumbnail is a preview, not an archival copy.
@@ -116,6 +124,67 @@ def render_thumbnail(source: bytes, *, max_px: int, max_source_pixels: int) -> b
         # Belt-and-suspenders: Pillow's decoder plugins can raise a wide, version-
         # dependent set of errors on crafted input. A thumbnail is never worth
         # propagating a decode failure, so anything else is also "no thumbnail".
+        return None
+
+
+def render_avatar(source: bytes, *, px: int, max_source_pixels: int) -> bytes | None:
+    """Decode ``source`` and return a normalized ``px``×``px`` WEBP avatar, or ``None``.
+
+    The ENG-152 profile-picture sibling of :func:`render_thumbnail` — the SAME
+    hostile-input discipline applies verbatim (this function also NEVER raises):
+
+    * the explicit pre-decode ``w*h > max_source_pixels`` bomb check (plus the
+      ``Image.MAX_IMAGE_PIXELS`` backstop) rejects a decompression bomb BEFORE any
+      pixel buffer is allocated;
+    * everything is contained — a non-image, truncated, or crafted payload returns
+      ``None`` (the caller maps that to a 400, unlike the best-effort thumbnail);
+    * the output is a RE-ENCODED raster we control: EXIF/metadata (GPS, camera
+      serials — a privacy leak on a workspace-public image) and any active or
+      exploit content in the original container are DISCARDED because only decoded
+      pixels survive into the fresh WEBP.
+
+    The one behavioral difference from the thumbnail: the output is a SQUARE.
+    ``ImageOps.fit`` center-crops to the target aspect then resizes, so every
+    avatar is exactly ``px``×``px`` regardless of the source shape (a small source
+    is upscaled — a fixed-size avatar is the contract, unlike the downscale-only
+    preview thumbnail).
+
+    Args:
+        source: raw, UNTRUSTED image bytes (an uploaded avatar).
+        px: edge length of the square output (``settings.avatar_px``).
+        max_source_pixels: decompression-bomb guard, shared with the thumbnail
+            path (``settings.thumbnail_max_source_pixels``).
+    """
+    # Per-call decompression-bomb backstop (Pillow module global; see module
+    # docstring). The authoritative guard is the explicit pre-decode check below.
+    Image.MAX_IMAGE_PIXELS = max_source_pixels
+    try:
+        with Image.open(io.BytesIO(source)) as img:
+            # EXPLICIT, THREAD-SAFE, PRE-DECODE bomb check (see render_thumbnail:
+            # Image.open reads only the header, so this runs before any raster
+            # allocation and mutates no global state).
+            width, height = img.size
+            if width * height > max_source_pixels:
+                return None
+            if width == 0 or height == 0:
+                return None
+
+            # Honor EXIF orientation BEFORE stripping it: a sideways phone photo
+            # must crop upright, and the re-encode below drops the EXIF block.
+            oriented = ImageOps.exif_transpose(img)
+            flat = _flatten_to_rgb(oriented if oriented is not None else img)
+            # Center-crop to square + resize to exactly px×px in one step.
+            square = ImageOps.fit(flat, (px, px))
+
+            buf = io.BytesIO()
+            square.save(buf, format="WEBP", quality=_WEBP_QUALITY)
+            return buf.getvalue()
+    except (Image.DecompressionBombError, UnidentifiedImageError, OSError):
+        return None
+    except Exception:
+        # Same belt-and-suspenders as render_thumbnail: Pillow's decoder plugins
+        # raise a wide, version-dependent set on crafted input; every failure is
+        # uniformly "not a usable image" (the HTTP layer's 400), never a 500.
         return None
 
 

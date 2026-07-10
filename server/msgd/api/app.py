@@ -24,6 +24,7 @@ from msgd.api.problems import register_problem_handlers
 from msgd.api.routers import (
     admin,
     auth,
+    avatars,
     events_read,
     events_upload,
     files,
@@ -127,6 +128,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # dependency — the path token is the credential; see msgd.plugins.hooks).
     app.include_router(plugin_hooks.router)
     app.include_router(me.router)  # self-profile: GET/PATCH /v1/me (structurally self-only)
+    # ENG-152 profile pictures: POST/DELETE /v1/me/avatar (self-only, re-encode
+    # pipeline) + GET /v1/users/{id}/avatar (workspace-readable, never by hash).
+    app.include_router(avatars.router)
     app.include_router(events_upload.router)
     app.include_router(events_read.router)
     app.include_router(files.router)  # ENG-116: /v1/files (initiate + blob + download)

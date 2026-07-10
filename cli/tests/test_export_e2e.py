@@ -442,6 +442,8 @@ def test_export_bundle_end_to_end(
             "status_emoji",
             "status_text",
             "status_expires_at",
+            # ENG-152: the profile-picture blob ref (null when unset).
+            "avatar_sha256",
         }
         for u in users
     )

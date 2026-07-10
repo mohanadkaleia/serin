@@ -22,6 +22,7 @@ import { formatTime } from '../../lib/time'
 import type { FileRow } from '../../worker'
 import EmojiPicker from '../ui/EmojiPicker.vue'
 import Icon from '../ui/Icon.vue'
+import UserAvatar from '../ui/UserAvatar.vue'
 import AttachmentFile from './AttachmentFile.vue'
 import AttachmentImage from './AttachmentImage.vue'
 import ReactionPill from './ReactionPill.vue'
@@ -44,6 +45,12 @@ const props = withDefaults(
      */
     names?: ReadonlyMap<string, string> | undefined
     /**
+     * Directory `user_id → avatar_sha256` map (ENG-152): when the author has an
+     * avatar, the leading chip renders their IMAGE (fetched worker-side by
+     * id + sha) instead of the initial. Absent → initials, as before.
+     */
+    avatars?: ReadonlyMap<string, string> | undefined
+    /**
      * Briefly highlight this row (ENG-127 search jump-to-message): a tinted
      * background the parent clears after a moment. Purely visual.
      */
@@ -61,6 +68,7 @@ const props = withDefaults(
     editing: false,
     showHeader: true,
     names: undefined,
+    avatars: undefined,
     flash: false,
     readonly: false,
   },
@@ -135,17 +143,12 @@ function isImage(file: FileRow): boolean {
   return file.mime_type.startsWith('image/')
 }
 
-/** First letter of a display name for the avatar chip (safe-interpolated). */
-function initial(name: string): string {
-  const c = name.trim().charAt(0)
-  return c ? c.toUpperCase() : '?'
-}
-
 /** Author's resolved display name (directory-backed; raw id fallback). */
 const authorName = computed(
   () => props.names?.get(props.message.author_user_id) ?? props.message.author_user_id,
 )
-const authorInitial = computed(() => initial(authorName.value))
+/** Author's avatar ref (ENG-152) — undefined = no avatar → initials chip. */
+const authorAvatarSha = computed(() => props.avatars?.get(props.message.author_user_id))
 
 const pickerOpen = ref(false)
 /** The trailing "add reaction" ghost pill's picker (separate anchor; one open at a time). */
@@ -226,15 +229,16 @@ function confirmDelete(): void {
     <div class="w-10 shrink-0" data-testid="message-gutter">
       <!-- No presence dot on message rows (ENG-152 conversation-pane cleanup):
            live presence stays on the sidebar/DM header/people pickers only. -->
-      <div
+      <UserAvatar
         v-if="props.showHeader && !isDeleted"
         class="flex h-10 w-10 items-center justify-center rounded-full bg-accent-subtle text-sm font-semibold text-accent"
         data-testid="message-avatar"
         :title="authorName"
         aria-hidden="true"
-      >
-        {{ authorInitial }}
-      </div>
+        :user-id="props.message.author_user_id"
+        :name="authorName"
+        :sha="authorAvatarSha"
+      />
     </div>
 
     <!-- Content column — aligns under the avatar for both leading + grouped rows. -->

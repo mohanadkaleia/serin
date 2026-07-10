@@ -18,7 +18,7 @@ import { AuthManager } from './auth'
 import { checkProjectionVersion } from './db'
 import { FileManager } from './files'
 import { createHttpClient, type HttpClient } from './http'
-import { getMe, updateMe } from './me'
+import { clearAvatar, getMe, updateMe, uploadAvatar } from './me'
 import { MetaAuthor } from './meta'
 import { Outbox } from './outbox'
 import { EphemeralState } from './presence'
@@ -52,6 +52,7 @@ import {
   type AdminWorkspace,
   type ApplyEventsToProjection,
   type AuthResult,
+  type AvatarFetchResult,
   type BackfillResult,
   type FileFetchResult,
   type MeProfile,
@@ -117,6 +118,11 @@ export interface RpcResultMap {
   // Self-profile HTTP pass-through (`/v1/me`) — structurally self-only.
   'me.get': MeProfile
   'me.update': MeProfile
+  // ENG-152 profile pictures: self-only avatar writes + the workspace-readable
+  // avatar read (worker-side fetch + LRU; only bytes cross to the tab).
+  'me.uploadAvatar': MeProfile
+  'me.clearAvatar': MeProfile
+  'user.avatar': AvatarFetchResult
 }
 
 /** A handler typed to exactly one method's request variant and result. */
@@ -658,6 +664,13 @@ export class WorkerCore {
   private registerMe(): void {
     this.register('me.get', () => getMe(this.http))
     this.register('me.update', (req) => updateMe(this.http, req.params))
+    // ENG-152 profile pictures. The upload's Blob arrived by structured clone;
+    // the worker POSTs the raw bytes (token attached here, never tab-side).
+    // The resulting `user.profile_updated` meta event syncs back and updates
+    // the directory fold, which is how every OTHER member sees the new face.
+    this.register('me.uploadAvatar', (req) => uploadAvatar(this.http, req.params.blob))
+    this.register('me.clearAvatar', () => clearAvatar(this.http))
+    this.register('user.avatar', (req) => this.files.fetchAvatar(req.params))
   }
 }
 

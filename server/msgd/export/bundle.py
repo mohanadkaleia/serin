@@ -38,8 +38,9 @@ Design pins (each locked by a test):
   ``read_state``, and ``prefs`` are never queried. Private streams and DMs ARE
   exported — export is a whole-workspace server-admin operation (§9).
 * **Missing-blob policy.** A PRESENT ``files`` row whose content (or thumbnail)
-  blob is absent from the store is a HARD FAIL (:class:`MissingBlobsError`)
-  unless ``allow_missing_blobs``, which records the digests in
+  blob — or a ``users`` row whose avatar blob (ENG-152) — is absent from the
+  store is a HARD FAIL (:class:`MissingBlobsError`) unless
+  ``allow_missing_blobs``, which records the digests in
   ``manifest.missing_blobs`` instead of copying them.
 * **Sealed manifest.** ``bundle_digest`` = ``sha256:`` over the RFC 8785 (JCS)
   canonicalization of the manifest dict *without* the ``bundle_digest`` key —
@@ -203,12 +204,17 @@ async def _load_workspace(session: AsyncSession) -> Workspace:
     return rows[0]
 
 
-async def _export_users(session: AsyncSession, path: Path) -> str:
+async def _export_users(session: AsyncSession, path: Path) -> tuple[str, list[str]]:
     """Write ``users.json`` — the §9 user snapshot, secrets excluded.
 
     Exactly the fields download-authz / UI need from the ``users`` schema:
     ``password_hash`` is never selected into the output, and sessions / devices /
     invites are never queried at all. Sorted by ``user_id`` (determinism).
+
+    Returns ``(sidecar_sha256, referenced avatar blob shas)`` — avatar blobs are
+    first-class bundle content exactly like file/thumbnail blobs (ENG-152): a
+    restored ``avatar_sha256`` without its bytes would 404 on every serve, the
+    precise data-loss shape the ENG-164 M1 omission had for profile fields.
     """
     users = (await session.execute(select(User).order_by(User.user_id))).scalars().all()
     snapshot = [
@@ -230,10 +236,16 @@ async def _export_users(session: AsyncSession, path: Path) -> str:
             "status_emoji": u.status_emoji,
             "status_text": u.status_text,
             "status_expires_at": _opt_rfc3339(u.status_expires_at),
+            # ENG-152 profile picture: the content-addressed digest of the
+            # server-re-encoded avatar blob (null = none). The BLOB rides in
+            # ``blobs/`` (see the return value), so ref + bytes round-trip
+            # together.
+            "avatar_sha256": u.avatar_sha256,
         }
         for u in users
     ]
-    return _write_sidecar(path, snapshot)
+    avatar_shas = sorted({u.avatar_sha256 for u in users if u.avatar_sha256 is not None})
+    return _write_sidecar(path, snapshot), avatar_shas
 
 
 async def _export_files(session: AsyncSession, path: Path) -> tuple[str, list[str]]:
@@ -367,8 +379,11 @@ async def export_workspace(
 
     workspace = await _load_workspace(session)
 
-    users_sha = await _export_users(session, dest / "users.json")
-    files_sha, referenced_blobs = await _export_files(session, dest / "files.json")
+    users_sha, avatar_blobs = await _export_users(session, dest / "users.json")
+    files_sha, file_blobs = await _export_files(session, dest / "files.json")
+    # Every blob the bundle must carry: file content + thumbnails (ENG-118) +
+    # user avatars (ENG-152), deduplicated + sorted for a deterministic walk.
+    referenced_blobs = sorted(set(file_blobs) | set(avatar_blobs))
 
     # --- streams/<id>/<YYYY-MM>.ndjson, sorted by stream_id ------------------
     streams = (
@@ -400,7 +415,7 @@ async def export_workspace(
             "files": files_map,
         }
 
-    # --- blobs/<ab>/<hex> — content-addressed, thumbnails included -----------
+    # --- blobs/<ab>/<hex> — content-addressed; thumbnails + avatars included --
     blob_index: dict[str, Any] = {}
     missing: list[str] = []
     total_blob_bytes = 0

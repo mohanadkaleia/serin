@@ -310,6 +310,52 @@ describe('FileManager download — worker-side LRU', () => {
   })
 })
 
+describe('FileManager avatars (ENG-152) — worker-side fetch + LRU', () => {
+  it('fetches a member avatar once per (user, sha); a NEW sha re-fetches', async () => {
+    const { server, http, manager } = makeFiles()
+    server.meProfile = {
+      user_id: 'u_alice',
+      display_name: 'Alice',
+      email: 'a@example.com',
+      role: 'member',
+      is_bot: false,
+      title: null,
+      description: null,
+      status_emoji: null,
+      status_text: null,
+      status_expires_at: null,
+      avatar_sha256: null,
+    }
+    server.respondUploadAvatar() // Alice now has avatar v1
+    const sha1 = server.meProfile.avatar_sha256 ?? ''
+
+    const first = await manager.fetchAvatar({ user_id: 'u_alice', avatar_sha256: sha1 })
+    const second = await manager.fetchAvatar({ user_id: 'u_alice', avatar_sha256: sha1 })
+    expect(first.blob).toBeInstanceOf(Blob)
+    expect(second.blob).toBe(first.blob) // same cached instance
+    expect(http.getBlobCalls).toEqual(['/v1/users/u_alice/avatar'])
+
+    // The avatar CHANGES (new sha) → a new cache key → a fresh fetch.
+    server.respondUploadAvatar()
+    const sha2 = server.meProfile.avatar_sha256 ?? ''
+    expect(sha2).not.toBe(sha1)
+    const updated = await manager.fetchAvatar({ user_id: 'u_alice', avatar_sha256: sha2 })
+    expect(updated.blob).toBeInstanceOf(Blob)
+    expect(updated.blob).not.toBe(first.blob)
+    expect(http.getBlobCalls).toHaveLength(2)
+  })
+
+  it('returns a null blob (uncached) on the server uniform 404', async () => {
+    const { manager, http } = makeFiles()
+
+    const res = await manager.fetchAvatar({ user_id: 'u_nobody', avatar_sha256: 'x'.repeat(64) })
+    expect(res.blob).toBeNull()
+    // Not cached: a later fetch (e.g. after the user uploads) re-hits the server.
+    await manager.fetchAvatar({ user_id: 'u_nobody', avatar_sha256: 'x'.repeat(64) })
+    expect(http.getBlobCalls).toHaveLength(2)
+  })
+})
+
 describe('FileManager — token boundary', () => {
   it('never surfaces a token in a progress frame or a fetch result', async () => {
     const { manager, frames, http } = makeFiles()

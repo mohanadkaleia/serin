@@ -60,6 +60,8 @@ export {
   type UploadPhase,
   type UploadProgress,
   type FileFetchResult,
+  // ENG-152 profile pictures (the tab seam: UserAvatar / useAvatarUrl).
+  type AvatarFetchResult,
   // ENG-120 client `file.uploaded` projection + attachments query (ENG-121 UI reads these).
   type FileRow,
   type AttachmentsResult,
