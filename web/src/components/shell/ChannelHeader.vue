@@ -4,7 +4,7 @@
 // Extracted from AppShell's inline `<header data-testid="channel-header">` so the
 // timeline chrome matches the reference mockup: a bold `# channel` (or DM) title
 // with a favorite STAR, a muted member/topic subline, and a cluster of right-
-// aligned icon actions (add-member, pin, details). The `channel-header` test-id is
+// aligned icon actions (pin, details). The `channel-header` test-id is
 // preserved on the root `<header>` — the golden-path + m3-messaging-core E2E suites
 // assert the title text through it, and its `.text()` MUST stay the title alone
 // (the icon buttons carry no text; the member/topic subline is a SIBLING `<p>`, not
@@ -16,8 +16,9 @@
 // header's `.text()` is still the title alone). Everything else is a LOCAL,
 // honest scaffold with no backend — the star/pin toggles are local ref state,
 // "N members" is a stand-in count (the workspace directory user count), and
-// "Add a topic" is a non-wired affordance. `add-member` / `toggle-details` are
-// emitted for the parent to wire (details drawer lands in a later PR).
+// "Add a topic" is a non-wired affordance. `toggle-details` is emitted for the
+// parent to wire. There is NO add-member button here (ENG-152 cleanup) — adding
+// members lives in the channel-settings dialog via the Details drawer.
 import { ref } from 'vue'
 
 import Icon from '../ui/Icon.vue'
@@ -48,8 +49,6 @@ const props = withDefaults(
 )
 
 defineEmits<{
-  /** Open the add-member affordance (wired by the parent to channel settings). */
-  'add-member': []
   /** Toggle the channel Details drawer (wired in AppShell — ENG-136/ENG-129). */
   'toggle-details': []
 }>()
@@ -77,14 +76,6 @@ const favorite = ref(false)
       </IconButton>
     </div>
     <div class="flex items-center gap-1">
-      <IconButton
-        size="sm"
-        label="Add member"
-        data-testid="channel-header-add-member"
-        @click="$emit('add-member')"
-      >
-        <Icon name="user-plus" :size="18" />
-      </IconButton>
       <IconButton size="sm" label="Pinned messages">
         <Icon name="pin" :size="18" />
       </IconButton>

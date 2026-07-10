@@ -320,46 +320,19 @@ describe('MessageItem', () => {
     expect(wrapper.emitted('react')?.[0]?.[2]).toBe(false)
   })
 
-  // -- ENG-128 presence dot on the author avatar -----------------------------
+  // -- ENG-152 conversation-pane cleanup: NO presence dot on message rows -----
 
-  it('renders the author presence dot from a provided presence map', () => {
+  it('renders NO presence dot next to the author (avatar + name stay)', () => {
     const wrapper = mount(MessageItem, {
       props: {
         message: makeMessage({ author_user_id: 'u_other' }),
-        presence: new Map([['u_other', 'online' as const]]),
-      },
-    })
-    const dot = wrapper.get('[data-testid="presence-dot"]')
-    expect(dot.attributes('data-status')).toBe('online')
-    expect(dot.classes()).toContain('bg-success')
-  })
-
-  it('defaults an author unknown to the presence map to offline', () => {
-    const wrapper = mount(MessageItem, {
-      props: {
-        message: makeMessage({ author_user_id: 'u_other' }),
-        presence: new Map([['u_someone_else', 'online' as const]]),
-      },
-    })
-    const dot = wrapper.get('[data-testid="presence-dot"]')
-    expect(dot.attributes('data-status')).toBe('offline')
-    expect(dot.classes()).toContain('bg-muted')
-  })
-
-  it('renders NO dot without a presence map (e.g. the thread pane)', () => {
-    const wrapper = mount(MessageItem, { props: { message: makeMessage() } })
-    expect(wrapper.find('[data-testid="presence-dot"]').exists()).toBe(false)
-  })
-
-  it('renders NO dot on a grouped follow-up row (no avatar to anchor to)', () => {
-    const wrapper = mount(MessageItem, {
-      props: {
-        message: makeMessage({ author_user_id: 'u_other' }),
-        showHeader: false,
-        presence: new Map([['u_other', 'online' as const]]),
+        names: new Map([['u_other', 'Other']]),
       },
     })
     expect(wrapper.find('[data-testid="presence-dot"]').exists()).toBe(false)
+    // The avatar + author name are unaffected by the dot removal.
+    expect(wrapper.get('[data-testid="message-avatar"]').text()).toBe('O')
+    expect(wrapper.get('[data-testid="message-author"]').text()).toBe('Other')
   })
 })
 

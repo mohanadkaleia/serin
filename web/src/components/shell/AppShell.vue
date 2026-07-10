@@ -53,7 +53,6 @@ const {
   workspaceName,
   workspaceInitials,
   myUserId,
-  presenceStatuses,
   selectedStream,
   selectedStreamId,
   mentionItems,
@@ -116,12 +115,6 @@ async function onSearchJump(streamId: string, messageId: string): Promise<void> 
   }
 }
 
-/** SCAFFOLD: the add-member affordance lives in the sidebar's channel settings
- * today; the header's button is a forward hook (a dedicated flow is a follow-up). */
-function onHeaderAddMember(): void {
-  // No-op scaffold — a real add-member entry point is wired in a follow-up.
-}
-
 /** The Details drawer's Members row → the EXISTING channel-settings dialog
  * (rename/archive + add/remove member, ENG-104), targeted at the selected stream. */
 const settingsFor = ref<SidebarStream | null>(null)
@@ -168,7 +161,6 @@ const gridCols = computed(() => {
             :title="mainTitle"
             :presence="headerPresence"
             :member-count="memberCount"
-            @add-member="onHeaderAddMember"
             @toggle-details="toggleDetails"
           />
 
@@ -178,7 +170,6 @@ const gridCols = computed(() => {
               ref="messageListRef"
               :messages="displayMessages"
               :names="names"
-              :presence="presenceStatuses"
               :unread-count="unreadCount"
               :has-more="hasMore"
               :stream-key="selectedStreamId"
