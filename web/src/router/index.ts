@@ -4,7 +4,9 @@ import AppShell from '../components/shell/AppShell.vue'
 import { useAuthStore } from '../stores/auth'
 import AcceptInviteView from '../views/AcceptInviteView.vue'
 import LoginView from '../views/LoginView.vue'
+import OnboardingView from '../views/OnboardingView.vue'
 import SetupView from '../views/SetupView.vue'
+import { isTauri } from '../worker/tauri/detect'
 
 // History mode (D-4): deep links like /channel/abc are client routes; the
 // FastAPI SPA fallback (SPAStaticFiles) returns index.html for them in prod.
@@ -24,14 +26,46 @@ export const router = createRouter({
       component: AcceptInviteView,
       meta: { public: true },
     },
+    // M6-5 (ENG-170): the desktop first-run screen (server URL + workspace
+    // folder). Tauri-only — the guard below sends browser navigations home
+    // and desktop first-runs here.
+    {
+      path: '/onboarding',
+      name: 'onboarding',
+      component: OnboardingView,
+      meta: { public: true },
+    },
   ],
 })
+
+// Desktop first-run probe (M6-5), resolved once per page load. Only a Tauri
+// env ever calls this, so browsers never fetch the lazy Tauri chunk.
+let onboardingNeeded: Promise<boolean> | undefined
+
+function desktopNeedsOnboarding(): Promise<boolean> {
+  onboardingNeeded ??= import('../worker/tauri/boot')
+    .then((m) => m.needsOnboarding())
+    .catch(() => false) // an unreadable config must not wedge routing
+  return onboardingNeeded
+}
 
 // Auth gate (ENG-78, R9). On the first navigation the store phase is 'unknown';
 // resolve it once (init() asks the worker for status), then enforce access:
 // unauthenticated → protected route redirects to /login?redirect=<path>;
 // authenticated → /login or /setup redirects home.
 router.beforeEach(async (to) => {
+  // Desktop onboarding gate (M6-5), BEFORE the auth gate: with no desktop
+  // config there is no server URL, so login cannot work yet — every route
+  // funnels to /onboarding until the config exists (the view then reloads
+  // the window). In a browser, /onboarding is not a real destination.
+  if (isTauri()) {
+    if ((await desktopNeedsOnboarding()) && to.name !== 'onboarding') {
+      return { name: 'onboarding' }
+    }
+  } else if (to.name === 'onboarding') {
+    return { name: 'home' }
+  }
+
   const auth = useAuthStore()
   if (auth.phase === 'unknown') {
     try {
