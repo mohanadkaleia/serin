@@ -63,6 +63,8 @@ export {
   // ENG-120 client `file.uploaded` projection + attachments query (ENG-121 UI reads these).
   type FileRow,
   type AttachmentsResult,
+  // ENG-152 workspace file listing (the Files view reads this).
+  type FilesListResult,
   // ENG-126 server FTS search (ENG-127 SearchOverlay reads these; worker-authed).
   type SearchHit,
   type SearchParams,

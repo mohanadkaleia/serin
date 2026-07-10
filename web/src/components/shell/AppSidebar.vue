@@ -354,7 +354,7 @@ function dmStatus(stream: SidebarStream): PresenceStatus | undefined {
         <NavGroup title="Workspace" storage-key="workspace" data-testid="nav-group-workspace">
           <template #icon><Icon name="folder" :size="14" /></template>
 
-          <!-- SCAFFOLD single-row nav. -->
+          <!-- REAL Files surface (ENG-152): the workspace file listing. -->
           <SidebarItem
             :active="activeView === 'files'"
             data-testid="nav-files"

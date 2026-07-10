@@ -227,6 +227,8 @@ function fileRow(id: string, over: Partial<FileRow> = {}): FileRow {
     mime_type: 'image/png',
     size_bytes: 7,
     stream_id: 's1',
+    uploaded_by: 'u_author',
+    created_at: '2026-01-01T00:00:00.000Z',
     ...over,
   }
 }

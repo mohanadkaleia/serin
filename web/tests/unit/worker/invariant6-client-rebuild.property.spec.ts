@@ -703,7 +703,10 @@ describe('§12 invariant 6 — client rebuild ≡ incremental [property]', () =>
       }),
       { numRuns: 300 },
     )
-  })
+    // 300 fake-indexeddb-backed runs sit at ~4.5s on a loaded machine — right at
+    // vitest's 5s default, which made this flake under a busy full-suite run.
+    // Explicit headroom: the property asserts CORRECTNESS, not latency.
+  }, 20_000)
 
   // ------------------------------------------------------------------------
   // Property 2c — DETERMINISTIC out-of-order TEETH. Proves the windowed gate above

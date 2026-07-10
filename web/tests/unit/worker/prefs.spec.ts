@@ -101,8 +101,12 @@ describe.each([
 })
 
 describe('Dexie version(4) prefs table is orthogonal to PROJECTION_VERSION', () => {
-  it('adding the prefs table did NOT bump PROJECTION_VERSION (stays 5)', () => {
-    expect(PROJECTION_VERSION).toBe(5)
+  it('adding the prefs table did NOT bump PROJECTION_VERSION (a deliberate pin)', () => {
+    // This pin exists so an ACCIDENTAL bump (which drops + rebuilds every derived
+    // table on all clients) is caught in review. Update it ONLY for a deliberate,
+    // documented shape change. History: 5 = ENG-120 (files table + file_ids);
+    // 6 = ENG-152 (FileRow gained uploaded_by/created_at for the Files view).
+    expect(PROJECTION_VERSION).toBe(6)
   })
 
   it('opening the version(4) DB with an in-sync projection version does NOT rebuild', async () => {

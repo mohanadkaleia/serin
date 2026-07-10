@@ -30,6 +30,7 @@ import type {
   EventBody,
   EventRow,
   FileRow,
+  FilesListResult,
   MessageReactions,
   MessageRow,
   MessagesListResult,
@@ -188,6 +189,10 @@ export function applyFileUploadedV1(event: EventRow, body: EventBody): FileRow |
     mime_type: p.mime_type,
     size_bytes: p.size_bytes,
     stream_id: event.stream_id, // from the ENVELOPE, not the payload
+    // ENG-152 display fields, from the hashed BODY (not the payload) — both
+    // deterministic functions of the event, so rebuild ≡ incremental holds.
+    uploaded_by: typeof body.author_user_id === 'string' ? body.author_user_id : '',
+    created_at: typeof body.client_created_at === 'string' ? body.client_created_at : '',
   }
 }
 
@@ -616,6 +621,8 @@ function serializeFileRow(row: FileRow): string {
     name: row.name,
     mime_type: row.mime_type,
     size_bytes: row.size_bytes,
+    uploaded_by: row.uploaded_by,
+    created_at: row.created_at,
   }
   return JSON.stringify(ordered)
 }
@@ -692,6 +699,37 @@ export async function listAttachments(db: MsgDb, messageId: string): Promise<Att
     else pending_file_ids.push(id)
   }
   return { message_id: messageId, files, pending_file_ids }
+}
+
+/**
+ * Whether a locally-cached stream row is READABLE-shaped for the signed-in user:
+ * a stream they are a member of, or a public channel. Mirrors the server's
+ * `readable_streams_predicate` branches the client can evaluate locally.
+ */
+function isReadableStream(stream: StreamRow): boolean {
+  return stream.member || (stream.kind === 'channel' && stream.visibility === 'public')
+}
+
+/**
+ * The workspace file listing (`files.list`, ENG-152) — every projected `FileRow`,
+ * newest-first (`created_at` desc, `file_id` desc tiebreak). A pure LOCAL
+ * projection read (zero network): the `files` table only ever holds
+ * `file.uploaded` events the server's sync ALREADY scoped to the caller's
+ * readable streams (`readable_streams_predicate`), so the server enforced
+ * read-authz at delivery time. The join against the local `streams` table is a
+ * DEFENSIVE second layer: a file whose stream row is missing or no longer
+ * readable-shaped (e.g. the user left a private channel and the row flipped
+ * `member:false`) is dropped rather than listed.
+ */
+export async function listFiles(db: MsgDb): Promise<FilesListResult> {
+  const [rows, streams] = await Promise.all([db.getAllFiles(), db.listStreams()])
+  const readable = new Set(streams.filter(isReadableStream).map((s) => s.stream_id))
+  const files = rows.filter((f) => readable.has(f.stream_id))
+  files.sort((a, b) => {
+    if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1
+    return a.file_id < b.file_id ? 1 : a.file_id > b.file_id ? -1 : 0
+  })
+  return { files }
 }
 
 /** Kinds excluded from the `#channel` autocomplete (DMs + infra). */

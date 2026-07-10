@@ -18,8 +18,9 @@ import {
   dumpFiles,
   FILE_HANDLERS,
   listAttachments,
+  listFiles,
 } from '../../../src/worker/projection'
-import type { EventRow, MsgDb } from '../../../src/worker/types'
+import type { EventRow, MsgDb, StreamRow } from '../../../src/worker/types'
 
 import { fakeIdbOptions } from './helpers'
 import { fileId, fileUploadedEvent, messageCreatedEvent } from './projfixtures'
@@ -57,6 +58,8 @@ describe('applyFileUploadedV1 (pure row builder)', () => {
       mime_type: 'application/pdf',
       size_bytes: 4096,
       stream_id: S, // from the ENVELOPE, NOT the payload (which carries no stream_id)
+      uploaded_by: 'u_author', // ENG-152: body.author_user_id
+      created_at: '2026-01-01T00:00:00.000Z', // ENG-152: body.client_created_at
     })
   })
 
@@ -164,6 +167,8 @@ describe.each([
         name: 'one.png',
         mime_type: 'image/png',
         size_bytes: 1234,
+        uploaded_by: 'u_author',
+        created_at: '2026-01-01T00:00:00.000Z',
       }),
     )
     expect(lines[1]).toContain(F2)
@@ -248,5 +253,107 @@ describe.each([
     expect(await dumpFiles(before)).toBe(await dumpFiles(after))
     await before.close()
     await after.close()
+  })
+})
+
+// ===========================================================================
+// files.list — the ENG-152 workspace file listing (against both DB backends).
+// ===========================================================================
+
+describe.each([
+  { name: 'MemoryDb', make: (): Promise<MsgDb> => Promise.resolve(new MemoryDb()) },
+  { name: 'DexieDb', make: (): Promise<MsgDb> => openDb(fakeIdbOptions()) },
+])('files.list query [$name]', ({ make }) => {
+  /** A member channel stream row (the common readable shape). */
+  function stream(id: string, over: Partial<StreamRow> = {}): StreamRow {
+    return { stream_id: id, kind: 'channel', name: id, head_seq: 0, member: true, ...over }
+  }
+
+  it('lists files newest-first (created_at desc, file_id desc tiebreak)', async () => {
+    const db = await make()
+    await db.putStreams([stream(S)])
+    await apply(db, [
+      fileUploadedEvent({
+        streamId: S,
+        seq: 1,
+        fileId: F1,
+        clientCreatedAt: '2026-01-01T00:00:00.000Z',
+      }),
+      fileUploadedEvent({
+        streamId: S,
+        seq: 2,
+        fileId: F2,
+        clientCreatedAt: '2026-02-01T00:00:00.000Z',
+      }),
+      // Same instant as F2 → the higher file_id wins the tiebreak (desc).
+      fileUploadedEvent({
+        streamId: S,
+        seq: 3,
+        fileId: fileId(3),
+        clientCreatedAt: '2026-02-01T00:00:00.000Z',
+      }),
+    ])
+    const res = await listFiles(db)
+    expect(res.files.map((f) => f.file_id)).toEqual([fileId(3), F2, F1])
+    await db.close()
+  })
+
+  it('carries the display fields the Files view renders (uploader + date)', async () => {
+    const db = await make()
+    await db.putStreams([stream(S)])
+    await apply(db, [
+      fileUploadedEvent({
+        streamId: S,
+        seq: 1,
+        fileId: F1,
+        authorUserId: 'u_uploader',
+        clientCreatedAt: '2026-03-04T05:06:07.000Z',
+      }),
+    ])
+    const res = await listFiles(db)
+    expect(res.files[0]?.uploaded_by).toBe('u_uploader')
+    expect(res.files[0]?.created_at).toBe('2026-03-04T05:06:07.000Z')
+    await db.close()
+  })
+
+  it('DEFENSE: drops files whose local stream row is not readable-shaped', async () => {
+    const db = await make()
+    const S_PRIVATE = 's_private_left'
+    const S_PUBLIC = 's_public'
+    const S_DM = 's_dm'
+    await db.putStreams([
+      stream(S), // member channel → readable
+      // A private channel the user LEFT (member flipped false) → NOT readable.
+      stream(S_PRIVATE, { visibility: 'private', member: false }),
+      // A public channel the user never joined → readable (server predicate parity).
+      stream(S_PUBLIC, { visibility: 'public', member: false }),
+      // A DM (membership is what makes it readable).
+      stream(S_DM, { kind: 'dm', member: true }),
+    ])
+    const events: EventRow[] = [
+      fileUploadedEvent({ streamId: S, seq: 1, fileId: fileId(11) }),
+      fileUploadedEvent({ streamId: S_PRIVATE, seq: 1, fileId: fileId(12) }),
+      fileUploadedEvent({ streamId: S_PUBLIC, seq: 1, fileId: fileId(13) }),
+      fileUploadedEvent({ streamId: S_DM, seq: 1, fileId: fileId(14) }),
+      // No local stream row at all → dropped (defensive).
+      fileUploadedEvent({ streamId: 's_unknown', seq: 1, fileId: fileId(15) }),
+    ]
+    await db.putEvents(events)
+    for (const ev of events) await applyEventsToProjection(db, ev.stream_id, [ev])
+
+    const res = await listFiles(db)
+    const ids = res.files.map((f) => f.file_id)
+    expect(ids).toContain(fileId(11)) // member channel
+    expect(ids).toContain(fileId(13)) // public channel
+    expect(ids).toContain(fileId(14)) // member DM
+    expect(ids).not.toContain(fileId(12)) // left private channel — filtered
+    expect(ids).not.toContain(fileId(15)) // unknown stream — filtered
+    await db.close()
+  })
+
+  it('empty projection → empty list (the Files view empty state)', async () => {
+    const db = await make()
+    expect(await listFiles(db)).toEqual({ files: [] })
+    await db.close()
   })
 })
