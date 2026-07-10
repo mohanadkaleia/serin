@@ -67,8 +67,9 @@ export function useShellController() {
   const notifications = useNotificationsStore()
 
   const { myUserId, role } = storeToRefs(auth)
-  // Live presence snapshot (ENG-128): `user_id → status`, threaded to the message
-  // list so author avatars carry a REAL presence dot. Ephemeral, worker-owned.
+  // Live presence snapshot (ENG-128): `user_id → status`, ephemeral + worker-owned.
+  // Consumed here for the DM header dot (message rows carry NO presence dot —
+  // ENG-152 conversation-pane cleanup).
   const { statuses: presenceStatuses } = storeToRefs(presence)
   const {
     selectedStream,
@@ -503,7 +504,6 @@ export function useShellController() {
     workspaceInitials,
     // store-derived refs
     myUserId,
-    presenceStatuses,
     selectedStream,
     selectedStreamId,
     channels,

@@ -212,11 +212,6 @@ function onToolbarBold(): void {
   editor.value?.chain().focus().toggleBold().run()
 }
 
-/** `@` toolbar button → insert '@' so the tiptap mention suggestion plugin fires. */
-function onToolbarMention(): void {
-  editor.value?.chain().focus().insertContent('@').run()
-}
-
 /** File-picker change: add the chosen files, then reset so re-picking the same fires. */
 function onFilePicked(event: Event): void {
   const input = event.target as HTMLInputElement
@@ -346,7 +341,6 @@ export type { MentionItem }
         @attach="openFilePicker"
         @bold="onToolbarBold"
         @emoji="onToolbarEmoji"
-        @mention="onToolbarMention"
         @send="submit"
       />
 

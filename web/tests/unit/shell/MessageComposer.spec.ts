@@ -20,7 +20,11 @@ async function mountComposer(props: Record<string, unknown> = {}) {
 /** The exposed test surface (editor instance + imperative hooks). */
 interface ComposerVm {
   editor: {
-    commands: { setContent: (c: JSONContent, emit?: boolean) => void; clearContent: () => void }
+    commands: {
+      setContent: (c: JSONContent, emit?: boolean) => void
+      insertContent: (c: string) => void
+      clearContent: () => void
+    }
     isEmpty: boolean
   }
   submit: () => void
@@ -141,5 +145,80 @@ describe('MessageComposer (TipTap, ENG-101)', () => {
     expect(cls).toContain('outline-none')
     expect(cls).toContain('focus:outline-none')
     expect(cls).toContain('focus-visible:outline-none')
+  })
+})
+
+// -- ENG-152 conversation-pane cleanup: type-@ autocomplete, NO toolbar @ button.
+//
+// The tiptap Mention suggestion plugin is driven by TYPING `@` in the editor —
+// the popup filters the (zero-network) `mentionItems` projection prop and a
+// selection inserts the SAME mention node the toolbar path used to, so the
+// serialized text + `mentions[]` payload are byte-identical to before.
+describe('MessageComposer — type-@ mention autocomplete (ENG-152)', () => {
+  afterEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  const items: MentionItem[] = [
+    { id: 'u_dana', label: 'Dana', kind: 'user' },
+    { id: 'u_bob', label: 'Bob', kind: 'user' },
+    { id: 's_gen', label: 'general', kind: 'channel' },
+  ]
+
+  it('renders NO @ toolbar button — mentions are typed, not clicked', async () => {
+    const wrapper = await mountComposer({ mentionItems: items })
+    expect(wrapper.find('[data-testid="composer-mention-btn"]').exists()).toBe(false)
+    expect(wrapper.find('button[aria-label="Mention someone"]').exists()).toBe(false)
+    // The rest of the toolbar (attach/emoji/send) is untouched.
+    expect(wrapper.find('[data-testid="attach-file"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="composer-emoji"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="composer-send"]').exists()).toBe(true)
+  })
+
+  it('typing @ opens the suggestion popup filtered to matching USERS', async () => {
+    const wrapper = await mountComposer({ mentionItems: items })
+    const vm = vmOf(wrapper)
+
+    vm.editor.commands.insertContent('@Da')
+    await flushPromises()
+
+    // The popup is appended to <body> (mention-popup) with the filtered options:
+    // "Da" matches Dana only — Bob and the #general channel are excluded.
+    const popup = document.body.querySelector('[data-testid="mention-popup"]')
+    expect(popup).not.toBeNull()
+    const options = popup!.querySelectorAll('[data-testid="mention-option"]')
+    expect(options).toHaveLength(1)
+    expect(options[0]!.textContent).toContain('Dana')
+    wrapper.unmount()
+  })
+
+  it('selecting a suggestion inserts the SAME mention data → mentions[] on send', async () => {
+    const wrapper = await mountComposer({ mentionItems: items })
+    const vm = vmOf(wrapper)
+
+    vm.editor.commands.insertContent('@Da')
+    await flushPromises()
+
+    // jsdom quirk: the Mention extension's commit calls `getSelection().
+    // collapseToEnd()`, which THROWS on jsdom's initially-empty selection (a
+    // real browser always has one). Seed a trivial selection first.
+    const range = document.createRange()
+    range.setStart(document.body, 0)
+    range.setEnd(document.body, 0)
+    window.getSelection()?.addRange(range)
+
+    // Commit the highlighted option (the list commits on mousedown).
+    const option = document.body.querySelector('[data-testid="mention-option"]')
+    expect(option).not.toBeNull()
+    option!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }))
+    await flushPromises()
+
+    vm.submit()
+    const [text, mentions, fileIds] = wrapper.emitted('send')?.[0] as [string, string[], string[]]
+    // Identical payload shape to the old toolbar-@ path: markdown source text with
+    // the `@label` chip serialization and the resolved `u_` id in mentions[].
+    expect(text).toContain('@Dana')
+    expect(mentions).toEqual(['u_dana'])
+    expect(fileIds).toEqual([])
   })
 })

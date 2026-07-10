@@ -22,10 +22,12 @@
 //                 (XSS-safe segments, never v-html), and `search-jump` lands on
 //                 that message in the conversation.
 //   3. PRESENCE + TYPING (two browsers) — the owner sees the second member's
-//                 `presence-dot` flip ONLINE on their message row (ephemeral WS
-//                 presence — never persisted, §3.3/D3), and sees the
-//                 "Second is typing…" `typing-indicator` while the second
-//                 member types in the shared channel.
+//                 `presence-dot` read ONLINE in the New DM people picker
+//                 (ephemeral WS presence — never persisted, §3.3/D3; message
+//                 rows carry NO presence dot since the ENG-152 conversation-
+//                 pane cleanup), and sees the "Second is typing…"
+//                 `typing-indicator` while the second member types in the
+//                 shared channel.
 //   4. NOTIFICATIONS (two browsers) — the owner @mentions the second member in
 //                 #general while the second member is on the Inbox view (no
 //                 active conversation): an in-app `notification-toast` appears
@@ -214,17 +216,23 @@ test('m3.5 presence + typing: A sees B online (presence dot) and sees B typing l
   await login(page2, SECOND)
   await openGeneral(page2)
 
-  // --- 1) B posts → A's row for it carries B's presence dot, ONLINE ----------
+  // --- 1) A sees B ONLINE in the New DM people picker -------------------------
   // (Ephemeral WS presence only — the store's default is offline until the
   // worker's presence push says otherwise, so `data-status="online"` proves the
-  // live frame arrived; nothing about presence is ever persisted or pulled.)
-  const probe = `presence probe ${Date.now()}`
-  await sendMain(page2, probe)
-  const probeRow = mainRow(page1, probe)
-  await expect(probeRow.getByTestId('message-text')).toBeVisible({ timeout: WS_TIMEOUT })
-  await expect(probeRow.getByTestId('presence-dot')).toHaveAttribute('data-status', 'online', {
+  // live frame arrived; nothing about presence is ever persisted or pulled.
+  // Message rows carry NO presence dot since the ENG-152 conversation-pane
+  // cleanup — the people picker's per-user dot is the asserted surface. The
+  // picker is only OPENED, never committed: no DM is created, keeping the m3
+  // spec's fresh-DM flow undisturbed.)
+  await page1.getByTestId('open-new-dm').click()
+  await expect(page1.getByTestId('new-dm')).toBeVisible()
+  await page1.getByTestId('new-dm-filter').fill('Second')
+  const secondRow = page1.getByTestId('new-dm-user').filter({ hasText: 'Second' }).first()
+  await expect(secondRow.getByTestId('presence-dot')).toHaveAttribute('data-status', 'online', {
     timeout: WS_TIMEOUT,
   })
+  await page1.getByTestId('new-dm').getByRole('button', { name: 'Close' }).click()
+  await expect(page1.getByTestId('new-dm')).toBeHidden()
 
   // --- 2) B types in the shared channel → A sees "Second is typing…" ---------
   // pressSequentially keeps the composer updating (each update re-signals; the

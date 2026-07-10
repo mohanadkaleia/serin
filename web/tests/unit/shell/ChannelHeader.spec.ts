@@ -26,12 +26,17 @@ describe('ChannelHeader', () => {
     expect(wrapper.get('[data-testid="channel-header-meta"]').text()).toContain('1 member ·')
   })
 
-  it('emits add-member and toggle-details from the header actions', async () => {
+  it('renders NO add-member button (ENG-152 cleanup); pin + details remain', async () => {
     const wrapper = mount(ChannelHeader, { props: { title: '# eng' } })
-    await wrapper.get('[data-testid="channel-header-add-member"]').trigger('click')
-    expect(wrapper.emitted('add-member')).toHaveLength(1)
+    // The add-user icon button next to the pin was removed — adding members
+    // lives in the channel-settings dialog via the Details drawer.
+    expect(wrapper.find('[data-testid="channel-header-add-member"]').exists()).toBe(false)
+    expect(wrapper.find('button[aria-label="Add member"]').exists()).toBe(false)
 
-    // The details (more-horizontal) button — labeled, last in the action cluster.
+    // The pin button is still there…
+    expect(wrapper.find('button[aria-label="Pinned messages"]').exists()).toBe(true)
+
+    // …and the details (more-horizontal) button still emits toggle-details.
     const details = wrapper.get('button[aria-label="Details"]')
     await details.trigger('click')
     expect(wrapper.emitted('toggle-details')).toHaveLength(1)

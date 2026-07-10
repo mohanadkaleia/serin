@@ -4,8 +4,10 @@
 // PURELY PRESENTATIONAL: it holds no store/editor state and never touches the
 // worker — it only renders the icon-button row + the accent circular send button
 // and EMITS intent up to MessageComposer, which owns the tiptap editor and the send
-// gate. The `+`/paperclip attach, `Aa` bold, emoji, and `@` mention buttons are
-// REAL (wired in the parent); mic/audio are rendered but `disabled` (no backend yet).
+// gate. The `+`/paperclip attach, `Aa` bold, and emoji buttons are REAL (wired in
+// the parent); mic/audio are rendered but `disabled` (no backend yet). There is NO
+// `@` button — @mentions are typed: `@` in the editor opens the tiptap suggestion
+// popup (ENG-152 conversation-pane cleanup).
 import Icon from '../ui/Icon.vue'
 import IconButton from '../ui/IconButton.vue'
 
@@ -23,7 +25,6 @@ const emit = defineEmits<{
   attach: []
   bold: []
   emoji: [event: MouseEvent]
-  mention: []
   send: []
 }>()
 </script>
@@ -44,14 +45,6 @@ const emit = defineEmits<{
         @click="emit('emoji', $event)"
       >
         <Icon name="smile" :size="18" />
-      </IconButton>
-      <IconButton
-        size="sm"
-        label="Mention someone"
-        data-testid="composer-mention-btn"
-        @click="emit('mention')"
-      >
-        <Icon name="at-sign" :size="18" />
       </IconButton>
       <IconButton size="sm" label="Attach link" @click="emit('attach')">
         <Icon name="paperclip" :size="18" />

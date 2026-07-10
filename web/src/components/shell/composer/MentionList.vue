@@ -29,6 +29,12 @@ function commit(index: number): void {
   if (item) props.command({ id: item.id, label: item.label })
 }
 
+/** First letter of a display name for the user avatar chip (safe-interpolated). */
+function initial(label: string): string {
+  const c = label.trim().charAt(0)
+  return c ? c.toUpperCase() : '?'
+}
+
 /** Keyboard nav delegated from the suggestion plugin. Returns true when handled. */
 function onKeyDown(event: KeyboardEvent): boolean {
   if (props.items.length === 0) return false
@@ -66,7 +72,14 @@ defineExpose({ onKeyDown })
       data-testid="mention-option"
       @mousedown.prevent="commit(index)"
     >
-      <span class="text-muted">{{ item.kind === 'channel' ? '#' : '@' }}</span>
+      <!-- User rows carry an initials avatar (Ranin); channel rows keep the # glyph. -->
+      <span
+        v-if="item.kind === 'user'"
+        class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent-subtle text-[10px] font-semibold text-accent"
+        aria-hidden="true"
+        >{{ initial(item.label) }}</span
+      >
+      <span v-else class="text-muted">#</span>
       <span class="truncate">{{ item.label }}</span>
     </button>
     <div v-if="props.items.length === 0" class="px-3 py-1.5 text-muted">No matches</div>

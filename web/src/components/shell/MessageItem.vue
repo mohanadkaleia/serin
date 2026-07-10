@@ -19,10 +19,9 @@ import { computed, ref, watch } from 'vue'
 import type { DisplayMessage } from '../../stores/messages'
 import { useAttachments } from '../../composables/useAttachments'
 import { formatTime } from '../../lib/time'
-import type { FileRow, PresenceStatus } from '../../worker'
+import type { FileRow } from '../../worker'
 import EmojiPicker from '../ui/EmojiPicker.vue'
 import Icon from '../ui/Icon.vue'
-import PresenceDot from '../ui/PresenceDot.vue'
 import AttachmentFile from './AttachmentFile.vue'
 import AttachmentImage from './AttachmentImage.vue'
 import ReactionPill from './ReactionPill.vue'
@@ -45,12 +44,6 @@ const props = withDefaults(
      */
     names?: ReadonlyMap<string, string> | undefined
     /**
-     * Live presence `user_id → status` map (ENG-128) driving the avatar's presence
-     * dot. Absent (undefined) → NO dot renders (e.g. the thread pane / contexts
-     * that do not wire presence); a provided map defaults unknown ids to offline.
-     */
-    presence?: ReadonlyMap<string, PresenceStatus> | undefined
-    /**
      * Briefly highlight this row (ENG-127 search jump-to-message): a tinted
      * background the parent clears after a moment. Purely visual.
      */
@@ -68,7 +61,6 @@ const props = withDefaults(
     editing: false,
     showHeader: true,
     names: undefined,
-    presence: undefined,
     flash: false,
     readonly: false,
   },
@@ -155,13 +147,6 @@ const authorName = computed(
 )
 const authorInitial = computed(() => initial(authorName.value))
 
-/** The author's live presence for the avatar dot — undefined ⇒ no dot (ENG-128). */
-const authorStatus = computed<PresenceStatus | undefined>(() =>
-  props.presence === undefined
-    ? undefined
-    : (props.presence.get(props.message.author_user_id) ?? 'offline'),
-)
-
 const pickerOpen = ref(false)
 /** The trailing "add reaction" ghost pill's picker (separate anchor; one open at a time). */
 const addPickerOpen = ref(false)
@@ -239,22 +224,16 @@ function confirmDelete(): void {
          avatar shows only on a group's LEADING row; a grouped follow-up keeps the
          (empty) gutter so its text aligns under the first message's text. -->
     <div class="w-10 shrink-0" data-testid="message-gutter">
-      <div v-if="props.showHeader && !isDeleted" class="relative h-10 w-10">
-        <div
-          class="flex h-10 w-10 items-center justify-center rounded-full bg-accent-subtle text-sm font-semibold text-accent"
-          data-testid="message-avatar"
-          :title="authorName"
-          aria-hidden="true"
-        >
-          {{ authorInitial }}
-        </div>
-        <!-- Live presence dot (ENG-128): rendered only when the parent wires a
-             presence map; reflects the AUTHOR's status (unknown ⇒ offline). -->
-        <PresenceDot
-          v-if="authorStatus"
-          :status="authorStatus"
-          class="absolute -bottom-0.5 -right-0.5 border-2 border-background"
-        />
+      <!-- No presence dot on message rows (ENG-152 conversation-pane cleanup):
+           live presence stays on the sidebar/DM header/people pickers only. -->
+      <div
+        v-if="props.showHeader && !isDeleted"
+        class="flex h-10 w-10 items-center justify-center rounded-full bg-accent-subtle text-sm font-semibold text-accent"
+        data-testid="message-avatar"
+        :title="authorName"
+        aria-hidden="true"
+      >
+        {{ authorInitial }}
       </div>
     </div>
 
