@@ -91,6 +91,16 @@ export class WorkspaceMirror {
   private readonly heads = new Map<string, number>()
   /** Serializes manifest read-modify-write cycles (bootstrap vs. live registration). */
   private registerQueue: Promise<void> = Promise.resolve()
+  /**
+   * Per-stream serialization of {@link appendApplied} (ENG-168, M6-4 — the
+   * M6-3 review's Low-2). Today the engine already serializes appends per
+   * stream (live frames ride `withStreamLock`; bootstrap catch-up runs one
+   * sequential loop per stream), but that guarantee lives in the CALLER. Two
+   * concurrent appends racing the `headSeq` read would both see the same head
+   * and double-append the run — so the mirror now owns its own guard: a future
+   * pull-path refactor can never open a double-writer window.
+   */
+  private readonly appendQueues = new Map<string, Promise<unknown>>()
 
   constructor(
     /** The durable NDJSON log seam — also the rebuild-from-disk read surface. */
@@ -144,10 +154,30 @@ export class WorkspaceMirror {
    * `head+1`, gapless — anything else would corrupt the mirror and is refused
    * fail-closed (the thrown error also stops the cursor from advancing past
    * bytes that never became durable).
+   *
+   * Appends are SERIALIZED per stream inside the mirror itself (M6-4, Low-2):
+   * the head-read → dedupe → append cycle is a read-modify-write, so two
+   * concurrent calls for one stream queue rather than race (either one would
+   * otherwise read a stale head and double-append).
    */
-  async appendApplied(streamId: string, rows: readonly EventRow[]): Promise<void> {
-    if (rows.length === 0) return
+  appendApplied(streamId: string, rows: readonly EventRow[]): Promise<void> {
+    if (rows.length === 0) return Promise.resolve()
     const sid = safeStreamId(streamId)
+    const prev = this.appendQueues.get(sid) ?? Promise.resolve()
+    const run = prev.then(
+      () => this.appendAppliedLocked(sid, rows),
+      () => this.appendAppliedLocked(sid, rows),
+    )
+    // Keep the queue alive past a rejection so a later append still runs.
+    this.appendQueues.set(
+      sid,
+      run.catch(() => undefined),
+    )
+    return run
+  }
+
+  /** The {@link appendApplied} body — only ever entered under the per-stream queue. */
+  private async appendAppliedLocked(sid: string, rows: readonly EventRow[]): Promise<void> {
     const manifest = await this.loadManifest()
     if (!manifest.streams[sid]) {
       // Registration-before-write, enforced fail-closed: verify treats an
