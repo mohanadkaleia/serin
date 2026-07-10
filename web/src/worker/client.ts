@@ -23,6 +23,7 @@ import {
   type AuthResult,
   type AuthStatus,
   type BackfillResult,
+  type AvatarFetchResult,
   type FileFetchResult,
   type FilesListResult,
   type FileUploadParams,
@@ -238,6 +239,22 @@ export function makeWorkerClient(clientId: string, transport: Transport): Worker
       get: () => caller.request({ method: 'me.get', params: {} }) as Promise<MeProfile>,
       update: (params: MeUpdateParams) =>
         caller.request({ method: 'me.update', params }) as Promise<MeProfile>,
+      // ENG-152: the avatar Blob crosses by structured clone; the worker owns
+      // the POST (raw bytes + bearer). The echoed profile carries the new sha.
+      uploadAvatar: (blob: Blob) =>
+        caller.request({ method: 'me.uploadAvatar', params: { blob } }) as Promise<MeProfile>,
+      clearAvatar: () =>
+        caller.request({ method: 'me.clearAvatar', params: {} }) as Promise<MeProfile>,
+    },
+    // Other-user reads (ENG-152): a member's avatar bytes via the workspace-
+    // readable serve endpoint — worker-side fetch + LRU keyed by the directory
+    // sha; the tab mints the object URL (useAvatarUrl).
+    users: {
+      avatar: (userId: string, avatarSha256: string) =>
+        caller.request({
+          method: 'user.avatar',
+          params: { user_id: userId, avatar_sha256: avatarSha256 },
+        }) as Promise<AvatarFetchResult>,
     },
     // Read-state (ENG-126): `mark` clears the unread/mention badge (optimistic +
     // monotonic worker-side; the `{kind:'stream'}` push re-derives the badge).

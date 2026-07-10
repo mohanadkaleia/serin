@@ -39,6 +39,15 @@ const names = computed<ReadonlyMap<string, string>>(
   () => new Map(directory.value.users.map((u) => [u.user_id, u.display_name])),
 )
 
+/** Directory-backed `user_id → avatar_sha256` (ENG-152 avatar images in rows). */
+const avatars = computed<ReadonlyMap<string, string>>(() => {
+  const map = new Map<string, string>()
+  for (const u of directory.value.users) {
+    if (u.avatar_sha256 !== undefined) map.set(u.user_id, u.avatar_sha256)
+  }
+  return map
+})
+
 // Preview-scoped window: independent of the active conversation's store.
 const { messages, loading, send } = usePreviewMessages(() => props.entry?.stream_id ?? null)
 
@@ -113,6 +122,7 @@ function onSend(text: string, mentions: string[], fileIds: string[]): void {
             :message="item.message"
             :show-header="item.showHeader"
             :names="names"
+            :avatars="avatars"
             readonly
           />
         </div>

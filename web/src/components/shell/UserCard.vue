@@ -22,6 +22,7 @@ import { computed } from 'vue'
 import type { PresenceStatus } from '../../worker'
 import Icon from '../ui/Icon.vue'
 import PresenceDot from '../ui/PresenceDot.vue'
+import UserAvatar from '../ui/UserAvatar.vue'
 
 const props = withDefaults(
   defineProps<{
@@ -33,6 +34,12 @@ const props = withDefaults(
     statusEmoji?: string | undefined
     // eslint-disable-next-line vue/require-default-prop -- optional; absent = no custom status
     statusText?: string | undefined
+    /** ENG-152: the signed-in user's id + avatar ref (from the directory) — the
+     * chip renders their avatar IMAGE when set, else the initial as before. */
+    // eslint-disable-next-line vue/require-default-prop -- optional; absent = initials
+    userId?: string | undefined
+    // eslint-disable-next-line vue/require-default-prop -- optional; absent = initials
+    avatarSha?: string | undefined
   }>(),
   {
     status: 'online',
@@ -40,8 +47,6 @@ const props = withDefaults(
 )
 
 const emit = defineEmits<{ openProfile: [] }>()
-
-const initial = computed(() => (props.name.trim()[0] ?? '?').toUpperCase())
 const online = computed(() => props.status === 'online')
 const statusLabel = computed(() => (online.value ? 'Online' : 'Offline'))
 /** Narrowed for the dot (exactOptionalPropertyTypes: the default is 'online'). */
@@ -61,11 +66,13 @@ const hasCustomStatus = computed(
     @click="emit('openProfile')"
   >
     <span class="relative shrink-0">
-      <span
+      <UserAvatar
         aria-hidden="true"
         class="grid h-7 w-7 place-items-center rounded-full bg-accent-subtle text-[12px] font-semibold text-accent"
-        >{{ initial }}</span
-      >
+        :user-id="props.userId"
+        :name="props.name"
+        :sha="props.avatarSha"
+      />
       <PresenceDot
         :status="dotStatus"
         class="absolute -bottom-0.5 -right-0.5 border-2 border-surface"

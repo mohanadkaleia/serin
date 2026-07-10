@@ -47,3 +47,24 @@ export async function updateMe(http: HttpClient, params: MeUpdateParams): Promis
   if (params.status !== undefined) body['status'] = params.status
   return unwrap(await http.patch<MeProfile>('/v1/me', body))
 }
+
+/**
+ * `me.uploadAvatar` → `POST /v1/me/avatar` (ENG-152). The tab hands over an
+ * opaque image `Blob` (structured clone); the worker POSTs the RAW bytes with
+ * the picked file's content type — the server treats them as hostile, decodes
+ * + re-encodes to a normalized square (stripping EXIF), and echoes the updated
+ * profile carrying the re-encode's `avatar_sha256`. A 400 (not an image /
+ * bomb) surfaces as `invalid-image`; an over-cap body as `file-too-large`.
+ */
+export async function uploadAvatar(http: HttpClient, blob: Blob): Promise<MeProfile> {
+  return unwrap(
+    await http.postBlob<MeProfile>('/v1/me/avatar', blob, {
+      contentType: blob.type || 'application/octet-stream',
+    }),
+  )
+}
+
+/** `me.clearAvatar` → `DELETE /v1/me/avatar`; echoes the (avatar-less) profile. */
+export async function clearAvatar(http: HttpClient): Promise<MeProfile> {
+  return unwrap(await http.del<MeProfile>('/v1/me/avatar'))
+}

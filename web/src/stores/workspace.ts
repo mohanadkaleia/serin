@@ -26,6 +26,9 @@ export interface MentionItem {
   id: string
   label: string
   kind: 'user' | 'channel'
+  /** ENG-152: the user's avatar ref (user rows only) — the dropdown renders the
+   * image chip when set, else the initial. */
+  avatar_sha?: string
 }
 
 /** A sidebar row: a projected stream merged with its live badge (+ DM participants). */
@@ -112,6 +115,7 @@ export const useWorkspaceStore = defineStore('workspace', () => {
       id: u.user_id,
       label: u.display_name,
       kind: 'user' as const,
+      ...(u.avatar_sha256 !== undefined ? { avatar_sha: u.avatar_sha256 } : {}),
     })),
     ...directory.value.channels.map((c) => ({
       id: c.stream_id,

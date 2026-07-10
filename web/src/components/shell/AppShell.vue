@@ -62,6 +62,7 @@ const {
   mainTitle,
   headerPresence,
   names,
+  avatars,
   memberCount,
   unreadCount,
   scaffold,
@@ -170,6 +171,7 @@ const gridCols = computed(() => {
               ref="messageListRef"
               :messages="displayMessages"
               :names="names"
+              :avatars="avatars"
               :unread-count="unreadCount"
               :has-more="hasMore"
               :stream-key="selectedStreamId"

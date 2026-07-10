@@ -138,6 +138,20 @@ export function useShellController() {
     return map
   })
 
+  /**
+   * Directory-backed `user_id → avatar_sha256` map (ENG-152) — threaded down
+   * the SAME paths as `names`, so a message row can render the author's avatar
+   * IMAGE (worker-fetched by user id + sha) instead of the initials chip.
+   * Users without an avatar are simply absent (→ initials fallback).
+   */
+  const avatars = computed<ReadonlyMap<string, string>>(() => {
+    const map = new Map<string, string>()
+    for (const u of directory.value.users) {
+      if (u.avatar_sha256 !== undefined) map.set(u.user_id, u.avatar_sha256)
+    }
+    return map
+  })
+
   /** A DM stream's label: the OTHER participant's name (ENG-149), else name/id. */
   function dmLabel(s: SidebarStream): string {
     return dmDisplayName(s.dm_user_ids, myUserId.value, names.value) ?? s.name ?? s.stream_id
@@ -518,6 +532,7 @@ export function useShellController() {
     headerPresence,
     mainTitle,
     names,
+    avatars,
     memberCount,
     unreadCount,
     scaffold,

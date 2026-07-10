@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from msgd.api.deps import CurrentAuth, require_scope
 from msgd.api.schemas.me import MeResponse, StatusUpdate, UpdateMeRequest
+from msgd.auth.context import AuthContext
 from msgd.core.payloads import build_user_profile_updated_body
 from msgd.core.time import now_rfc3339, to_rfc3339
 from msgd.db.engine import get_session
@@ -56,7 +57,7 @@ def _status_expired(user: User, now: datetime) -> bool:
     return user.status_expires_at is not None and user.status_expires_at <= now
 
 
-def _me_response(user: User) -> MeResponse:
+def me_response(user: User) -> MeResponse:
     """Project the caller's ``users`` row to the self-profile shape.
 
     Applies LAZY status expiry: an expired status reads as cleared (all three
@@ -76,6 +77,7 @@ def _me_response(user: User) -> MeResponse:
         status_emoji=None if expired else user.status_emoji,
         status_text=None if expired else user.status_text,
         status_expires_at=None if (expired or expires_at is None) else to_rfc3339(expires_at),
+        avatar_sha256=user.avatar_sha256,
     )
 
 
@@ -112,7 +114,7 @@ def _apply_status(user: User, status: StatusUpdate | None, now: datetime) -> Non
 @router.get("/me", response_model=MeResponse)
 async def get_me(ctx: CurrentAuth) -> MeResponse:
     """The caller's own profile — the row ``require_auth`` already loaded."""
-    return _me_response(ctx.user)
+    return me_response(ctx.user)
 
 
 # ENG-159 (security review): PATCH /v1/me is a bot-reachable EVENT-LOG WRITE — it
@@ -149,6 +151,22 @@ async def update_me(req: UpdateMeRequest, ctx: CurrentAuth, db: DbSession) -> Me
     if "status" in provided:
         _apply_status(user, req.status, now)
 
+    await emit_profile_updated(db, ctx=ctx, user=user)
+
+    await db.commit()
+    return me_response(user)
+
+
+async def emit_profile_updated(db: AsyncSession, *, ctx: AuthContext, user: User) -> None:
+    """Append ONE self-authored ``user.profile_updated`` carrying ``user``'s row state.
+
+    The shared emit for every self-profile write surface — ``PATCH /v1/me`` here
+    and the ENG-152 avatar endpoints (:mod:`msgd.api.routers.avatars`). The
+    payload carries the RESULTING profile values (including ``avatar_sha256``),
+    so the client directory fold — which applies every carried key, ``null``
+    clearing — always converges on the row. Runs inside the caller's
+    transaction; does not commit.
+    """
     # Setup always creates the single workspace-meta stream (seq 1), so it must
     # exist for any real workspace — same assertion as accept-invite.
     meta_stream_id = await db.scalar(
@@ -176,8 +194,6 @@ async def update_me(req: UpdateMeRequest, ctx: CurrentAuth, db: DbSession) -> Me
             status_expires_at=(
                 None if user.status_expires_at is None else to_rfc3339(user.status_expires_at)
             ),
+            avatar_sha256=user.avatar_sha256,
         ),
     )
-
-    await db.commit()
-    return _me_response(user)

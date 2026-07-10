@@ -259,6 +259,20 @@ def blob_size_mismatch() -> ProblemException:
     )
 
 
+def invalid_image() -> ProblemException:
+    # ``POST /v1/me/avatar`` (ENG-152): the uploaded bytes are not a decodable
+    # raster image — a non-image, a truncated/crafted payload, or a
+    # decompression bomb over the decoded-pixel bound. Deliberately ONE uniform
+    # body for all of these: the reject reason is a fact about hostile input and
+    # is not worth an oracle distinguishing "too many pixels" from "not an image".
+    return ProblemException(
+        status=400,
+        type="/problems/invalid-image",
+        title="Not a usable image",
+        detail="the uploaded bytes are not a decodable image within the allowed bounds",
+    )
+
+
 # --- handler registration ----------------------------------------------------
 
 

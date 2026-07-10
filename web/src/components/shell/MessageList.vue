@@ -38,6 +38,11 @@ const props = withDefaults(
      */
     names?: ReadonlyMap<string, string> | undefined
     /**
+     * Directory `user_id → avatar_sha256` map (ENG-152), threaded to each row so
+     * the leading chip renders the author's avatar IMAGE when set (else initials).
+     */
+    avatars?: ReadonlyMap<string, string> | undefined
+    /**
      * INTERIM unread count for the "New" divider (ENG-136). There is no
      * `readState.get` RPC exposed to the tab yet, so the divider is placed before
      * the last `unreadCount` messages — a VISUAL APPROXIMATION. Exact placement
@@ -53,6 +58,7 @@ const props = withDefaults(
     loadOlder: () => Promise.resolve(0),
     editingMessageId: null,
     names: undefined,
+    avatars: undefined,
     unreadCount: 0,
   },
 )
@@ -279,6 +285,7 @@ onBeforeUnmount(() => {
           :message="item.message"
           :show-header="item.showHeader"
           :names="props.names"
+          :avatars="props.avatars"
           :editing="item.message.message_id === props.editingMessageId"
           :flash="item.message.message_id === flashId"
           @retry="emit('retry', $event)"

@@ -711,10 +711,13 @@ function makeStreamRewritingHttp(evilStream: string): HttpClient {
     get<T>(): Promise<ApiResult<T>> {
       throw new Error('unused')
     },
-    del(): Promise<ApiResult<void>> {
+    del<T = void>(): Promise<ApiResult<T>> {
       throw new Error('unused')
     },
     putBlob(): Promise<ApiResult<void>> {
+      throw new Error('unused')
+    },
+    postBlob<T>(): Promise<ApiResult<T>> {
       throw new Error('unused')
     },
     getBlob(): Promise<ApiResult<{ blob: Blob; mimeType: string }>> {

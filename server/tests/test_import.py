@@ -69,7 +69,7 @@ from msgd.projections.dump import (
 )
 from msgd.projections.rebuild import rebuild_projections
 from msgd.settings import Settings
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 EXPORTED_AT = "2026-07-09T12:00:00.000Z"
@@ -104,7 +104,8 @@ class SeededA:
     member_id: str
     guest_id: str
     bundle_dir: Path
-    blob_shas: dict[str, bytes]  # sha -> content bytes (content, thumbnail, text)
+    blob_shas: dict[str, bytes]  # sha -> content bytes (content, thumbnail, text, avatar)
+    avatar_sha: str  # the owner's ENG-152 avatar blob digest
     state: CapturedState
 
 
@@ -118,7 +119,8 @@ class CapturedState:
     guest_readable: set[str]
     member_readable: set[str]
     # user_id, email, display_name, role, is_bot, deactivated_at, + ENG-164:
-    # title, description, status_emoji, status_text, status_expires_at.
+    # title, description, status_emoji, status_text, status_expires_at,
+    # + ENG-152: avatar_sha256.
     users: list[
         tuple[
             str,
@@ -126,6 +128,7 @@ class CapturedState:
             str,
             str,
             bool,
+            str | None,
             str | None,
             str | None,
             str | None,
@@ -206,6 +209,8 @@ async def _capture_state(
             u.status_emoji,
             u.status_text,
             _opt_rfc3339(u.status_expires_at),
+            # ENG-152 profile picture — part of the round-trip surface.
+            u.avatar_sha256,
         )
         for u in (await db.execute(select(User).order_by(User.user_id))).scalars().all()
     ]
@@ -449,9 +454,14 @@ async def _seed_and_export(db: AsyncSession, tmp_path: Path) -> SeededA:
     content = b"PNG-ish bytes \x89PNG..." * 10
     thumb = b"WEBP-thumb-bytes" * 4
     text_blob = b"quarterly numbers, very private\n" * 8
+    avatar = b"WEBP-avatar-bytes (server re-encode)" * 3
     content_sha = await store.put(_bytes_stream(content))
     thumb_sha = await store.put(_bytes_stream(thumb))
     text_sha = await store.put(_bytes_stream(text_blob))
+    # ENG-152: the owner's profile picture — a USER-referenced blob (no files
+    # row) that must round-trip as ref (users.json) + bytes (blobs/) together.
+    avatar_sha = await store.put(_bytes_stream(avatar))
+    await db.execute(update(User).where(User.user_id == owner).values(avatar_sha256=avatar_sha))
 
     f_img, f_txt = sorted(ids.new_file_id() for _ in range(2))
     db.add(
@@ -535,7 +545,8 @@ async def _seed_and_export(db: AsyncSession, tmp_path: Path) -> SeededA:
         member_id=member,
         guest_id=guest,
         bundle_dir=bundle_dir,
-        blob_shas={content_sha: content, thumb_sha: thumb, text_sha: text_blob},
+        blob_shas={content_sha: content, thumb_sha: thumb, text_sha: text_blob, avatar_sha: avatar},
+        avatar_sha=avatar_sha,
         state=state,
     )
 
@@ -598,7 +609,7 @@ async def test_round_trip_restores_projections_membership_blobs_and_users(
     assert seeded.dm_id not in b.guest_readable
 
     # --- blobs: every one restored, content-addressed, byte-exact -------------
-    assert result.blobs == len(seeded.blob_shas) == 3
+    assert result.blobs == len(seeded.blob_shas) == 4
     for sha, content in seeded.blob_shas.items():
         restored = (tmp_path / "b-blobs" / sha[:2] / sha).read_bytes()
         assert restored == content
@@ -607,10 +618,20 @@ async def test_round_trip_restores_projections_membership_blobs_and_users(
     # --- users: snapshot fields verbatim; credentials re-minted ---------------
     # ENG-164: the OWNER carries a full richer profile (title/description/status
     # with a future expiry); the other two carry nulls — all round-trip verbatim.
-    def _profile(role: str) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    def _profile(
+        role: str,
+    ) -> tuple[str | None, str | None, str | None, str | None, str | None, str | None]:
+        # ENG-164 profile + the ENG-152 avatar ref: the OWNER carries them all.
         if role == "owner":
-            return ("Founder", "Runs Acme.", "🚀", "shipping", "2099-01-01T00:00:00.000Z")
-        return (None, None, None, None, None)
+            return (
+                "Founder",
+                "Runs Acme.",
+                "🚀",
+                "shipping",
+                "2099-01-01T00:00:00.000Z",
+                seeded.avatar_sha,
+            )
+        return (None, None, None, None, None, None)
 
     assert (
         b.users
@@ -1166,6 +1187,27 @@ async def test_tampered_blob_is_rejected_by_verified_restore(
     await _assert_all_empty(db_session)
     # The tampered bytes were never promoted into the store.
     assert not (tmp_path / "b-blobs" / sha[:2] / sha).exists()
+
+
+async def test_malformed_avatar_sha256_in_users_json_aborts(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    """ENG-152: a users.json ``avatar_sha256`` that is not bare-hex sha256 (or
+    null) fails closed — a path-shaped or truncated ref must never reach the
+    ``users`` row (the serve endpoint builds a blob path from this column)."""
+    seeded = await _seed_and_export(db_session, tmp_path)
+    users_path = seeded.bundle_dir / "users.json"
+    users = json.loads(users_path.read_text(encoding="utf-8"))
+    users[0]["avatar_sha256"] = "../../etc/passwd"
+    users_path.write_text(json.dumps(users), encoding="utf-8")
+    await db_session.execute(text(_RESET))
+
+    with pytest.raises(RestoreError, match="avatar_sha256"):
+        await import_workspace(
+            db_session, LocalDiskBlobStore(tmp_path / "b-blobs"), seeded.bundle_dir
+        )
+    await db_session.rollback()
+    await _assert_all_empty(db_session)
 
 
 async def test_owner_recredential_requires_exactly_one_match(

@@ -24,7 +24,7 @@
 //
 // SECURITY: every profile field is user-controlled — rendered via text
 // interpolation only.
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 
 import { resolveWorkerClient } from '../../composables/useWorkerClient'
@@ -32,6 +32,7 @@ import { usePresenceStore } from '../../stores/presence'
 import { useWorkspaceStore } from '../../stores/workspace'
 import Button from '../ui/Button.vue'
 import PresenceDot from '../ui/PresenceDot.vue'
+import UserAvatar from '../ui/UserAvatar.vue'
 
 import type { MeProfile, MeUpdateParams } from '../../worker'
 
@@ -97,8 +98,92 @@ function saveErrorCopy(err: unknown): string {
   )
 }
 
-const initial = computed(() => (draft.value.trim()[0] ?? '?').toUpperCase())
 const statusLabel = computed(() => (myStatus.value === 'online' ? 'Online' : 'Offline'))
+
+// -- avatar (ENG-152): pick → client-side preview → upload via the seam --------
+
+/** Client-side pre-checks mirror the server caps (its 400/413 stays the truth). */
+const AVATAR_MAX_BYTES = 5 * 1024 * 1024
+
+const AVATAR_MESSAGES: Record<string, string> = {
+  'invalid-image': 'That file could not be read as an image. Try a PNG or JPEG.',
+  'file-too-large': 'That image is too large — pick one under 5 MB.',
+  unauthenticated: 'Your session has expired. Please sign in again.',
+  network: 'Could not reach the server. Check your connection and try again.',
+}
+
+const fileInput = ref<HTMLInputElement | null>(null)
+/** True while an avatar upload/remove RPC is in flight. */
+const avatarBusy = ref(false)
+/** A failed avatar upload/remove (inline error under the avatar block). */
+const avatarError = ref<string | null>(null)
+/** Local object URL of the just-picked file — instant preview while (and after)
+ * the upload runs; revoked on replace/unmount. */
+const previewUrl = ref<string | null>(null)
+
+const hasAvatar = computed(() => (profile.value?.avatar_sha256 ?? null) !== null)
+const avatarSha = computed(() => profile.value?.avatar_sha256 ?? undefined)
+
+function clearPreview(): void {
+  if (previewUrl.value) URL.revokeObjectURL(previewUrl.value)
+  previewUrl.value = null
+}
+
+function avatarErrorCopy(err: unknown): string {
+  const code = errorCode(err)
+  return (
+    (code !== null ? AVATAR_MESSAGES[code] : undefined) ??
+    'Could not update your photo. Please try again.'
+  )
+}
+
+async function onAvatarPicked(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = '' // re-picking the same file must re-fire `change`
+  if (!file) return
+  avatarError.value = null
+  if (!file.type.startsWith('image/')) {
+    avatarError.value = AVATAR_MESSAGES['invalid-image'] ?? 'Not an image.'
+    return
+  }
+  if (file.size > AVATAR_MAX_BYTES) {
+    avatarError.value = AVATAR_MESSAGES['file-too-large'] ?? 'Image too large.'
+    return
+  }
+  clearPreview()
+  previewUrl.value = URL.createObjectURL(file)
+  avatarBusy.value = true
+  try {
+    const client = await resolveWorkerClient()
+    profile.value = await client.me.uploadAvatar(file)
+    // Nudge the directory so every avatar render picks up the new sha once the
+    // profile event syncs (best-effort; the fold is the source of truth).
+    void workspace.refresh()
+  } catch (err) {
+    clearPreview() // the upload failed — don't show a face the server rejected
+    avatarError.value = avatarErrorCopy(err)
+  } finally {
+    avatarBusy.value = false
+  }
+}
+
+async function removeAvatar(): Promise<void> {
+  avatarError.value = null
+  avatarBusy.value = true
+  try {
+    const client = await resolveWorkerClient()
+    profile.value = await client.me.clearAvatar()
+    clearPreview()
+    void workspace.refresh()
+  } catch (err) {
+    avatarError.value = avatarErrorCopy(err)
+  } finally {
+    avatarBusy.value = false
+  }
+}
+
+onBeforeUnmount(clearPreview)
 
 // -- dirty tracking (per field, so the PATCH stays a SUBSET) -----------------
 
@@ -223,20 +308,37 @@ onMounted(() => void load())
       </div>
 
       <template v-else-if="profile">
-        <!-- Identity header: initials avatar + presence dot + status label. -->
+        <!-- Identity header: avatar (image or initials) + presence dot + status label. -->
         <div class="mb-4 flex items-center gap-3">
           <span class="relative shrink-0">
+            <!-- The just-picked local preview wins (instant feedback); else the
+                 shared avatar atom (server image via the worker, or initials). -->
             <span
               aria-hidden="true"
-              class="grid h-12 w-12 place-items-center rounded-full bg-accent-subtle text-lg font-semibold text-accent"
-              >{{ initial }}</span
+              class="grid h-12 w-12 place-items-center overflow-hidden rounded-full bg-accent-subtle text-lg font-semibold text-accent"
+              data-testid="profile-avatar"
+              :data-has-avatar="previewUrl !== null || hasAvatar ? 'true' : 'false'"
             >
+              <img
+                v-if="previewUrl"
+                :src="previewUrl"
+                alt=""
+                class="h-full w-full rounded-[inherit] object-cover"
+              />
+              <UserAvatar
+                v-else
+                class="grid h-full w-full place-items-center rounded-[inherit]"
+                :user-id="profile.user_id"
+                :name="draft.trim() || profile.display_name"
+                :sha="avatarSha"
+              />
+            </span>
             <PresenceDot
               :status="myStatus"
               class="absolute -bottom-0.5 -right-0.5 border-2 border-surface-elevated"
             />
           </span>
-          <div class="min-w-0">
+          <div class="min-w-0 flex-1">
             <p class="truncate text-sm font-medium text-primary" data-testid="profile-name-preview">
               {{ draft.trim() || profile.display_name }}
             </p>
@@ -246,6 +348,37 @@ onMounted(() => void load())
             <p class="text-xs text-muted" data-testid="profile-presence">{{ statusLabel }}</p>
           </div>
         </div>
+
+        <!-- Avatar controls (ENG-152): pick (hidden input) + remove. The server
+             does the crop/resize/normalize; this is a plain pick+preview+upload. -->
+        <div class="mb-4 flex items-center gap-2">
+          <input
+            ref="fileInput"
+            type="file"
+            accept="image/*"
+            class="hidden"
+            data-testid="profile-avatar-upload"
+            @change="onAvatarPicked"
+          />
+          <Button variant="ghost" size="sm" :disabled="avatarBusy" @click="fileInput?.click()">
+            {{
+              avatarBusy ? 'Uploading…' : hasAvatar || previewUrl ? 'Change photo' : 'Upload photo'
+            }}
+          </Button>
+          <Button
+            v-if="hasAvatar"
+            variant="ghost"
+            size="sm"
+            :disabled="avatarBusy"
+            data-testid="profile-avatar-remove"
+            @click="removeAvatar"
+          >
+            Remove photo
+          </Button>
+        </div>
+        <p v-if="avatarError" class="mb-3 text-xs text-danger" data-testid="profile-avatar-error">
+          {{ avatarError }}
+        </p>
 
         <!-- Editable display name. -->
         <label class="mb-1 block text-xs font-medium text-secondary" for="profile-name-input"

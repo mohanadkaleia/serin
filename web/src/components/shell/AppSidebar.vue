@@ -60,6 +60,7 @@ import Icon from '../ui/Icon.vue'
 import NavGroup from '../ui/NavGroup.vue'
 import NavSection from '../ui/NavSection.vue'
 import SidebarItem from '../ui/SidebarItem.vue'
+import UserAvatar from '../ui/UserAvatar.vue'
 import ChannelBrowser from './ChannelBrowser.vue'
 import ChannelSettingsDialog from './ChannelSettingsDialog.vue'
 import CreateChannelDialog from './CreateChannelDialog.vue'
@@ -126,6 +127,9 @@ const myStatus = computed(() => presence.myStatus)
  */
 const myCustomStatus = computed(() => activeStatus(workspace.userOf(auth.myUserId)))
 
+/** The signed-in user's avatar ref for the footer card (ENG-152). */
+const myAvatarSha = computed(() => workspace.userOf(auth.myUserId)?.avatar_sha256)
+
 /** Select a real stream + switch the main panel to the conversation timeline. */
 function select(stream: SidebarStream): void {
   workspace.selectStream(stream.stream_id)
@@ -159,9 +163,19 @@ function labelFor(stream: SidebarStream): string {
   return stream.name ?? stream.stream_id
 }
 
-/** Single-letter avatar for a DM row (from the resolved label). */
-function dmInitial(stream: SidebarStream): string {
-  return labelFor(stream).trim()[0]?.toUpperCase() ?? '?'
+/**
+ * The single OTHER participant of a 1:1 DM (ENG-152 avatar target). A group DM
+ * (or unknown participants) returns undefined — the row keeps the initials chip.
+ */
+function dmOtherUserId(stream: SidebarStream): string | undefined {
+  const others = (stream.dm_user_ids ?? []).filter((id) => id !== auth.myUserId)
+  return others.length === 1 ? others[0] : undefined
+}
+
+/** The DM counterpart's avatar ref, when they have one (ENG-152). */
+function dmAvatarSha(stream: SidebarStream): string | undefined {
+  const other = dmOtherUserId(stream)
+  return other === undefined ? undefined : workspace.userOf(other)?.avatar_sha256
 }
 </script>
 
@@ -250,12 +264,14 @@ function dmInitial(stream: SidebarStream): string {
           @click="select(stream)"
         >
           <template #leading>
-            <!-- Avatar initial only — the DM-row presence dot was removed
-                 (sidebar restructure feedback); presence elsewhere is intact. -->
-            <span
+            <!-- Avatar (image when set, initial otherwise) — the DM-row presence
+                 dot was removed (sidebar restructure feedback). -->
+            <UserAvatar
               class="grid h-4 w-4 place-items-center rounded-full bg-accent-subtle text-[10px] font-semibold text-accent"
-              >{{ dmInitial(stream) }}</span
-            >
+              :user-id="dmOtherUserId(stream)"
+              :name="labelFor(stream)"
+              :sha="dmAvatarSha(stream)"
+            />
           </template>
           {{ labelFor(stream) }}
           <template v-if="stream.mention" #trailing>
@@ -397,6 +413,8 @@ function dmInitial(stream: SidebarStream): string {
         :status="myStatus"
         :status-emoji="myCustomStatus?.emoji"
         :status-text="myCustomStatus?.text"
+        :user-id="auth.myUserId ?? undefined"
+        :avatar-sha="myAvatarSha"
         @open-profile="showProfile = true"
       />
       <p class="px-2 pt-1 text-[11px] text-muted" data-testid="local-first-note">

@@ -770,6 +770,11 @@ export interface DirectoryUser {
   status_emoji?: string
   status_text?: string
   status_expires_at?: string
+  /** ENG-152 profile picture ref (the server re-encode's digest). Folded from
+   * `user.profile_updated` like every other profile field (`null` clears →
+   * the key is deleted); the UI renders the image via `client.users.avatar`
+   * and falls back to initials when absent. */
+  avatar_sha256?: string
 }
 
 /** One `#channel`-able stream (ENG-101). */
@@ -1006,6 +1011,17 @@ export interface UploadAck {
  * tab DOM.
  */
 export interface FileFetchResult {
+  blob: Blob | null
+  mime_type?: string
+}
+
+/**
+ * `user.avatar` result (ENG-152): the member's avatar bytes (a server
+ * re-encoded WEBP), or a `null` blob on the server's uniform 404 (no avatar /
+ * unknown user — no existence oracle). Same tab-mints-the-object-URL contract
+ * as {@link FileFetchResult}.
+ */
+export interface AvatarFetchResult {
   blob: Blob | null
   mime_type?: string
 }
@@ -1333,6 +1349,10 @@ export interface MeProfile {
   status_emoji: string | null
   status_text: string | null
   status_expires_at: string | null
+  /** ENG-152 profile picture — the content-addressed digest of the caller's
+   * SERVER-RE-ENCODED avatar blob (`null` = none). Set by `me.uploadAvatar`,
+   * cleared by `me.clearAvatar`; the image bytes are fetched via `user.avatar`. */
+  avatar_sha256: string | null
 }
 
 /**
@@ -1424,6 +1444,14 @@ export type RpcRequest =
   // structurally self-only; a 401/422 surfaces as a coded error).
   | { method: 'me.get'; params: Record<string, never> }
   | { method: 'me.update'; params: MeUpdateParams }
+  // ENG-152 profile pictures. The upload hands the worker an opaque Blob
+  // (structured clone) which the worker POSTs raw to `/v1/me/avatar` — the
+  // token and every `/v1/` path stay worker-side (no-http-in-ui). `user.avatar`
+  // fetches ANY member's avatar bytes through the workspace-readable serve
+  // endpoint (LRU-cached worker-side, keyed by the directory-carried sha).
+  | { method: 'me.uploadAvatar'; params: { blob: Blob } }
+  | { method: 'me.clearAvatar'; params: Record<string, never> }
+  | { method: 'user.avatar'; params: { user_id: string; avatar_sha256: string } }
   | { method: 'readState.mark'; params: { stream_id: string; last_read_seq: number } }
   | { method: 'prefs.get'; params: Record<string, never> }
   | { method: 'prefs.set'; params: { stream_id: string; level: PrefLevel } }
@@ -1614,6 +1642,22 @@ export interface WorkerClient {
   me: {
     get(): Promise<MeProfile>
     update(params: MeUpdateParams): Promise<MeProfile>
+    /** ENG-152: set the caller's avatar from a picked image `Blob` (the worker
+     * POSTs the raw bytes; the server re-encodes + strips metadata). Returns
+     * the updated profile carrying the new `avatar_sha256`. */
+    uploadAvatar(blob: Blob): Promise<MeProfile>
+    /** ENG-152: remove the caller's avatar (`avatar_sha256 → null`). */
+    clearAvatar(): Promise<MeProfile>
+  }
+
+  /**
+   * Other-user reads (ENG-152). `avatar` fetches a member's avatar bytes via
+   * the workspace-readable serve endpoint — worker-side fetch + LRU (keyed by
+   * the directory-carried sha, so a changed avatar re-fetches), only opaque
+   * bytes cross to the tab.
+   */
+  users: {
+    avatar(userId: string, avatarSha256: string): Promise<AvatarFetchResult>
   }
 
   /**

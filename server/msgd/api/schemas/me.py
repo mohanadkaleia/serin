@@ -91,6 +91,9 @@ class MeResponse(BaseModel):
     RFC 3339 string; the handler applies LAZY expiry before projecting the row
     (an expired status reads as cleared — nulls — with no background job),
     matching how the client fold/UI treats the event-carried timestamp.
+    ``avatar_sha256`` (ENG-152) is the content-addressed digest of the caller's
+    server-re-encoded profile picture (``null`` = no avatar); the bytes are
+    served by ``GET /v1/users/{user_id}/avatar``.
     """
 
     user_id: str
@@ -103,6 +106,7 @@ class MeResponse(BaseModel):
     status_emoji: str | None = None
     status_text: str | None = None
     status_expires_at: str | None = None
+    avatar_sha256: str | None = None
 
 
 class UpdateMeRequest(BaseModel):

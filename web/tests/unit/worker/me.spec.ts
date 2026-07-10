@@ -7,7 +7,7 @@
 
 import { describe, expect, it } from 'vitest'
 
-import { getMe, updateMe } from '../../../src/worker/me'
+import { clearAvatar, getMe, updateMe, uploadAvatar } from '../../../src/worker/me'
 import { WorkerCore } from '../../../src/worker/core'
 import { MemoryDb } from '../../../src/worker/db'
 import { RpcCodedError } from '../../../src/worker/types'
@@ -28,6 +28,7 @@ function profile(overrides: Partial<MeProfile> = {}): MeProfile {
     status_emoji: null,
     status_text: null,
     status_expires_at: null,
+    avatar_sha256: null,
     ...overrides,
   }
 }
@@ -130,6 +131,56 @@ describe('me.update (PATCH /v1/me)', () => {
     const http = new FakeHttpClient(server)
 
     expect(await codeOf(updateMe(http, { display_name: 'X' }))).toBe('unauthenticated')
+  })
+})
+
+describe('me.uploadAvatar / me.clearAvatar (ENG-152)', () => {
+  it('POSTs the RAW blob to /v1/me/avatar with its content type; echoes the new sha', async () => {
+    const server = new FakeSyncServer()
+    server.meProfile = profile()
+    const http = new FakeHttpClient(server)
+    const blob = new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer], { type: 'image/png' })
+
+    const res = await uploadAvatar(http, blob)
+
+    // The bytes went RAW through postBlob (never JSON.stringify'd), typed as picked.
+    expect(http.postBlobCalls).toEqual([
+      { path: '/v1/me/avatar', body: blob, contentType: 'image/png' },
+    ])
+    expect(res.avatar_sha256).not.toBeNull()
+    // The fake server advanced its profile — a subsequent GET sees the avatar.
+    expect((await getMe(http)).avatar_sha256).toBe(res.avatar_sha256)
+  })
+
+  it('clearAvatar DELETEs /v1/me/avatar and echoes the nulled profile', async () => {
+    const server = new FakeSyncServer()
+    server.meProfile = profile()
+    const http = new FakeHttpClient(server)
+    await uploadAvatar(http, new Blob([new Uint8Array([1]).buffer], { type: 'image/png' }))
+
+    const res = await clearAvatar(http)
+
+    expect(http.delCalls).toEqual(['/v1/me/avatar'])
+    expect(res.avatar_sha256).toBeNull()
+    expect((await getMe(http)).avatar_sha256).toBeNull()
+  })
+
+  it('maps upload failures to coded errors (invalid-image / file-too-large / 401)', async () => {
+    const server = new FakeSyncServer()
+    server.meProfile = profile()
+    const http = new FakeHttpClient(server)
+    const blob = new Blob([new Uint8Array([1]).buffer], { type: 'image/png' })
+
+    for (const err of [
+      { status: 400, code: 'invalid-image', title: 'Not a usable image' },
+      { status: 413, code: 'file-too-large', title: 'File too large' },
+      unauthenticated,
+    ]) {
+      server.meError = err
+      expect(await codeOf(uploadAvatar(http, blob))).toBe(err.code)
+    }
+    server.meError = unauthenticated
+    expect(await codeOf(clearAvatar(http))).toBe('unauthenticated')
   })
 })
 

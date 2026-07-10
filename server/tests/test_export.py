@@ -74,6 +74,7 @@ class Seeded:
     content_sha: str = ""
     thumb_sha: str = ""
     dedup_sha: str = ""
+    avatar_sha: str = ""
     events_per_stream: dict[str, int] = field(default_factory=dict)
 
 
@@ -239,9 +240,15 @@ async def _seed(db: AsyncSession, tmp_path: Path) -> Seeded:
     content = b"PNG-ish bytes \x89PNG..." * 10
     thumb = b"WEBP-thumb-bytes" * 4
     shared = b"shared text attachment bytes"
+    avatar = b"WEBP-avatar-bytes (server re-encode)" * 3
     content_sha = await store.put(_bytes_stream(content))
     thumb_sha = await store.put(_bytes_stream(thumb))
     dedup_sha = await store.put(_bytes_stream(shared))
+    # ENG-152: Alice's profile picture — a USER-referenced blob (no files row),
+    # exported via users.json's avatar_sha256 exactly like file content. The
+    # ref lands on the row here (the row was added before the store existed).
+    avatar_sha = await store.put(_bytes_stream(avatar))
+    await db.execute(update(User).where(User.user_id == alice).values(avatar_sha256=avatar_sha))
 
     f1, f2, f3, f4 = sorted(ids.new_file_id() for _ in range(4))
     db.add(
@@ -312,6 +319,7 @@ async def _seed(db: AsyncSession, tmp_path: Path) -> Seeded:
         content_sha=content_sha,
         thumb_sha=thumb_sha,
         dedup_sha=dedup_sha,
+        avatar_sha=avatar_sha,
         events_per_stream={meta: 0, public: 3, private: 2, dm: 1},
     )
 
@@ -381,12 +389,15 @@ async def test_bundle_layout_manifest_and_canonical_lines(
         "status_emoji": "🚀",
         "status_text": "shipping",
         "status_expires_at": "2026-07-01T09:30:00.000Z",
+        # ENG-152: the avatar ref rides users.json (its blob is asserted below).
+        "avatar_sha256": seeded.avatar_sha,
     }
     # Bob has no profile set → the new columns snapshot as null.
     assert users[1]["deactivated_at"] == "2026-07-01T09:30:00.000Z"
     assert users[1]["title"] is None
     assert users[1]["status_emoji"] is None
     assert users[1]["status_expires_at"] is None
+    assert users[1]["avatar_sha256"] is None
 
     # No secret material anywhere in the bundle (password hashes, key names).
     for path in dest.rglob("*"):
@@ -402,15 +413,17 @@ async def test_bundle_layout_manifest_and_canonical_lines(
     assert files[0]["thumbnail_sha256"] == seeded.thumb_sha
     assert all(f["name"] != "ghost.bin" for f in files)
 
-    # --- blobs: content + thumbnail, deduped, byte-exact ------------------------
-    expected_shas = sorted({seeded.content_sha, seeded.thumb_sha, seeded.dedup_sha})
+    # --- blobs: content + thumbnail + avatar, deduped, byte-exact ---------------
+    expected_shas = sorted(
+        {seeded.content_sha, seeded.thumb_sha, seeded.dedup_sha, seeded.avatar_sha}
+    )
     on_disk = sorted(p.name for p in (dest / "blobs").rglob("*") if p.is_file())
     assert on_disk == expected_shas
     for sha in expected_shas:
         data = (dest / "blobs" / sha[:2] / sha).read_bytes()
         assert hashlib.sha256(data).hexdigest() == sha
         assert manifest["blobs"]["index"][sha]["bytes"] == len(data)
-    assert manifest["blobs"]["count"] == 3 == result.blobs
+    assert manifest["blobs"]["count"] == 4 == result.blobs
     assert manifest["blobs"]["total_bytes"] == result.blob_bytes
 
     # --- manifest fields ---------------------------------------------------------
@@ -505,11 +518,44 @@ async def test_missing_blob_hard_fails_unless_allowed(
     manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["missing_blobs"] == [seeded.dedup_sha] == result.missing_blobs
     assert seeded.dedup_sha not in manifest["blobs"]["index"]
-    assert manifest["blobs"]["count"] == 2
+    assert manifest["blobs"]["count"] == 3
     assert not (dest / "blobs" / seeded.dedup_sha[:2] / seeded.dedup_sha).exists()
     # The digest still seals the (missing-blob-recording) manifest.
     digest = manifest.pop("bundle_digest")
     assert digest == f"sha256:{hashlib.sha256(canonicalize(manifest)).hexdigest()}"
+
+
+async def test_missing_avatar_blob_hard_fails_unless_allowed(
+    db_session: AsyncSession, tmp_path: Path
+) -> None:
+    """ENG-152: a user's avatar blob is held to the SAME missing-blob policy as
+    file content — an absent avatar hard-fails the export (no silent
+    ref-without-bytes bundle, the ENG-164-shaped data-loss trap) unless
+    explicitly allowed."""
+    seeded = await _seed(db_session, tmp_path)
+    store = LocalDiskBlobStore(seeded.blob_root)
+    await store.delete(seeded.avatar_sha)
+
+    with pytest.raises(MissingBlobsError) as excinfo:
+        await export_workspace(
+            db_session, store, tmp_path / "fails", exported_at=EXPORTED_AT, tool=TOOL
+        )
+    assert excinfo.value.missing == [seeded.avatar_sha]
+
+    dest = tmp_path / "allowed"
+    result = await export_workspace(
+        db_session,
+        store,
+        dest,
+        exported_at=EXPORTED_AT,
+        tool=TOOL,
+        allow_missing_blobs=True,
+    )
+    manifest = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["missing_blobs"] == [seeded.avatar_sha] == result.missing_blobs
+    # The ref still snapshots (mirroring the source instance's brokenness).
+    users = json.loads((dest / "users.json").read_text(encoding="utf-8"))
+    assert users[0]["avatar_sha256"] == seeded.avatar_sha
 
 
 async def test_keyset_pagination_is_correct_across_page_boundaries(

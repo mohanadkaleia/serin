@@ -39,6 +39,7 @@ import type { Outbox } from './outbox'
 import type { TimerId } from './sync'
 import type {
   AuthStatus,
+  AvatarFetchResult,
   FileFetchResult,
   FileUploadParams,
   UploadAck,
@@ -205,6 +206,28 @@ export class FileManager {
         ? `/v1/files/${params.file_id}/thumbnail`
         : `/v1/files/${params.file_id}`
     const res = await this.http.getBlob(path)
+    if (!res.ok) return { blob: null }
+    this.cachePut(key, res.value)
+    return { blob: res.value.blob, mime_type: res.value.mimeType }
+  }
+
+  /**
+   * Fetch a member's avatar bytes (`user.avatar`, ENG-152) from the
+   * workspace-readable serve endpoint. Shares the bounded download LRU; the
+   * cache key includes the DIRECTORY-CARRIED `avatar_sha256`, so a changed
+   * avatar (new sha) is a fresh key and re-fetches while the old entry ages
+   * out — no stale-face window. A 404 (no avatar / unknown user — the server's
+   * uniform not-found) returns a `null` blob and is NOT cached.
+   */
+  async fetchAvatar(params: {
+    user_id: string
+    avatar_sha256: string
+  }): Promise<AvatarFetchResult> {
+    const key = `avatar:${params.user_id}:${params.avatar_sha256}`
+    const cached = this.cacheGet(key)
+    if (cached) return { blob: cached.blob, mime_type: cached.mimeType }
+
+    const res = await this.http.getBlob(`/v1/users/${params.user_id}/avatar`)
     if (!res.ok) return { blob: null }
     this.cachePut(key, res.value)
     return { blob: res.value.blob, mime_type: res.value.mimeType }

@@ -327,6 +327,11 @@ export class FakeSyncServer {
   meProfile: MeProfile | undefined
   /** When set, EVERY `/v1/me` call fails with this error (401 / 422 model). */
   meError: ApiError | undefined
+  // -- ENG-152 avatars --------------------------------------------------------
+  /** `user_id → served avatar bytes` for `GET /v1/users/{id}/avatar`. */
+  readonly avatarBlobs = new Map<string, Uint8Array>()
+  /** Counter minting deterministic fake "re-encode" digests on upload. */
+  private avatarSeq = 0
 
   // -- ENG-119 Files API model --------------------------------------------
   /** `file_id` → the reserved file row (models the server `files` table). */
@@ -751,6 +756,53 @@ export class FakeSyncServer {
     return { ok: true, value: { ...this.meProfile } }
   }
 
+  /**
+   * `POST /v1/me/avatar` — model the server pipeline's OBSERVABLE contract: the
+   * stored ref is a fresh digest of a server-minted RE-ENCODE (never the raw
+   * upload's hash), the profile echoes it, and the serve endpoint starts
+   * serving distinct (re-encoded) bytes for the caller.
+   */
+  respondUploadAvatar(): ApiResult<MeProfile> {
+    if (this.meError) return { ok: false, error: this.meError }
+    if (!this.meProfile) {
+      return {
+        ok: false,
+        error: { status: 401, code: 'unauthenticated', title: 'Unauthenticated' },
+      }
+    }
+    this.avatarSeq++
+    const sha = `reencoded-${this.avatarSeq}-`.padEnd(64, '0')
+    this.meProfile = { ...this.meProfile, avatar_sha256: sha }
+    this.avatarBlobs.set(this.meProfile.user_id, new Uint8Array([0xaa, this.avatarSeq]))
+    return { ok: true, value: { ...this.meProfile } }
+  }
+
+  /** `DELETE /v1/me/avatar` — null the ref and stop serving the bytes. */
+  respondClearAvatar(): ApiResult<MeProfile> {
+    if (this.meError) return { ok: false, error: this.meError }
+    if (!this.meProfile) {
+      return {
+        ok: false,
+        error: { status: 401, code: 'unauthenticated', title: 'Unauthenticated' },
+      }
+    }
+    this.meProfile = { ...this.meProfile, avatar_sha256: null }
+    this.avatarBlobs.delete(this.meProfile.user_id)
+    return { ok: true, value: { ...this.meProfile } }
+  }
+
+  /** `GET /v1/users/{id}/avatar` — bytes when set, else the uniform 404. */
+  respondGetAvatarBlob(userId: string): ApiResult<{ blob: Blob; mimeType: string }> {
+    const bytes = this.avatarBlobs.get(userId)
+    if (!bytes) {
+      return { ok: false, error: { status: 404, code: 'not-found', title: 'Not found' } }
+    }
+    return {
+      ok: true,
+      value: { blob: new Blob([bytes.slice().buffer]), mimeType: 'image/webp' },
+    }
+  }
+
   /** `GET /v1/admin/invites` — the pending invites (`id` = sha256 token_hash). */
   respondAdminInvites(): ApiResult<{ invites: AdminInvite[] }> {
     if (this.adminError) return { ok: false, error: this.adminError }
@@ -868,6 +920,8 @@ export class FakeHttpClient implements HttpClient {
   readonly delCalls: string[] = []
   /** Every `putBlob` call — the raw body + declared content type (never JSON). */
   readonly putBlobCalls: { path: string; body: Blob | ArrayBuffer; contentType?: string }[] = []
+  /** Every `postBlob` call (ENG-152 avatar upload) — raw body + content type. */
+  readonly postBlobCalls: { path: string; body: Blob | ArrayBuffer; contentType?: string }[] = []
   readonly getBlobCalls: string[] = []
   inFlight = 0
   maxInFlight = 0
@@ -977,13 +1031,32 @@ export class FakeHttpClient implements HttpClient {
     return Promise.resolve({ ok: true, value: undefined as T })
   }
 
-  del(path = ''): Promise<ApiResult<void>> {
+  del<T = void>(path = ''): Promise<ApiResult<T>> {
     this.delCalls.push(path)
     if (path.startsWith('/v1/admin/invites/')) {
       const id = decodeURIComponent(path.slice('/v1/admin/invites/'.length))
-      return Promise.resolve(this.server.respondAdminRevokeInvite(id))
+      return Promise.resolve(this.server.respondAdminRevokeInvite(id)) as Promise<ApiResult<T>>
     }
-    return Promise.resolve({ ok: true, value: undefined })
+    if (path === '/v1/me/avatar') {
+      return Promise.resolve(this.server.respondClearAvatar()) as Promise<ApiResult<T>>
+    }
+    return Promise.resolve({ ok: true, value: undefined as T })
+  }
+
+  postBlob<T>(
+    path: string,
+    body: Blob | ArrayBuffer,
+    opts?: { contentType?: string; signal?: AbortSignal },
+  ): Promise<ApiResult<T>> {
+    this.postBlobCalls.push({
+      path,
+      body,
+      ...(opts?.contentType ? { contentType: opts.contentType } : {}),
+    })
+    if (path === '/v1/me/avatar') {
+      return Promise.resolve(this.server.respondUploadAvatar()) as Promise<ApiResult<T>>
+    }
+    return Promise.resolve({ ok: true, value: undefined as T })
   }
 
   async putBlob(
@@ -1011,6 +1084,10 @@ export class FakeHttpClient implements HttpClient {
 
   getBlob(path: string): Promise<ApiResult<{ blob: Blob; mimeType: string }>> {
     this.getBlobCalls.push(path)
+    const avatarMatch = /^\/v1\/users\/(.+)\/avatar$/.exec(path)
+    if (avatarMatch?.[1] !== undefined) {
+      return Promise.resolve(this.server.respondGetAvatarBlob(avatarMatch[1]))
+    }
     return Promise.resolve(this.server.respondGetBlob(path))
   }
 

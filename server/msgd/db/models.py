@@ -83,6 +83,14 @@ class User(Base):
     status_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Profile picture (ENG-152): the content-addressed digest of the user's
+    # SERVER-RE-ENCODED avatar blob (256×256 WEBP minted by POST /v1/me/avatar —
+    # never the raw upload's hash). NULL = no avatar. Serving is by
+    # ``user_id → this column`` only (GET /v1/users/{id}/avatar), so a blob is
+    # reachable through the avatar route iff some same-workspace row names it
+    # here — the route can never become a general blob-read oracle (migration
+    # 0012).
+    avatar_sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Device(Base):

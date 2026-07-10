@@ -144,6 +144,9 @@ def test_user_profile_updated_back_compat_and_resulting_state() -> None:
         "status_emoji": "👽",
         "status_text": "Investigating",
         "status_expires_at": "2026-07-09T12:00:00.000Z",
+        # ENG-152: the avatar ref rides the same resulting-state contract
+        # (unset here → explicit null, so a fold reads "no avatar").
+        "avatar_sha256": None,
     }
     event_hash = hash_event(body)
     env = Envelope(body=Body(**body), event_hash=event_hash)
