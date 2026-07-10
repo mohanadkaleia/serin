@@ -28,6 +28,8 @@ function fileRow(over: Partial<FileRow> & { file_id: string }): FileRow {
     mime_type: 'application/octet-stream',
     size_bytes: 1234,
     stream_id: 's1',
+    uploaded_by: 'u_author',
+    created_at: '2026-01-01T00:00:00.000Z',
     ...over,
   }
 }

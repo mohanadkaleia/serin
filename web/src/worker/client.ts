@@ -22,6 +22,7 @@ import {
   type AuthStatus,
   type BackfillResult,
   type FileFetchResult,
+  type FilesListResult,
   type FileUploadParams,
   type FromWorker,
   type LoginCredentials,
@@ -164,6 +165,14 @@ export function makeWorkerClient(clientId: string, transport: Transport): Worker
           method: 'file.fetch',
           params: { file_id: fileId, variant: 'thumbnail' },
         }) as Promise<FileFetchResult>,
+      // ENG-152: the workspace file listing — a LOCAL projection read routed over
+      // the existing `query` verb (zero network, zero token exposure), surfaced
+      // here so the Files view reads `client.files.list()` like its siblings.
+      list: () =>
+        caller.request({
+          method: 'query',
+          params: { q: 'files.list' },
+        }) as Promise<FilesListResult>,
       onProgress: (uploadId: string, cb: (payload: UploadProgress) => void): Unsubscribe =>
         caller.subscribe({ kind: 'upload', upload_id: uploadId }, (payload) => {
           cb(payload as UploadProgress)

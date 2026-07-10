@@ -50,7 +50,12 @@ import type { ApiError } from './http'
 // the `message.created` body). A shape/derived-set change bumps this so existing
 // clients drop + rebuild the derived tables from the raw `events` cache on boot —
 // which is what populates the new `files` table + backfills `MessageRow.file_ids`.
-export const PROJECTION_VERSION = 5
+// ENG-152 bumped 5 → 6 (Files view): `FileRow` gained the `uploaded_by` +
+// `created_at` display columns (both deterministic reads of the `file.uploaded`
+// body — `author_user_id` / `client_created_at`), so shape-skew clients drop +
+// rebuild the derived tables from the raw `events` cache on boot, repopulating
+// every `files` row with the new fields.
+export const PROJECTION_VERSION = 6
 
 /** `meta` key under which the current `PROJECTION_VERSION` is stored. */
 export const META_PROJECTION_VERSION = 'projection_version'
@@ -290,6 +295,11 @@ export interface FileRow {
   size_bytes: number
   /** The stream the file was uploaded into — from the event envelope, not the payload. */
   stream_id: string
+  /** The uploader (`body.author_user_id`) — resolved to a display name tab-side. */
+  uploaded_by: string
+  /** The client-claimed upload instant (`body.client_created_at`, ISO 8601). A
+   *  DISPLAY/sort field only — it is the uploader's clock, not server truth. */
+  created_at: string
 }
 
 /** Projected stream row (derived). */
@@ -612,6 +622,13 @@ export type QueryParams =
   // the client only holds data it is authorized for. ENG-121 (the attachment UI)
   // pairs each returned FileRow with a download/thumbnail handle via `client.files.*`.
   | { q: 'attachments.forMessage'; message_id: string }
+  // ENG-152: the workspace Files view — ALL projected `FileRow`s, newest-first.
+  // A pure LOCAL projection read (zero network): the `files` table mirrors the
+  // `file.uploaded` events the server's sync ALREADY scoped to the caller's
+  // readable streams (`readable_streams_predicate`), so no extra authz is needed;
+  // a defensive query-time filter additionally drops rows whose local stream row
+  // is not readable-shaped (not a member / not a public channel).
+  | { q: 'files.list' }
 
 /**
  * Mutation taxonomy (ENG-81) — durable mutations carried on the existing
@@ -827,6 +844,16 @@ export interface AttachmentsResult {
   pending_file_ids: string[]
 }
 
+/**
+ * `files.list` result (ENG-152) — every projected file the local cache holds,
+ * newest-first (`created_at` desc, `file_id` desc tiebreak). The Files view
+ * renders this directly; download/thumbnail bytes still go through
+ * `client.files.download`/`thumbnail` (the ENG-119 blob path).
+ */
+export interface FilesListResult {
+  files: FileRow[]
+}
+
 /** The union of every projection-query result (RpcResultMap['query']). */
 export type QueryResultUnion =
   | MessagesListResult
@@ -837,6 +864,7 @@ export type QueryResultUnion =
   | ThreadResult
   | ThreadsListResult
   | AttachmentsResult
+  | FilesListResult
 
 /** Result keyed to the query's `q` discriminant (WorkerClient.query<Q>). */
 export type QueryResult<Q extends QueryParams> = Q extends { q: 'messages.list' }
@@ -855,7 +883,9 @@ export type QueryResult<Q extends QueryParams> = Q extends { q: 'messages.list' 
               ? ThreadsListResult
               : Q extends { q: 'attachments.forMessage' }
                 ? AttachmentsResult
-                : never
+                : Q extends { q: 'files.list' }
+                  ? FilesListResult
+                  : never
 export type MutateResult<M extends MutateParams> = M extends {
   m: 'outbox.send' | 'outbox.react' | 'outbox.edit' | 'outbox.remove'
 }
@@ -1448,6 +1478,8 @@ export interface WorkerClient {
     cancel(uploadId: string): Promise<UploadAck>
     download(fileId: string): Promise<FileFetchResult>
     thumbnail(fileId: string): Promise<FileFetchResult>
+    /** ENG-152: the workspace file listing — sugar over `query({q:'files.list'})`. */
+    list(): Promise<FilesListResult>
     onProgress(uploadId: string, cb: (payload: UploadProgress) => void): Unsubscribe
   }
 

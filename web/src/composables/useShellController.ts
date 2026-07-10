@@ -9,8 +9,9 @@
 // (a ZERO-network projection read), the global Cmd+K opens the palette, the sync
 // store feeds the reconnect indicator, and a lightweight `activeView` flips the
 // main panel between the live conversation timeline, the REAL Inbox triage view
-// (ENG-136 — the single triage surface; Feeds folded in), and the scaffold
-// placeholder sections (Apps / Files / Admin). No message data ever comes from
+// (ENG-136 — the single triage surface; Feeds folded in), the REAL Admin
+// (ENG-151) and Files (ENG-152) surfaces, and the scaffold placeholder section
+// (Apps). No message data ever comes from
 // the HTTP API — the shell reads exclusively through the worker client (via stores).
 import { computed, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { storeToRefs } from 'pinia'
@@ -43,8 +44,8 @@ export type ActiveView = 'conversation' | 'inbox' | 'apps' | 'files' | 'admin'
 export type DrawerMode = 'none' | 'thread' | 'details'
 
 /** The views that still render a scaffold placeholder (Inbox is REAL — ENG-136;
- * Admin is REAL — ENG-151 PR-3). */
-type ScaffoldView = Exclude<ActiveView, 'conversation' | 'inbox' | 'admin'>
+ * Admin is REAL — ENG-151 PR-3; Files is REAL — ENG-152). */
+type ScaffoldView = Exclude<ActiveView, 'conversation' | 'inbox' | 'admin' | 'files'>
 
 /** The neutral workspace name shown in the sidebar header + rail glyph (NOT "Ranin"). */
 const WORKSPACE_NAME = 'msg'
@@ -52,7 +53,6 @@ const WORKSPACE_NAME = 'msg'
 /** Copy for the scaffold placeholder EmptyState shown in the main panel. */
 const SCAFFOLD_COPY: Record<ScaffoldView, { title: string; body: string }> = {
   apps: { title: 'Apps', body: 'Apps are coming soon.' },
-  files: { title: 'Files', body: 'A workspace file browser is coming soon.' },
 }
 
 export function useShellController() {
@@ -142,6 +142,7 @@ export function useShellController() {
     if (activeView.value === 'conversation') return headerLabel.value || 'No channel selected'
     if (activeView.value === 'inbox') return 'Inbox'
     if (activeView.value === 'admin') return 'Admin'
+    if (activeView.value === 'files') return 'Files'
     return SCAFFOLD_COPY[activeView.value].title
   })
 
@@ -169,11 +170,12 @@ export function useShellController() {
   /** INTERIM unread count for the "New" divider (see MessageList's `unreadCount`). */
   const unreadCount = computed(() => selectedStream.value?.unread ?? 0)
 
-  /** Copy for the scaffold EmptyState (null for the real conversation/Inbox/Admin views). */
+  /** Copy for the scaffold EmptyState (null for the real conversation/Inbox/Admin/Files views). */
   const scaffold = computed(() =>
     activeView.value === 'conversation' ||
     activeView.value === 'inbox' ||
-    activeView.value === 'admin'
+    activeView.value === 'admin' ||
+    activeView.value === 'files'
       ? null
       : SCAFFOLD_COPY[activeView.value],
   )

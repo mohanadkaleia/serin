@@ -28,6 +28,7 @@ import {
   getMessage,
   listAttachments,
   listDirectory,
+  listFiles,
   listMessages,
   listReactions,
   listStreamsForSidebar,
@@ -524,6 +525,8 @@ export class WorkerCore {
         return listThreadSummaries(this.db, params.root_message_ids)
       case 'attachments.forMessage':
         return listAttachments(this.db, params.message_id)
+      case 'files.list':
+        return listFiles(this.db)
       default:
         // Exhaustive: a new QueryParams member without a case is a COMPILE error
         // here (params narrows to `never`). At runtime an out-of-contract `q`

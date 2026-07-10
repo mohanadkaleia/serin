@@ -33,6 +33,7 @@ import SearchOverlay from './SearchOverlay.vue'
 import SpaceRail from './SpaceRail.vue'
 import ToastContainer from './ToastContainer.vue'
 import AdminView from '../admin/AdminView.vue'
+import FilesView from '../files/FilesView.vue'
 import TopBar from './TopBar.vue'
 import TypingIndicator from './TypingIndicator.vue'
 import EmptyState from '../ui/EmptyState.vue'
@@ -217,7 +218,11 @@ const gridCols = computed(() => {
                the `client.admin.*` worker RPCs; the view re-checks the role. -->
           <AdminView v-else-if="activeView === 'admin'" />
 
-          <!-- Scaffold placeholder (Apps / Files). -->
+          <!-- REAL Files surface (ENG-152): the workspace file listing over the
+               local `files` projection via `client.files.list` — zero HTTP here. -->
+          <FilesView v-else-if="activeView === 'files'" />
+
+          <!-- Scaffold placeholder (Apps). -->
           <div v-else class="flex flex-1 items-center justify-center">
             <EmptyState v-if="scaffold" :title="scaffold.title" :description="scaffold.body" />
           </div>

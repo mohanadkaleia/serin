@@ -69,6 +69,10 @@ export class FakeWorker {
   /** ENG-121 attachment-upload spies + progress plumbing. */
   readonly uploadSpy = vi.fn<(params: FileUploadParams) => void>()
   readonly cancelSpy = vi.fn<(uploadId: string) => void>()
+  /** ENG-152 Files view spies: `files.list` + `files.download`. */
+  readonly filesListSpy = vi.fn()
+  readonly downloadSpy = vi.fn<(fileId: string) => void>()
+  private filesListError: RpcCodedError | null = null
   /** Registered per-upload progress callbacks (keyed by the tab-minted upload_id). */
   private readonly uploadCbs = new Map<string, (p: UploadProgress) => void>()
   /** When set, `file.upload` withholds its ack until `resolveUpload` (tests the
@@ -279,7 +283,8 @@ export class FakeWorker {
     return this
   }
 
-  /** Seed a projected file (ENG-120) the `attachments.forMessage` query resolves. */
+  /** Seed a projected file (ENG-120/152) — the `attachments.forMessage` +
+   *  `files.list` source. */
   addFile(file: Partial<FileRow> & { file_id: string }): this {
     this.files.set(file.file_id, {
       stream_id: 's_x',
@@ -287,8 +292,16 @@ export class FakeWorker {
       name: 'file.bin',
       mime_type: 'application/octet-stream',
       size_bytes: 0,
+      uploaded_by: 'u_author',
+      created_at: '2026-01-01T00:00:00.000Z',
       ...file,
     })
+    return this
+  }
+
+  /** Make the NEXT `files.list` reject with the coded error `code` (ENG-152). */
+  failNextFilesList(code: string): this {
+    this.filesListError = new RpcCodedError(code, code)
     return this
   }
 
@@ -511,6 +524,15 @@ export class FakeWorker {
         participants: this.threadParticipants(root_message_id),
       }))
       return Promise.resolve({ threads } as QueryResult<Q>)
+    }
+    if (params.q === 'files.list') {
+      // Same shape/sort as the `client.files.list` sugar below (which is how the
+      // Files view actually reads it — this arm covers a direct `query` call).
+      const files = [...this.files.values()].sort((a, b) => {
+        if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1
+        return a.file_id < b.file_id ? 1 : a.file_id > b.file_id ? -1 : 0
+      })
+      return Promise.resolve({ files } as QueryResult<Q>)
     }
     if (params.q === 'attachments.forMessage') {
       const msg = this.findMessage(params.message_id)
@@ -757,8 +779,26 @@ export class FakeWorker {
           this.uploadCbs.delete(uploadId)
           return Promise.resolve({ upload_id: uploadId })
         },
-        download: () => Promise.resolve({ blob: null }),
+        download: (fileId: string) => {
+          this.downloadSpy(fileId)
+          return Promise.resolve({ blob: null })
+        },
         thumbnail: () => Promise.resolve({ blob: null }),
+        // ENG-152: the seeded files, newest-first (`created_at` desc, `file_id`
+        // desc tiebreak) — mirrors the worker's `listFiles` sort.
+        list: () => {
+          this.filesListSpy()
+          if (this.filesListError) {
+            const err = this.filesListError
+            this.filesListError = null
+            return Promise.reject(err)
+          }
+          const files = [...this.files.values()].sort((a, b) => {
+            if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1
+            return a.file_id < b.file_id ? 1 : a.file_id > b.file_id ? -1 : 0
+          })
+          return Promise.resolve({ files })
+        },
         onProgress: (uploadId: string, cb: (p: UploadProgress) => void): Unsubscribe => {
           this.uploadCbs.set(uploadId, cb)
           return () => this.uploadCbs.delete(uploadId)

@@ -272,6 +272,8 @@ export interface FileUploadedOpts {
   sizeBytes?: number
   authorUserId?: string
   typeVersion?: number
+  /** The body's `client_created_at` (ENG-152 `FileRow.created_at` source). */
+  clientCreatedAt?: string
 }
 
 /** A well-formed `file.uploaded` event (v1 by default). */
@@ -292,7 +294,7 @@ export function fileUploadedEvent(opts: FileUploadedOpts): EventRow {
         type_version: opts.typeVersion ?? 1,
         author_user_id: opts.authorUserId ?? 'u_author',
         author_device_id: 'd_test',
-        client_created_at: '2026-01-01T00:00:00.000Z',
+        client_created_at: opts.clientCreatedAt ?? '2026-01-01T00:00:00.000Z',
         payload: {
           file_id: opts.fileId,
           sha256: opts.sha256 ?? 'a'.repeat(64),
