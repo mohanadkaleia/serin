@@ -611,4 +611,24 @@ describe('useShellController (ENG-136 PR-B)', () => {
     await flushPromises()
     expect(ctrl.canAdmin.value).toBe(true)
   })
+
+  it('openAdmin deep-targets an AdminView tab; tabChange reports keep it honest', async () => {
+    fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const { ctrl } = await mountController(router)
+
+    // The split sidebar "Workspace" item: admin view + workspace tab, together.
+    ctrl.openAdmin('workspace')
+    expect(ctrl.activeView.value).toBe('admin')
+    expect(ctrl.adminTab.value).toBe('workspace')
+
+    // The "Members & invites" item while ALREADY on admin re-targets the tab.
+    ctrl.openAdmin('members')
+    expect(ctrl.activeView.value).toBe('admin')
+    expect(ctrl.adminTab.value).toBe('members')
+
+    // An in-view tab click reported by AdminView keeps the sidebar state honest.
+    ctrl.onAdminTabChange('invites')
+    expect(ctrl.adminTab.value).toBe('invites')
+  })
 })

@@ -51,6 +51,9 @@ const {
   searchOpen,
   editingMessageId,
   canAdmin,
+  adminTab,
+  openAdmin,
+  onAdminTabChange,
   workspaceName,
   workspaceInitials,
   workspaceIconSha,
@@ -168,9 +171,11 @@ const gridCols = computed(() => {
       :workspace-initials="workspaceInitials"
       :workspace-icon-sha="workspaceIconSha"
       :can-admin="canAdmin"
+      :admin-tab="adminTab"
       :collapsed="sidebarCollapsed"
       @open-search="searchOpen = true"
       @select-view="setActiveView"
+      @open-admin="openAdmin"
       @toggle-collapse="toggleSidebar"
     />
 
@@ -238,9 +243,16 @@ const gridCols = computed(() => {
           <!-- REAL Inbox triage view (ENG-136): tabs over derived stream activity. -->
           <InboxView v-else-if="activeView === 'inbox'" @open-stream="onOpenStream" />
 
-          <!-- REAL Admin surface (ENG-151 PR-3): members + pending invites over
-               the `client.admin.*` worker RPCs; the view re-checks the role. -->
-          <AdminView v-else-if="activeView === 'admin'" />
+          <!-- REAL Admin surface (ENG-151 PR-3): members + pending invites +
+               workspace settings over the `client.admin.*` worker RPCs; the view
+               re-checks the role. Deep-targeted by the sidebar's SPLIT Admin
+               items (`initialTab`); user tab clicks report back (`tabChange`)
+               so the sidebar highlight stays honest. -->
+          <AdminView
+            v-else-if="activeView === 'admin'"
+            :initial-tab="adminTab"
+            @tab-change="onAdminTabChange"
+          />
 
           <!-- REAL Files surface (ENG-152): the workspace file listing over the
                local `files` projection via `client.files.list` — zero HTTP here. -->
@@ -284,8 +296,8 @@ const gridCols = computed(() => {
          selects the hit's stream. -->
     <SearchOverlay :open="searchOpen" @close="searchOpen = false" @jump="onSearchJump" />
 
-    <!-- REAL compose target: a New DM dialog, opened from the sidebar's "+ New"
-         menu OR the palette's "Start a direct message" command. -->
+    <!-- REAL compose target: a New DM dialog, opened from the sidebar's Inbox
+         compose menu OR the palette's "Start a direct message" command. -->
     <NewDmDialog v-if="newDmOpen" @close="newDmOpen = false" />
 
     <!-- Palette command targets (ENG-136): the EXISTING create-channel dialog +

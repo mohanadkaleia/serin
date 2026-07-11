@@ -26,11 +26,21 @@
 // under the UserCard — sync-store-derived ("Synced · Local" when live, the store
 // label otherwise), reinforcing the local-first identity without inventing data.
 //
-// ENG-152 PR-c: a "+ New" button sits under the workspace pill, opening the
-// REAL create flows (New message / New channel — the same dialogs the section
-// "+" affordances open). Restyled COMPACT (sidebar restructure feedback): a
-// small ghost control, not a hero accent button. Unread rows get an
-// accent-subtle count pill (mention rows keep the danger `mention-badge`).
+// Create control (user feedback, replacing the standalone "+ New" button of
+// ENG-152 PR-c): a SMALL compose icon (square-pen) sits NEXT TO the Inbox nav
+// row and opens the same create menu (New message / New channel — the same
+// dialogs the section "+" affordances open). The menu test-ids (`new-menu`,
+// `new-menu-dm`, `new-menu-channel`) are preserved; the trigger is
+// `inbox-compose`. Unread rows get an accent-subtle count pill (mention rows
+// keep the danger `mention-badge`).
+//
+// Admin nav split (user feedback): the single "Members & invites" item hid the
+// Workspace-settings tab, so the Admin section now offers TWO items —
+// "Members & invites" (`nav-admin`, preserved) and "Workspace"
+// (`nav-admin-workspace`) — each deep-targeting the matching AdminView tab via
+// the shell's `openAdmin` seam. Both are owner/admin-gated exactly like the
+// former single item; the `adminTab` prop keeps the highlight honest when the
+// user switches tabs inside the view.
 //
 // ENG-152 sidebar restructure (user feedback): the "Messages" category header
 // is GONE — Inbox, DMs, and Channels are TOP-LEVEL nodes. Inbox is a single
@@ -64,14 +74,14 @@ import UserAvatar from '../ui/UserAvatar.vue'
 import UserPopover from '../ui/UserPopover.vue'
 import ChannelBrowser from './ChannelBrowser.vue'
 import ChannelSettingsDialog from './ChannelSettingsDialog.vue'
+import ComposeButton from './ComposeButton.vue'
 import CreateChannelDialog from './CreateChannelDialog.vue'
-import NewButton from './NewButton.vue'
 import NewDmDialog from './NewDmDialog.vue'
 import UserCard from './UserCard.vue'
 import WorkspaceSwitcher from './WorkspaceSwitcher.vue'
 import ProfileDialog from '../profile/ProfileDialog.vue'
 
-import type { ActiveView } from '../../composables/useShellController'
+import type { ActiveView, AdminTab } from '../../composables/useShellController'
 
 /** The product brand shown in the header (NOT the workspace name — see file note). */
 const BRAND = 'Ranin'
@@ -83,6 +93,9 @@ const props = defineProps<{
   /** ENG-152: the folded workspace icon sha (undefined = no icon → glyph). */
   workspaceIconSha?: string | undefined
   canAdmin: boolean
+  /** Which AdminView tab is showing — drives the split Admin items' active
+   * state ('workspace' → the Workspace item; anything else → Members & invites). */
+  adminTab?: AdminTab
   /** ENG-174: shell-owned collapse state — v-show'd here (not in AppShell)
    * because this component has a fragment root (aside + teleported dialogs);
    * the dialogs stay mountable while the column is hidden. */
@@ -92,6 +105,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   openSearch: []
   selectView: [view: ActiveView]
+  /** Split Admin nav: open AdminView deep-targeted at a tab (shell `openAdmin`). */
+  openAdmin: [tab: AdminTab]
   /** ENG-174: the header collapse control — the shell owns the state. */
   toggleCollapse: []
 }>()
@@ -227,12 +242,6 @@ function dmAvatarSha(stream: SidebarStream): string | undefined {
       :workspace-icon-sha="workspaceIconSha"
     />
 
-    <!-- "+ New" — compact, restrained create control (sidebar restructure).
-         The menu opens the SAME dialogs the node "+" affordances open. -->
-    <div class="px-2 pt-2">
-      <NewButton @new-dm="showNewDm = true" @new-channel="showCreateChannel = true" />
-    </div>
-
     <!-- Scroll region for the feed list. The root <aside> is the (labeled)
          navigation landmark, so this stays a plain div to avoid a nested,
          unlabeled second nav landmark. -->
@@ -241,22 +250,30 @@ function dmAvatarSha(stream: SidebarStream): string | undefined {
            Inbox is a single leaf; DMs and Channels are collapsible nodes whose
            children indent under the NavGroup connector rule. -->
 
-      <!-- Feed-first: Inbox with a REAL total-unread count. -->
-      <SidebarItem
-        :active="activeView === 'inbox'"
-        data-testid="nav-inbox"
-        @click="emit('selectView', 'inbox')"
-      >
-        <template #leading><Icon name="mail" :size="16" /></template>
-        Inbox
-        <template v-if="totalUnread > 0" #trailing>
-          <span
-            class="rounded-full bg-accent-subtle px-1.5 text-xs font-medium text-accent"
-            data-testid="inbox-unread"
-            >{{ totalUnread }}</span
-          >
-        </template>
-      </SidebarItem>
+      <!-- Feed-first: Inbox with a REAL total-unread count, plus the SMALL
+           compose control (user feedback — it replaces the standalone "+ New"
+           button; the SAME create menu, relocated). The compose button is a
+           SIBLING of the row (SidebarItem renders a <button>; nesting one
+           would be invalid HTML). -->
+      <div class="flex items-center gap-1">
+        <SidebarItem
+          class="min-w-0 flex-1"
+          :active="activeView === 'inbox'"
+          data-testid="nav-inbox"
+          @click="emit('selectView', 'inbox')"
+        >
+          <template #leading><Icon name="mail" :size="16" /></template>
+          Inbox
+          <template v-if="totalUnread > 0" #trailing>
+            <span
+              class="rounded-full bg-accent-subtle px-1.5 text-xs font-medium text-accent"
+              data-testid="inbox-unread"
+              >{{ totalUnread }}</span
+            >
+          </template>
+        </SidebarItem>
+        <ComposeButton @new-dm="showNewDm = true" @new-channel="showCreateChannel = true" />
+      </div>
 
       <!-- REAL Direct Messages (ENG-80 projection) — expandable top-level node. -->
       <NavGroup title="DMs" storage-key="dms" data-testid="nav-group-dms">
@@ -415,15 +432,25 @@ function dmAvatarSha(stream: SidebarStream): string | undefined {
           </SidebarItem>
 
           <!-- REAL Admin (ENG-151 PR-3) — expandable, role-gated, inside the
-               Workspace group; opens the members + pending-invites surface. -->
+               Workspace group. SPLIT (user feedback): "Members & invites" and
+               "Workspace" (settings) each open AdminView on the matching tab,
+               so the settings surface is no longer hidden behind the
+               members-only label. -->
           <NavSection v-if="canAdmin" title="Admin" :default-open="false">
             <template #icon><Icon name="shield" :size="16" /></template>
             <SidebarItem
-              :active="activeView === 'admin'"
+              :active="activeView === 'admin' && adminTab !== 'workspace'"
               data-testid="nav-admin"
-              @click="emit('selectView', 'admin')"
+              @click="emit('openAdmin', 'members')"
             >
               Members &amp; invites
+            </SidebarItem>
+            <SidebarItem
+              :active="activeView === 'admin' && adminTab === 'workspace'"
+              data-testid="nav-admin-workspace"
+              @click="emit('openAdmin', 'workspace')"
+            >
+              Workspace
             </SidebarItem>
           </NavSection>
         </NavGroup>

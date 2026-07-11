@@ -343,20 +343,26 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
     )
   })
 
-  it('shows the compact "+ New" button and wires its menu to the REAL create flows', async () => {
+  it('the Inbox row carries a compose icon wired to the REAL create flows (no "+ New")', async () => {
     fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
     fake.setDirectory([{ user_id: 'u_dana', display_name: 'Dana' }], [])
     setWorkerClient(fake.client)
     const wrapper = await mountSidebar()
 
-    // Compact, restrained secondary control (restructure) — no accent fill,
-    // no full-width hero treatment.
-    const newBtn = wrapper.get('[data-testid="new-button"]')
-    expect(newBtn.classes()).not.toContain('bg-accent')
-    expect(newBtn.classes()).not.toContain('w-full')
+    // The standalone "+ New" button is GONE (user feedback) — the create menu
+    // now hangs off a small compose icon NEXT TO the Inbox nav row.
+    expect(wrapper.find('[data-testid="new-button"]').exists()).toBe(false)
+    const compose = wrapper.get('[data-testid="inbox-compose"]')
+    expect(compose.attributes('aria-label')).toBe('New message or channel')
+    // A compose glyph sitting beside (NOT nested inside) the Inbox row button.
+    expect(compose.find('svg.lucide-square-pen-icon, svg.lucide-square-pen').exists()).toBe(true)
+    const inboxRow = wrapper.get('[data-testid="nav-inbox"]')
+    expect(inboxRow.find('[data-testid="inbox-compose"]').exists()).toBe(false)
+    expect(inboxRow.element.parentElement!.contains(compose.element)).toBe(true)
 
-    // "New channel" → the EXISTING CreateChannelDialog.
-    await wrapper.get('[data-testid="new-button"]').trigger('click')
+    // "New channel" → the EXISTING CreateChannelDialog (menu test-ids preserved).
+    await compose.trigger('click')
+    expect(wrapper.find('[data-testid="new-menu"]').exists()).toBe(true)
     await wrapper.get('[data-testid="new-menu-channel"]').trigger('click')
     await flushPromises()
     expect(document.querySelector('[data-testid="create-channel"]')).toBeTruthy()
@@ -365,10 +371,13 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
       ?.click()
 
     // "New message" → the EXISTING NewDmDialog.
-    await wrapper.get('[data-testid="new-button"]').trigger('click')
+    await compose.trigger('click')
     await wrapper.get('[data-testid="new-menu-dm"]').trigger('click')
     await flushPromises()
     expect(document.querySelector('[data-testid="new-dm"]')).toBeTruthy()
+
+    // Composing never navigates: the Inbox row click stays the ONLY selectView.
+    expect(wrapper.emitted('selectView')).toBeUndefined()
   })
 
   it('shows an accent unread pill on unread rows and keeps the danger mention badge', async () => {
@@ -577,7 +586,7 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
     expect(dm.find('[data-testid="presence-dot"]').exists()).toBe(false)
   })
 
-  it('gates the Admin section on canAdmin', async () => {
+  it('gates BOTH split Admin items on canAdmin', async () => {
     fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
     setWorkerClient(fake.client)
 
@@ -594,5 +603,57 @@ describe('AppSidebar — ENG-136 feed-first structure', () => {
     })
     await flushPromises()
     expect(wrapper.find('[data-testid="nav-admin"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="nav-admin-workspace"]').exists()).toBe(true)
+  })
+
+  it('hides BOTH split Admin items for a non-privileged user', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+    const wrapper = await mountSidebar() // canAdmin: false
+
+    expect(wrapper.find('[data-testid="nav-admin"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="nav-admin-workspace"]').exists()).toBe(false)
+  })
+
+  it('splits the Admin nav: each item deep-targets its AdminView tab (openAdmin)', async () => {
+    fake.addStream({ stream_id: 's_general', name: 'general', kind: 'channel' })
+    setWorkerClient(fake.client)
+
+    const store = useWorkspaceStore()
+    await store.load()
+    const wrapper = mount(AppSidebar, {
+      attachTo: document.body,
+      props: {
+        activeView: 'admin',
+        workspaceName: 'msg',
+        workspaceInitials: 'MS',
+        canAdmin: true,
+        adminTab: 'members',
+      },
+    })
+    await flushPromises()
+
+    const members = wrapper.get('[data-testid="nav-admin"]')
+    const settings = wrapper.get('[data-testid="nav-admin-workspace"]')
+    expect(members.text()).toBe('Members & invites')
+    expect(settings.text()).toBe('Workspace')
+
+    // Each item routes through the shell's deep-target seam — NOT the plain
+    // selectView('admin') the former single item used.
+    await members.trigger('click')
+    await settings.trigger('click')
+    expect(wrapper.emitted('openAdmin')).toEqual([['members'], ['workspace']])
+    expect(wrapper.emitted('selectView')).toBeUndefined()
+
+    // Active state follows the SHOWING AdminView tab: members/invites light up
+    // "Members & invites"; the workspace tab lights up "Workspace".
+    expect(members.classes()).toContain('bg-accent-subtle')
+    expect(settings.classes()).not.toContain('bg-accent-subtle')
+    await wrapper.setProps({ adminTab: 'invites' })
+    expect(members.classes()).toContain('bg-accent-subtle')
+    expect(settings.classes()).not.toContain('bg-accent-subtle')
+    await wrapper.setProps({ adminTab: 'workspace' })
+    expect(members.classes()).not.toContain('bg-accent-subtle')
+    expect(settings.classes()).toContain('bg-accent-subtle')
   })
 })
