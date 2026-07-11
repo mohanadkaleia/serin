@@ -68,6 +68,8 @@ const {
   closeUserDetails,
   mainTitle,
   headerPresence,
+  headerKind,
+  headerSubtitle,
   names,
   avatars,
   memberCount,
@@ -80,6 +82,7 @@ const {
   toggleDetails,
   closeDetails,
   onChannelLeft,
+  onDmClosed,
   onPaletteSelect,
   onPaletteCommand,
   onOpenStream,
@@ -176,6 +179,8 @@ const gridCols = computed(() => {
             v-if="activeView !== 'inbox'"
             :title="mainTitle"
             :presence="headerPresence"
+            :kind="headerKind"
+            :subtitle="headerSubtitle"
             :member-count="memberCount"
             @toggle-details="toggleDetails"
           />
@@ -247,6 +252,7 @@ const gridCols = computed(() => {
           @close="closeDetails"
           @open-members="onOpenMembers"
           @left="onChannelLeft"
+          @close-dm="onDmClosed"
           @close-user="closeUserDetails"
         />
       </div>
