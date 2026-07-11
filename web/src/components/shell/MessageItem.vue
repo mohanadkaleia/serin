@@ -18,6 +18,7 @@ import { computed, ref, watch } from 'vue'
 
 import type { DisplayMessage } from '../../stores/messages'
 import { useAttachments } from '../../composables/useAttachments'
+import { detectTextDirection } from '../../lib/textDirection'
 import { formatTime } from '../../lib/time'
 import type { FileRow } from '../../worker'
 import EmojiPicker from '../ui/EmojiPicker.vue'
@@ -143,6 +144,13 @@ const hasAttachments = computed(
 function isImage(file: FileRow): boolean {
   return file.mime_type.startsWith('image/')
 }
+
+/**
+ * Base direction of THIS message's text (ENG-175): first-strong detection —
+ * Arabic/Hebrew-leading text renders `dir="rtl"` (right-aligned via
+ * `text-start`), everything else `dir="ltr"`. Per message, not global.
+ */
+const textDir = computed(() => detectTextDirection(props.message.text))
 
 /** Author's resolved display name (directory-backed; raw id fallback). */
 const authorName = computed(
@@ -307,9 +315,14 @@ function confirmDelete(): void {
              GROUPED follow-up the header (with its "(edited)" marker) is hidden, so
              the marker renders inline here instead — always visible, exactly one in
              the DOM (the header + inline variants are mutually exclusive on showHeader). -->
+        <!-- Direction (ENG-175): `dir` is detected per message (first-strong,
+             lib/textDirection). `text-start` (text-align: start) lets the dir
+             attribute drive alignment — RTL text right-aligns, LTR text keeps
+             left — without hardcoding either side. -->
         <p
           v-else
-          class="whitespace-pre-wrap break-words text-sm text-primary"
+          :dir="textDir"
+          class="whitespace-pre-wrap break-words text-start text-sm text-primary"
           data-testid="message-text"
         >
           {{ props.message.text }}
