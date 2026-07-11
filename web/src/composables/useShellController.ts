@@ -37,6 +37,12 @@ import type { DirectoryUser, PresenceStatus } from '../worker'
 /** Which panel the main column renders: the live timeline, the Inbox, or a scaffold. */
 export type ActiveView = 'conversation' | 'inbox' | 'apps' | 'files' | 'admin'
 
+/** The Admin surface's tab keys — shared by AdminView and the sidebar's SPLIT
+ * Admin nav items ("Members & invites" / "Workspace"), which deep-target a tab.
+ * Defined HERE (not in AdminView.vue) so plain .ts consumers avoid importing a
+ * type through the ambient `*.vue` module shim. */
+export type AdminTab = 'members' | 'invites' | 'workspace'
+
 /**
  * What the right drawer hosts (ENG-136 details drawer). The two panels are
  * MUTUALLY EXCLUSIVE: opening a thread closes the details drawer and vice versa.
@@ -168,6 +174,26 @@ export function useShellController() {
 
   /** Admin section is only offered to privileged roles. */
   const canAdmin = computed(() => role.value === 'admin' || role.value === 'owner')
+
+  /**
+   * Which AdminView tab is (or should be) showing — the deep-target seam for
+   * the sidebar's SPLIT Admin nav ("Members & invites" → members/invites,
+   * "Workspace" → workspace settings). Fed to AdminView as `initialTab` and
+   * kept honest by its `tabChange` events, so the sidebar highlight tracks
+   * in-view tab switches too.
+   */
+  const adminTab = ref<AdminTab>('members')
+
+  /** Open the Admin surface deep-targeted at a tab (the sidebar Admin items). */
+  function openAdmin(tab: AdminTab): void {
+    adminTab.value = tab
+    setActiveView('admin')
+  }
+
+  /** AdminView reported a user tab click — mirror it for the sidebar state. */
+  function onAdminTabChange(tab: AdminTab): void {
+    adminTab.value = tab
+  }
 
   /** The REAL workspace name (ENG-152) — folded from the cached workspace-meta
    * events (`workspace.created`, then any admin `workspace.updated` renames);
@@ -613,6 +639,10 @@ export function useShellController() {
     searchOpen,
     editingMessageId,
     canAdmin,
+    // Admin deep-target (sidebar Admin split)
+    adminTab,
+    openAdmin,
+    onAdminTabChange,
     workspaceName,
     workspaceInitials,
     workspaceIconSha,
