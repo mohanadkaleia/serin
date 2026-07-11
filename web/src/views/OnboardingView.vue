@@ -2,10 +2,11 @@
 // OnboardingView (ENG-170, M6-5) — the desktop first-run screen, gated to the
 // Tauri env by the router (a browser navigation to /onboarding redirects
 // home). Collects the msgd server URL + the local workspace folder, persists
-// them via the Rust desktop-config commands, then reloads the window so the
-// worker client boots the desktop trim (SqliteDb + full mirror + keychain)
-// against the fresh config. All Tauri-flavored imports are DYNAMIC and run
-// only on user action — this view adds nothing to the web entry graph.
+// them via the Rust desktop-config commands, then full-document-navigates to
+// the app root so a fresh page boots the worker client's desktop trim
+// (SqliteDb + full mirror + keychain) against the fresh config. All
+// Tauri-flavored imports are DYNAMIC and run only on user action — this view
+// adds nothing to the web entry graph.
 import { computed, ref } from 'vue'
 
 const serverUrl = ref('')
@@ -53,8 +54,11 @@ async function onSubmit(): Promise<void> {
     }
     await writeDesktopConfig({ serverUrl: normalized, workspaceDir: workspaceDir.value })
     // Reboot the app on the fresh config: the worker-client singleton is
-    // per-page, so a reload is the one clean way to re-run the desktop boot.
-    window.location.reload()
+    // per-page, so a full-document navigation is the one clean way to re-run
+    // the desktop boot. Navigate to the app ROOT (not a reload of the
+    // /onboarding URL) so the fresh page lands on home → auth gate → login;
+    // the router's bidirectional onboarding gate is the backstop either way.
+    window.location.assign(import.meta.env.BASE_URL || '/')
   } catch {
     errorMessage.value = 'Saving the configuration failed. Please try again.'
   } finally {

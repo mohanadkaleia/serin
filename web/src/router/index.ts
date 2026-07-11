@@ -54,13 +54,20 @@ function desktopNeedsOnboarding(): Promise<boolean> {
 // unauthenticated → protected route redirects to /login?redirect=<path>;
 // authenticated → /login or /setup redirects home.
 router.beforeEach(async (to) => {
-  // Desktop onboarding gate (M6-5), BEFORE the auth gate: with no desktop
-  // config there is no server URL, so login cannot work yet — every route
-  // funnels to /onboarding until the config exists (the view then reloads
-  // the window). In a browser, /onboarding is not a real destination.
+  // Desktop onboarding gate (M6-5), BEFORE the auth gate — bidirectional:
+  // with no desktop config there is no server URL, so login cannot work yet —
+  // every route funnels to /onboarding until the config exists; and once the
+  // config exists, /onboarding is no longer a destination — it routes home
+  // (then through the auth gate → login), so the post-save page load can
+  // never strand the user on a fresh onboarding form. In a browser,
+  // /onboarding is not a real destination either way.
   if (isTauri()) {
-    if ((await desktopNeedsOnboarding()) && to.name !== 'onboarding') {
+    const needs = await desktopNeedsOnboarding()
+    if (needs && to.name !== 'onboarding') {
       return { name: 'onboarding' }
+    }
+    if (!needs && to.name === 'onboarding') {
+      return { name: 'home' }
     }
   } else if (to.name === 'onboarding') {
     return { name: 'home' }
