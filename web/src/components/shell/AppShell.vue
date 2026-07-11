@@ -11,8 +11,8 @@
 // Behavior and every load-bearing E2E test-id are preserved: it composes SpaceRail
 // | AppSidebar | TopBar | main (channel-header + virtualized MessageList +
 // MessageComposer, OR the REAL InboxView triage page — ENG-136, the Feeds concept
-// folded into Inbox — OR a scaffold EmptyState) | RightDrawer (thread) + the
-// CommandPalette overlay, and delegates ALL cross-store wiring to
+// folded into Inbox — OR a section view: Admin/Files/Apps) | RightDrawer (thread)
+// + the CommandPalette overlay, and delegates ALL cross-store wiring to
 // `useShellController`. The Inbox brings its own header + filter tabs, so the
 // ChannelHeader is skipped for it. No message data ever comes from the HTTP API —
 // the shell reads exclusively through the worker client (via the stores).
@@ -33,10 +33,10 @@ import SearchOverlay from './SearchOverlay.vue'
 import SpaceRail from './SpaceRail.vue'
 import ToastContainer from './ToastContainer.vue'
 import AdminView from '../admin/AdminView.vue'
+import AppsView from '../apps/AppsView.vue'
 import FilesView from '../files/FilesView.vue'
 import TopBar from './TopBar.vue'
 import TypingIndicator from './TypingIndicator.vue'
-import EmptyState from '../ui/EmptyState.vue'
 import { useShellController } from '../../composables/useShellController'
 import { provideOpenUserDetails } from '../../composables/useUserDetails'
 import type { SidebarStream } from '../../stores/workspace'
@@ -77,7 +77,6 @@ const {
   avatars,
   memberCount,
   unreadCount,
-  scaffold,
   composerPlaceholder,
   quickItems,
   paletteCommands,
@@ -258,10 +257,10 @@ const gridCols = computed(() => {
                local `files` projection via `client.files.list` — zero HTTP here. -->
           <FilesView v-else-if="activeView === 'files'" />
 
-          <!-- Scaffold placeholder (Apps). -->
-          <div v-else class="flex flex-1 items-center justify-center">
-            <EmptyState v-if="scaffold" :title="scaffold.title" :description="scaffold.body" />
-          </div>
+          <!-- REAL Apps surface (ENG-176): bots + incoming webhooks over the
+               `client.plugins.*` worker RPCs; the view re-checks the role
+               (owner/admin only) and never issues a plugin RPC otherwise. -->
+          <AppsView v-else />
         </main>
 
         <!-- Drawer column: the thread pane (ENG-103) OR the channel Details panel
