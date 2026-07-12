@@ -19,14 +19,25 @@ CI's Python job. Skipped only if Docker is unreachable.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from msg_sdk import MsgClient, hash_event, ids
+
+# Reuse the canonical live-server harness (subprocess uvicorn + Postgres
+# testcontainer) from cli/tests instead of forking a second boot mechanism. It
+# lives outside this package's tests dir, so put it on sys.path here — done in
+# the test module itself (NOT a conftest.py) to avoid shadowing the bare
+# top-level `conftest` module that cli/tests imports helpers from.
+_CLI_TESTS = Path(__file__).resolve().parents[3] / "cli" / "tests"
+if str(_CLI_TESTS) not in sys.path:
+    sys.path.insert(0, str(_CLI_TESTS))
 
 try:
     from _e2e_server import start_live_server

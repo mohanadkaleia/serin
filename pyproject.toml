@@ -60,11 +60,7 @@ files = [
 # `explicit_package_bases` double-maps the editable `msgd` distribution. All
 # real harness logic lives in server/tests/harness.py (unique module name,
 # fully type-checked); only the thin re-export shim conftest.py is excluded.
-# Multiple test dirs each carry a top-level `conftest.py`; mypy maps them all to
-# the module name `conftest` and aborts with "duplicate module". These shims hold
-# no real logic (a re-export; a sys.path insert), so exclude them — the harness
-# logic they wrap lives in uniquely-named modules that ARE checked.
-exclude = ["^server/tests/conftest\\.py$", "^plugins/msg_sdk/tests/conftest\\.py$"]
+exclude = ["^server/tests/conftest\\.py$"]
 
 [tool.pytest.ini_options]
 testpaths = [
