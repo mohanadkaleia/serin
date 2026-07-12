@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PACKAGE_DIR = Path(__file__).resolve().parent.parent / "msg_sdk"
+PACKAGE_DIR = Path(__file__).resolve().parent.parent / "serin_sdk"
 
 FORBIDDEN_IMPORTS = frozenset(
     {"msgd", "msgctl", "server", "cli", "fastapi", "sqlalchemy", "httpx", "pydantic"}
@@ -49,8 +49,8 @@ def test_base_import_is_dependency_light() -> None:
     """A fresh interpreter importing the SDK loads no msg modules and no websockets."""
     probe = (
         "import sys\n"
-        "import msg_sdk\n"
-        "from msg_sdk import MsgClient, hash_event, canonicalize, ids\n"
+        "import serin_sdk\n"
+        "from serin_sdk import SerinClient, hash_event, canonicalize, ids\n"
         f"forbidden = {sorted(FORBIDDEN_IMPORTS | {'websockets'})!r}\n"
         "loaded = {name.split('.')[0] for name in sys.modules}\n"
         "hit = sorted(set(forbidden) & loaded)\n"

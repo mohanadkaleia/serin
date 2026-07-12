@@ -1,8 +1,8 @@
-# msg
+# Serin
 
 **A self-hostable, local-first team messenger where your workspace is a folder you own.**
 
-msg is a Slack-style team chat for small technical teams (5–50 people) that you run on a
+Serin is a Slack-style team chat for small technical teams (5–50 people) that you run on a
 single box. The source of truth is an **append-only event log**; every surface — server
 tables, client caches, search — is a **rebuildable projection** of it. A self-hosted sync
 server validates, sequences, stores, and fans out events over WebSocket; clients replicate
@@ -53,7 +53,7 @@ headless-proven seams inside `web/src/worker/`; the native Tauri shell is still 
 
 ## Portability — your workspace is a folder
 
-A msg workspace exports to a portable, self-describing bundle: NDJSON event logs
+A Serin workspace exports to a portable, self-describing bundle: NDJSON event logs
 (`streams/<id>/<YYYY-MM>.ndjson`), content-addressed blobs, and a `manifest.json`. Three
 server-side `msgctl` commands own the round-trip:
 
@@ -70,7 +70,7 @@ CI gate.
 
 ## Plugins & integrations
 
-Plugins are **external processes** that talk to msg over HTTP — there is no in-process
+Plugins are **external processes** that talk to Serin over HTTP — there is no in-process
 runtime and nothing to import. Two surfaces:
 
 - **Incoming webhooks** — a capability URL that turns `POST {"text": …}` into a message in one channel. Zero-auth (the URL is the credential), write-only — ideal for notifiers.

@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
-from msg_sdk.jcs import canonicalize
+from serin_sdk.jcs import canonicalize
 
 __all__ = ["HASH_ALGORITHM", "hash_event"]
 

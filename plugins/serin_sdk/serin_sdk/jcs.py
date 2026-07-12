@@ -1,7 +1,7 @@
 """Minimal RFC 8785 (JCS) canonicalization for the msg event-body domain.
 
 The msg ``event_hash`` is ``"sha256:" + sha256(JCS(body))`` (see
-:mod:`msg_sdk.hashing`), where JCS is RFC 8785 JSON Canonicalization. The server
+:mod:`serin_sdk.hashing`), where JCS is RFC 8785 JSON Canonicalization. The server
 computes it with the ``rfc8785`` library over the RAW parsed body dict
 (``server/msgd/core/jcs.py``); this module is a dependency-free port that must
 produce **byte-identical** output for every value that can appear in an event

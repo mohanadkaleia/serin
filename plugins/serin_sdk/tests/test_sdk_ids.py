@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from msg_sdk import ids
+from serin_sdk import ids
 
 
 def test_event_id_is_bare_ulid() -> None:
@@ -37,7 +37,7 @@ def test_encode_decode_round_trips() -> None:
         u = ids.new_ulid()
         assert ids.ulid_to_bytes(u).__len__() == 16
         # Re-encoding the decoded bytes reproduces the string exactly.
-        from msg_sdk.ids import _encode_ulid  # noqa: PLC0415 - white-box round-trip
+        from serin_sdk.ids import _encode_ulid  # noqa: PLC0415 - white-box round-trip
 
         assert _encode_ulid(ids.ulid_to_bytes(u)) == u
 

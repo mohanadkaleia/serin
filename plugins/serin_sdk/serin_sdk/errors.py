@@ -1,22 +1,22 @@
-"""Typed errors raised by :class:`msg_sdk.MsgClient`."""
+"""Typed errors raised by :class:`serin_sdk.SerinClient`."""
 
 from __future__ import annotations
 
 import json
 
-__all__ = ["MsgError", "MsgHTTPError", "MsgRejectedError", "MsgConfigError"]
+__all__ = ["SerinError", "SerinHTTPError", "SerinRejectedError", "SerinConfigError"]
 
 
-class MsgError(Exception):
+class SerinError(Exception):
     """Base class for every error the SDK raises."""
 
 
-class MsgConfigError(MsgError):
+class SerinConfigError(SerinError):
     """The client is misconfigured (e.g. a missing optional dependency)."""
 
 
-class MsgHTTPError(MsgError):
-    """A msg API request returned a non-2xx status.
+class SerinHTTPError(SerinError):
+    """A Serin API request returned a non-2xx status.
 
     Carries the HTTP ``status`` and, when the server sent an RFC 9457
     ``application/problem+json`` body, its parsed ``problem`` dict (with
@@ -36,7 +36,7 @@ class MsgHTTPError(MsgError):
             self.problem = None
         detail = self._problem_str("detail") or self._problem_str("title") or self.raw_body
         where = f" for {url}" if url else ""
-        super().__init__(f"msg API returned HTTP {status}{where}: {detail}".rstrip())
+        super().__init__(f"Serin API returned HTTP {status}{where}: {detail}".rstrip())
 
     def _problem_str(self, key: str) -> str | None:
         if self.problem is None:
@@ -57,7 +57,7 @@ class MsgHTTPError(MsgError):
         return self._problem_str("type")
 
 
-class MsgRejectedError(MsgError):
+class SerinRejectedError(SerinError):
     """The batch endpoint accepted the request (200) but rejected the event.
 
     ``POST /v1/events/batch`` always returns 200 for a well-formed request and
