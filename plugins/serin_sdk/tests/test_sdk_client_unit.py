@@ -1,4 +1,4 @@
-"""Unit tests for MsgClient's HTTP behaviour against a local stub server.
+"""Unit tests for SerinClient's HTTP behaviour against a local stub server.
 
 No real msgd here (that's the e2e) — a stdlib ``http.server`` records requests
 and returns canned JSON, so these run fast and offline while still exercising the
@@ -15,8 +15,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
-from msg_sdk import MsgClient, MsgHTTPError, MsgRejectedError, hash_event
-from msg_sdk.client import _now_rfc3339
+from serin_sdk import SerinClient, SerinHTTPError, SerinRejectedError, hash_event
+from serin_sdk.client import _now_rfc3339
 
 _WHOAMI = {
     "user_id": "u_01JZ7N6A4M6Y8W5K2H7DGKX4PD",
@@ -90,7 +90,7 @@ def test_now_rfc3339_shape() -> None:
 
 def test_whoami_discovers_identity(server: tuple[str, _Stub]) -> None:
     base_url, _ = server
-    client = MsgClient(base_url, "tok")
+    client = SerinClient(base_url, "tok")
     ident = client.identity
     assert ident.user_id == _WHOAMI["user_id"]
     assert ident.device_id == _WHOAMI["device_id"]
@@ -114,7 +114,7 @@ def test_post_message_wire_shape_and_hash(server: tuple[str, _Stub]) -> None:
             "rejected": [],
         },
     )
-    client = MsgClient(base_url, "tok")
+    client = SerinClient(base_url, "tok")
     msg = client.post_message("s_01JZ7N6A4M6Y8W5K2H7DGKX4PC", "hello", mentions=["u_x"])
 
     upload = next(r for r in stub.requests if r["path"] == "/v1/events/batch")
@@ -159,8 +159,8 @@ def test_post_message_rejected_raises(server: tuple[str, _Stub]) -> None:
             "rejected": [{"event_id": "e", "code": "permission_denied", "detail": "no grant"}],
         },
     )
-    client = MsgClient(base_url, "tok")
-    with pytest.raises(MsgRejectedError) as exc:
+    client = SerinClient(base_url, "tok")
+    with pytest.raises(SerinRejectedError) as exc:
         client.post_message("s_01JZ7N6A4M6Y8W5K2H7DGKX4PC", "hi")
     assert exc.value.code == "permission_denied"
     assert "no grant" in exc.value.detail
@@ -186,7 +186,7 @@ def test_list_messages_filters_and_queries(server: tuple[str, _Stub]) -> None:
             "has_more": False,
         },
     )
-    client = MsgClient(base_url, "tok")
+    client = SerinClient(base_url, "tok")
     messages = client.list_messages("s_c", after=5, limit=10)
     assert [m.text for m in messages] == ["one"]  # non-message event filtered out
     q = next(r for r in stub.requests if r["path"] == "/v1/events")["full_path"]
@@ -199,8 +199,8 @@ def test_http_error_surfaces_problem_detail(server: tuple[str, _Stub]) -> None:
         401,
         {"type": "/problems/unauthorized", "title": "Unauthorized", "detail": "bad token"},
     )
-    client = MsgClient(base_url, "tok")
-    with pytest.raises(MsgHTTPError) as exc:
+    client = SerinClient(base_url, "tok")
+    with pytest.raises(SerinHTTPError) as exc:
         client.whoami()
     assert exc.value.status == 401
     assert exc.value.detail == "bad token"
@@ -209,7 +209,7 @@ def test_http_error_surfaces_problem_detail(server: tuple[str, _Stub]) -> None:
 
 def test_list_messages_rejects_both_cursors(server: tuple[str, _Stub]) -> None:
     base_url, _ = server
-    client = MsgClient(base_url, "tok")
+    client = SerinClient(base_url, "tok")
     with pytest.raises(ValueError):
         client.list_messages("s_c", after=1, before=2)
 
@@ -217,23 +217,23 @@ def test_list_messages_rejects_both_cursors(server: tuple[str, _Stub]) -> None:
 def test_post_webhook(server: tuple[str, _Stub]) -> None:
     base_url, stub = server
     stub.responses[("POST", "/v1/hooks/abc")] = (200, {"ok": True})
-    MsgClient.post_webhook(f"{base_url}/v1/hooks/abc", "ping")
+    SerinClient.post_webhook(f"{base_url}/v1/hooks/abc", "ping")
     hook = next(r for r in stub.requests if r["path"] == "/v1/hooks/abc")
     assert hook["body"] == {"text": "ping"}
     assert "Authorization" not in hook["headers"]  # URL is the credential
 
 
 def test_ws_url_scheme() -> None:
-    assert MsgClient("https://x.example", "t")._ws_url("/v1/ws") == "wss://x.example/v1/ws"
-    assert MsgClient("http://x.example", "t")._ws_url("/v1/ws") == "ws://x.example/v1/ws"
+    assert SerinClient("https://x.example", "t")._ws_url("/v1/ws") == "wss://x.example/v1/ws"
+    assert SerinClient("http://x.example", "t")._ws_url("/v1/ws") == "ws://x.example/v1/ws"
 
 
 def test_sdk_hash_matches_server_hasher() -> None:
     """The SDK's hash equals msgd's on a body the SDK builds (real ULIDs)."""
     msgd_hashing = pytest.importorskip("msgd.core.hashing")
-    from msg_sdk import Identity
+    from serin_sdk import Identity
 
-    client = MsgClient("http://unused", "tok")
+    client = SerinClient("http://unused", "tok")
     client._identity = Identity(  # skip the network whoami
         user_id="u_01JZ7N6A4M6Y8W5K2H7DGKX4PD",
         device_id="d_01JZ7N6A4M6Y8W5K2H7DGKX4PE",

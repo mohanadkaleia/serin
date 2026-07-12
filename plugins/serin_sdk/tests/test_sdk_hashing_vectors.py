@@ -1,6 +1,6 @@
 """The SDK hash MUST equal the server's, byte for byte.
 
-Pins :func:`msg_sdk.canonicalize` / :func:`msg_sdk.hash_event` against the repo's
+Pins :func:`serin_sdk.canonicalize` / :func:`serin_sdk.hash_event` against the repo's
 frozen cross-language JCS+hash vectors
 (``server/msgd/core/testdata/vectors.json``) — the same file the server, CLI, and
 web client are all verified against. Every vector inside the event-body JSON
@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from msg_sdk import JCSError, canonicalize, hash_event
+from serin_sdk import JCSError, canonicalize, hash_event
 
 _VECTORS = json.loads(
     (Path(__file__).parents[3] / "server/msgd/core/testdata/vectors.json").read_text("utf-8")

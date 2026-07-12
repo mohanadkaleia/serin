@@ -2,19 +2,19 @@
 name = "msg-workspace"
 version = "0"
 requires-python = ">=3.12"
-dependencies = ["msgd", "msgctl", "github-notifier", "msg-sdk"]
+dependencies = ["msgd", "msgctl", "github-notifier", "serin-sdk"]
 
 [tool.uv]
 package = false
 
 [tool.uv.workspace]
-members = ["server", "cli", "plugins/github_notifier", "plugins/msg_sdk"]
+members = ["server", "cli", "plugins/github_notifier", "plugins/serin_sdk"]
 
 [tool.uv.sources]
 msgd = { workspace = true }
 msgctl = { workspace = true }
 github-notifier = { workspace = true }
-msg-sdk = { workspace = true }
+serin-sdk = { workspace = true }
 
 [dependency-groups]
 # httpx drives the in-process ASGI test client; testcontainers runs the
@@ -29,7 +29,7 @@ dev = [
     "httpx-ws",
     "testcontainers[postgres]",
     "pytest-asyncio",
-    # msg_sdk's live event stream (and its e2e test) use the `websockets`
+    # serin_sdk's live event stream (and its e2e test) use the `websockets`
     # package; pinned here as a dev dep so the SDK's [ws] extra resolves for tests
     # without adding it to the base install.
     "websockets>=13",
@@ -51,7 +51,7 @@ files = [
     "cli/msgctl",
     "cli/tests",
     "plugins/github_notifier",
-    "plugins/msg_sdk",
+    "plugins/serin_sdk",
 ]
 # server/tests/ and cli/tests/ each hold a top-level `conftest.py`; mypy would
 # map both to the module name `conftest` and abort with "duplicate module".
@@ -67,7 +67,7 @@ testpaths = [
     "server/tests",
     "cli/tests",
     "plugins/github_notifier/tests",
-    "plugins/msg_sdk/tests",
+    "plugins/serin_sdk/tests",
 ]
 addopts = "-q"
 asyncio_mode = "auto"

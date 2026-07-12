@@ -1,14 +1,14 @@
-"""``MsgClient`` — a tiny, correctness-first bot client for the msg API.
+"""``SerinClient`` — a tiny, correctness-first bot client for the Serin API.
 
 One import, one call to post a message: the client builds the ``message.created``
 envelope, mints the ids, computes the frozen ``event_hash`` (``sha256`` over the
-RFC 8785 canonicalization of the body — see :mod:`msg_sdk.hashing`), and uploads
+RFC 8785 canonicalization of the body — see :mod:`serin_sdk.hashing`), and uploads
 it, so a bot author never touches hashing. It talks only to the public plugin
 surface documented in ``docs/plugins.md`` and imports nothing from ``msgd``.
 
 HTTP uses the standard library (``urllib``); the live event stream
-(:meth:`MsgClient.events`) needs the ``websockets`` package, pulled in by the
-optional ``ws`` extra (``pip install "msg-sdk[ws]"``) to keep the base install
+(:meth:`SerinClient.events`) needs the ``websockets`` package, pulled in by the
+optional ``ws`` extra (``pip install "serin-sdk[ws]"``) to keep the base install
 dependency-light.
 """
 
@@ -23,12 +23,12 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 
-from msg_sdk import ids
-from msg_sdk.errors import MsgConfigError, MsgHTTPError, MsgRejectedError
-from msg_sdk.hashing import hash_event
-from msg_sdk.models import Event, Identity, Message
+from serin_sdk import ids
+from serin_sdk.errors import SerinConfigError, SerinHTTPError, SerinRejectedError
+from serin_sdk.hashing import hash_event
+from serin_sdk.models import Event, Identity, Message
 
-__all__ = ["MsgClient"]
+__all__ = ["SerinClient"]
 
 _MAX_LIMIT = 500
 
@@ -39,11 +39,11 @@ def _now_rfc3339() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
-class MsgClient:
-    """A bot client for a single msg workspace, authenticated by a bot token.
+class SerinClient:
+    """A bot client for a single Serin workspace, authenticated by a bot token.
 
     Args:
-        base_url: The msg server root, e.g. ``https://msg.example.com``.
+        base_url: The Serin server root, e.g. ``https://msg.example.com``.
         token: A bot token (or any bearer credential). Sent as
             ``Authorization: Bearer <token>`` on HTTP and via
             ``Sec-WebSocket-Protocol: bearer, <token>`` on the WebSocket.
@@ -102,9 +102,9 @@ class MsgClient:
         membership grant on ``channel_id``.
 
         Raises:
-            MsgRejectedError: the server rejected the event (e.g.
+            SerinRejectedError: the server rejected the event (e.g.
                 ``permission_denied`` for a missing channel grant).
-            MsgHTTPError: the request itself failed (non-2xx).
+            SerinHTTPError: the request itself failed (non-2xx).
         """
         me = self.identity
         body = self.build_message_body(
@@ -147,7 +147,7 @@ class MsgClient:
         """Assemble a ``message.created`` body authored by this client.
 
         Exposed for callers that want the raw body (e.g. to inspect the hash via
-        :func:`msg_sdk.hash_event` or to batch several events with
+        :func:`serin_sdk.hash_event` or to batch several events with
         :meth:`post_event`).
         """
         me = self.identity
@@ -179,14 +179,14 @@ class MsgClient:
         (``{event_id, stream_id, server_sequence, server_received_at}``).
 
         Raises:
-            MsgRejectedError: if the event landed in the ``rejected`` partition.
+            SerinRejectedError: if the event landed in the ``rejected`` partition.
         """
         item = {"body": body, "event_hash": hash_event(body)}
         result = self._request("POST", "/v1/events/batch", json_body={"events": [item]})
         rejected = result.get("rejected") or []
         if rejected:
             first = rejected[0]
-            raise MsgRejectedError(
+            raise SerinRejectedError(
                 first.get("code", "unknown"),
                 first.get("detail", ""),
                 event_id=first.get("event_id"),
@@ -257,15 +257,15 @@ class MsgClient:
         ``presence`` / ``typing``) are skipped. Stop by breaking out of the loop
         or closing the generator — the socket is closed on exit.
 
-        Requires the ``websockets`` package (``pip install "msg-sdk[ws]"``).
+        Requires the ``websockets`` package (``pip install "serin-sdk[ws]"``).
         """
         try:
             from websockets import Subprotocol
             from websockets.sync.client import connect
         except ImportError as exc:  # pragma: no cover - exercised via error path
-            raise MsgConfigError(
+            raise SerinConfigError(
                 "live events() need the 'websockets' package; "
-                'install the SDK with the ws extra: pip install "msg-sdk[ws]"'
+                'install the SDK with the ws extra: pip install "serin-sdk[ws]"'
             ) from exc
 
         wanted = set(channels) if channels else None
@@ -323,7 +323,7 @@ class MsgClient:
         """POST ``{"text": text}`` to an incoming-webhook capability URL.
 
         The trivial one-way notifier path (``docs/plugins.md`` §1): no auth
-        header, the URL itself is the credential. Raises :class:`MsgHTTPError`
+        header, the URL itself is the credential. Raises :class:`SerinHTTPError`
         on a non-2xx response.
         """
         payload = json.dumps({"text": text}).encode("utf-8")
@@ -334,7 +334,7 @@ class MsgClient:
             with urllib.request.urlopen(request, timeout=timeout):
                 return
         except urllib.error.HTTPError as exc:
-            raise MsgHTTPError(exc.code, exc.read(), url=hook_url) from exc
+            raise SerinHTTPError(exc.code, exc.read(), url=hook_url) from exc
 
     # -- HTTP plumbing --------------------------------------------------------
 
@@ -358,7 +358,7 @@ class MsgClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
-            raise MsgHTTPError(exc.code, exc.read(), url=url) from exc
+            raise SerinHTTPError(exc.code, exc.read(), url=url) from exc
         if not raw:
             return {}
         parsed = json.loads(raw)

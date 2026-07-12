@@ -3,7 +3,7 @@
 Boots a REAL msgd (subprocess uvicorn + Postgres testcontainer, the shared
 ``cli/tests/_e2e_server`` harness), provisions an owner + a channel + a bot with
 a minted token via the real ``/v1/setup`` and ``/v1/plugins/*`` endpoints, then
-drives :class:`msg_sdk.MsgClient` against it over real HTTP/WebSocket:
+drives :class:`serin_sdk.SerinClient` against it over real HTTP/WebSocket:
 
 * ``whoami`` discovers the bot's own ``user_id`` / ``device_id`` / ``workspace_id``;
 * ``post_message`` builds the envelope, computes the frozen ``event_hash``, and
@@ -28,7 +28,7 @@ from typing import Any
 
 import httpx
 import pytest
-from msg_sdk import MsgClient, hash_event, ids
+from serin_sdk import SerinClient, hash_event, ids
 
 # Reuse the canonical live-server harness (subprocess uvicorn + Postgres
 # testcontainer) from cli/tests instead of forking a second boot mechanism. It
@@ -140,7 +140,7 @@ def provisioned(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, 
 
 
 def test_whoami_identity(provisioned: dict[str, Any]) -> None:
-    bot = MsgClient(provisioned["base_url"], provisioned["bot_token"])
+    bot = SerinClient(provisioned["base_url"], provisioned["bot_token"])
     ident = bot.identity
     assert ident.user_id == provisioned["bot_user_id"]
     assert ident.device_id == provisioned["bot_device_id"]
@@ -149,7 +149,7 @@ def test_whoami_identity(provisioned: dict[str, Any]) -> None:
 
 
 def test_post_message_accepted_and_readable(provisioned: dict[str, Any]) -> None:
-    bot = MsgClient(provisioned["base_url"], provisioned["bot_token"])
+    bot = SerinClient(provisioned["base_url"], provisioned["bot_token"])
     channel = provisioned["channel_id"]
 
     posted = bot.post_message(channel, "hello from the SDK bot")
@@ -168,8 +168,8 @@ def test_post_message_accepted_and_readable(provisioned: dict[str, Any]) -> None
 
 
 def test_live_events_receives_other_clients_message(provisioned: dict[str, Any]) -> None:
-    bot = MsgClient(provisioned["base_url"], provisioned["bot_token"])
-    owner = MsgClient(provisioned["base_url"], provisioned["owner_token"])
+    bot = SerinClient(provisioned["base_url"], provisioned["bot_token"])
+    owner = SerinClient(provisioned["base_url"], provisioned["owner_token"])
     channel = provisioned["channel_id"]
 
     received: list[Any] = []
