@@ -415,7 +415,12 @@ function dmAvatarSha(stream: SidebarStream): string | undefined {
             Files
           </SidebarItem>
 
+          <!-- REAL Apps surface (ENG-176): bots + incoming webhooks. Role-gated
+               like the Admin items — the whole plugin surface is owner/admin
+               only server-side, so members/guests never see the entry point
+               (AppsView independently re-checks the role too). -->
           <SidebarItem
+            v-if="canAdmin"
             :active="activeView === 'apps'"
             data-testid="nav-apps"
             @click="emit('selectView', 'apps')"

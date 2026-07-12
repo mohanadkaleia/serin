@@ -9,10 +9,10 @@
 // (a ZERO-network projection read), the global Cmd+K opens the palette, the sync
 // store feeds the reconnect indicator, and a lightweight `activeView` flips the
 // main panel between the live conversation timeline, the REAL Inbox triage view
-// (ENG-136 — the single triage surface; Feeds folded in), the REAL Admin
-// (ENG-151) and Files (ENG-152) surfaces, and the scaffold placeholder section
-// (Apps). No message data ever comes from
-// the HTTP API — the shell reads exclusively through the worker client (via stores).
+// (ENG-136 — the single triage surface; Feeds folded in), and the REAL Admin
+// (ENG-151), Files (ENG-152) and Apps (ENG-176) surfaces. No message data ever
+// comes from the HTTP API — the shell reads exclusively through the worker
+// client (via stores).
 import { computed, onBeforeUnmount, onMounted, ref, watch, type Ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useRouter } from 'vue-router'
@@ -34,7 +34,9 @@ import { useWorkspaceStore, type SidebarStream } from '../stores/workspace'
 
 import type { DirectoryUser, PresenceStatus } from '../worker'
 
-/** Which panel the main column renders: the live timeline, the Inbox, or a scaffold. */
+/** Which panel the main column renders: the live timeline or a section view
+ * (every section is REAL now — Inbox ENG-136, Admin ENG-151, Files ENG-152,
+ * Apps ENG-176; no scaffold placeholders remain). */
 export type ActiveView = 'conversation' | 'inbox' | 'apps' | 'files' | 'admin'
 
 /** The Admin surface's tab keys — shared by AdminView and the sidebar's SPLIT
@@ -51,18 +53,9 @@ export type AdminTab = 'members' | 'invites' | 'workspace'
  */
 export type DrawerMode = 'none' | 'thread' | 'details' | 'user'
 
-/** The views that still render a scaffold placeholder (Inbox is REAL — ENG-136;
- * Admin is REAL — ENG-151 PR-3; Files is REAL — ENG-152). */
-type ScaffoldView = Exclude<ActiveView, 'conversation' | 'inbox' | 'admin' | 'files'>
-
 /** Fallback shown until the real workspace name syncs (the genesis
  * `workspace.created` fold — ENG-152); neutral, NOT "Ranin". */
 const WORKSPACE_NAME_FALLBACK = 'msg'
-
-/** Copy for the scaffold placeholder EmptyState shown in the main panel. */
-const SCAFFOLD_COPY: Record<ScaffoldView, { title: string; body: string }> = {
-  apps: { title: 'Apps', body: 'Apps are coming soon.' },
-}
 
 export function useShellController() {
   const router = useRouter()
@@ -101,7 +94,7 @@ export function useShellController() {
   const searchOpen = ref(false)
   /** The message currently in inline edit (ENG-102); null = none. */
   const editingMessageId = ref<string | null>(null)
-  /** Which main panel is active: the conversation timeline vs a scaffold section. */
+  /** Which main panel is active: the conversation timeline vs a section view. */
   const activeView: Ref<ActiveView> = ref('conversation')
 
   /**
@@ -250,7 +243,7 @@ export function useShellController() {
     if (activeView.value === 'inbox') return 'Inbox'
     if (activeView.value === 'admin') return 'Admin'
     if (activeView.value === 'files') return 'Files'
-    return SCAFFOLD_COPY[activeView.value].title
+    return 'Apps'
   })
 
   /**
@@ -305,16 +298,6 @@ export function useShellController() {
   /** INTERIM unread count for the "New" divider (see MessageList's `unreadCount`). */
   const unreadCount = computed(() => selectedStream.value?.unread ?? 0)
 
-  /** Copy for the scaffold EmptyState (null for the real conversation/Inbox/Admin/Files views). */
-  const scaffold = computed(() =>
-    activeView.value === 'conversation' ||
-    activeView.value === 'inbox' ||
-    activeView.value === 'admin' ||
-    activeView.value === 'files'
-      ? null
-      : SCAFFOLD_COPY[activeView.value],
-  )
-
   const composerPlaceholder = computed(() =>
     selectedStream.value ? `Message ${headerLabel.value}` : 'Select a channel',
   )
@@ -345,7 +328,7 @@ export function useShellController() {
 
   // -- Mark-read on channel view (ENG-129) ----------------------------------
   //
-  // The stream shown in the conversation panel (null on Inbox / scaffold views).
+  // The stream shown in the conversation panel (null on the section views).
   // Threaded to the notifications store so the decision matrix can suppress
   // toasts for the conversation the user is already looking at.
   const activeConversationId = computed(() =>
@@ -677,7 +660,6 @@ export function useShellController() {
     avatars,
     memberCount,
     unreadCount,
-    scaffold,
     composerPlaceholder,
     quickItems,
     paletteCommands,

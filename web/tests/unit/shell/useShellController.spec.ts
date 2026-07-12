@@ -2,7 +2,7 @@
 // controller is the behavior-preserving extraction of ShellView's cross-store
 // wiring; both ShellView (PR-B) and AppShell (PR-C) consume it. This proves the
 // contract: stream selection loads messages + shows the conversation view, the
-// scaffold `activeView` flips the main panel, Cmd+K opens the palette, the palette
+// `activeView` flips the main panel between sections, Cmd+K opens the palette, the palette
 // selects + closes, threads open/close, and Admin is role-gated — all via stores,
 // never HTTP (the FakeWorker's fetch spy stays untouched).
 import { flushPromises, mount } from '@vue/test-utils'
@@ -114,14 +114,13 @@ describe('useShellController (ENG-136 PR-B)', () => {
     expect(second.ctrl.workspaceInitials.value).toBe('ZE')
   })
 
-  it('flips the main panel to a scaffold view and back', async () => {
+  it('flips the main panel to the Apps section and back (REAL view — ENG-176)', async () => {
     fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
     setWorkerClient(fake.client)
     const { ctrl } = await mountController(router)
 
     ctrl.setActiveView('apps')
     expect(ctrl.activeView.value).toBe('apps')
-    expect(ctrl.scaffold.value?.title).toBe('Apps')
     expect(ctrl.mainTitle.value).toBe('Apps')
 
     // Selecting a real stream returns to the conversation timeline.
@@ -129,7 +128,6 @@ describe('useShellController (ENG-136 PR-B)', () => {
     await flushPromises()
     expect(ctrl.activeView.value).toBe('conversation')
     expect(ctrl.paletteOpen.value).toBe(false)
-    expect(ctrl.scaffold.value).toBeNull()
   })
 
   it('toggles the palette on Cmd+K (ENG-152 nav cleanup)', async () => {
@@ -321,8 +319,7 @@ describe('useShellController (ENG-136 PR-B)', () => {
     const { ctrl } = await mountController(router)
 
     ctrl.setActiveView('inbox')
-    // Inbox is a REAL view now (ENG-136) — no scaffold copy; its own header titles it.
-    expect(ctrl.scaffold.value).toBeNull()
+    // Inbox is a REAL view (ENG-136) — its own header titles it.
     expect(ctrl.mainTitle.value).toBe('Inbox')
 
     // Re-opening the ALREADY-selected stream must still leave the Inbox (the
@@ -334,7 +331,7 @@ describe('useShellController (ENG-136 PR-B)', () => {
     expect(ctrl.selectedStreamId.value).toBe('s_a')
   })
 
-  it('closes an open thread when navigating to a scaffold view (PR-B review #4)', async () => {
+  it('closes an open thread when navigating to a section view (PR-B review #4)', async () => {
     fake.addStream({ stream_id: 's_a', name: 'alpha', kind: 'channel' })
     const root = fake.addMessage('s_a', { created_seq: 1, text: 'root' })
     setWorkerClient(fake.client)
@@ -344,7 +341,7 @@ describe('useShellController (ENG-136 PR-B)', () => {
     await flushPromises()
     expect(ctrl.threadOpen.value).toBe(true)
 
-    // Flipping to a scaffold placeholder closes the drawer so it doesn't dock beside it.
+    // Flipping to a section view closes the drawer so it does not dock beside it.
     ctrl.setActiveView('inbox')
     await flushPromises()
     expect(ctrl.threadOpen.value).toBe(false)
