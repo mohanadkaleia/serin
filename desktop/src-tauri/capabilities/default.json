@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "msg desktop main-window capability: core IPC + the http fetch bridge (API calls to the configured msgd), the onboarding folder dialog, and the fallback Rust WebSocket.",
+  "description": "msg desktop main-window capability: core IPC + the http fetch bridge (API calls to the configured msgd), the onboarding folder dialog, and the fallback Rust WebSocket. The http:default allow-list carries explicit port (`:*`) and path (`/**`) wildcards because tauri-plugin-http matches scopes with URLPattern, where a port-less pattern like `http://**` matches ONLY the scheme default port (80/443) and so rejects a real API URL such as `http://127.0.0.1:8080/v1/...`.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -9,7 +9,14 @@
     "websocket:default",
     {
       "identifier": "http:default",
-      "allow": [{ "url": "http://**" }, { "url": "https://**" }]
+      "allow": [
+        { "url": "http://127.0.0.1:*/**" },
+        { "url": "http://localhost:*/**" },
+        { "url": "http://**:*/**" },
+        { "url": "https://**:*/**" },
+        { "url": "http://**/**" },
+        { "url": "https://**/**" }
+      ]
     }
   ]
 }
